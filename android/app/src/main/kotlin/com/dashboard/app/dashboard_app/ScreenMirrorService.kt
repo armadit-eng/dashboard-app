@@ -153,11 +153,18 @@ class ScreenMirrorService : Service() {
                 val scaled = Bitmap.createScaledBitmap(cropped, outWidth, outHeight, true)
                 if (scaled != cropped) cropped.recycle()
 
-                val baos = ByteArrayOutputStream()
-                scaled.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
+                // Kualitas adaptif: turun otomatis sampai base64 <= 7000 karakter
+                var q = jpegQuality
+                var b64 = ""
+                while (true) {
+                    val baos = ByteArrayOutputStream()
+                    scaled.compress(Bitmap.CompressFormat.JPEG, q, baos)
+                    b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                    if (b64.length <= 7000 || q <= 10) break
+                    q -= 8
+                }
                 scaled.recycle()
-                val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                onFrameReady?.invoke(b64)
+                if (b64.length <= 7000) onFrameReady?.invoke(b64)
             } catch (_: Exception) {
             } finally {
                 img.close()

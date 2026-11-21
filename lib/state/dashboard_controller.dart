@@ -3,9 +3,6 @@ import 'dart:collection';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
-import 'package:geolocator/geolocator.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/app_models.dart';
 import '../models/navigation_models.dart';
@@ -14,12 +11,40 @@ import '../services/ble_devices_service.dart';
 import '../services/bt_classic_channel.dart';
 import '../services/mid_frame_renderer.dart';
 import '../services/persistence_service.dart';
+import '../services/platform_tools_channel.dart';
 import '../services/remote_apis_service.dart';
 import '../services/route_physics.dart';
 import '../services/telemetry_engine.dart';
 import '../services/voice_alert_service.dart';
 
 class DashboardController extends ChangeNotifier {
+  // --- Throttled notifications (kurangi rebuild UI) ---
+  static const int _minNotifyGapMs = 200;
+  int _lastNotifyMs = 0;
+  Timer? _notifyTimer;
+  bool _disposed = false;
+
+  @override
+  void notifyListeners() {
+    if (_disposed) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final elapsed = now - _lastNotifyMs;
+    if (elapsed >= _minNotifyGapMs) {
+      _notifyTimer?.cancel();
+      _notifyTimer = null;
+      _lastNotifyMs = now;
+      super.notifyListeners();
+      return;
+    }
+    if (_notifyTimer != null) return; // sudah ada notifikasi tertunda
+    _notifyTimer = Timer(Duration(milliseconds: _minNotifyGapMs - elapsed), () {
+      _notifyTimer = null;
+      if (_disposed) return;
+      _lastNotifyMs = DateTime.now().millisecondsSinceEpoch;
+      super.notifyListeners();
+    });
+  }
+
   final PersistenceService _storage = PersistenceService();
   final BtClassicChannelService _btClassic = BtClassicChannelService();
   final BleDevicesService _ble = BleDevicesService();
@@ -97,7 +122,7 @@ class DashboardController extends ChangeNotifier {
   Timer? _tick1HzTimer;
   Timer? _mapsTimer;
   Timer? _devSimTimer;
-  StreamSubscription<Position>? _gpsSub;
+  StreamSubscription<NativeGpsFix>? _gpsSub;
   int _lastWeatherFetchMs = 0;
   int _lastGeoFetchMs = 0;
   int _lastOffRouteCheckMs = 0;
@@ -371,49 +396,29 @@ class DashboardController extends ChangeNotifier {
   }
 
   Future<void> requestRuntimePermissions() async {
-    await [
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
-      Permission.notification,
-    ].request();
+    await PlatformToolsChannel.requestPermissions();
   }
 
   Future<void> _initLocationStream() async {
-    final perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.denied) {
-      await Geolocator.requestPermission();
-    }
-    final status = await Geolocator.checkPermission();
-    if (status == LocationPermission.denied ||
-        status == LocationPermission.deniedForever) {
-      return;
-    }
-
-    try {
-      final last = await Geolocator.getLastKnownPosition();
-      if (last != null) {
-        _onGpsPosition(last);
-      }
-    } catch (_) {}
-
+    await PlatformToolsChannel.requestPermissions();
+    await PlatformToolsChannel.startGps();
     _gpsSub?.cancel();
-    _gpsSub = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 4,
-      ),
-    ).listen(_onGpsPosition, onError: (_) {});
+    _gpsSub = PlatformToolsChannel.gpsStream().listen(
+      _onGpsFix,
+      onError: (_) {},
+    );
   }
 
-  void _onGpsPosition(Position pos) {
-    final gp = GeoPointX(pos.latitude, pos.longitude, altM: pos.altitude);
-    final spdKmh = pos.speed > 0.3 ? (pos.speed * 3.6) : 0.0;
+  void _onGpsFix(NativeGpsFix fix) {
+    final gp = GeoPointX(fix.lat, fix.lng, altM: fix.altM);
+    final spdKmh = fix.speedMs > 0.3 ? (fix.speedMs * 3.6) : 0.0;
     gpsState = gpsState.copyWith(
       location: gp,
       speedKmh: spdKmh,
-      headingDeg: pos.heading >= 0 ? pos.heading : gpsState.headingDeg,
-      accuracyM: pos.accuracy,
+      headingDeg: (fix.bearingDeg != null && fix.bearingDeg! >= 0)
+          ? fix.bearingDeg
+          : gpsState.headingDeg,
+      accuracyM: fix.accuracyM,
     );
 
     if (spdKmh > 2.0) {
@@ -426,10 +431,10 @@ class DashboardController extends ChangeNotifier {
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _lastWeatherFetchMs > 600000) {
       _lastWeatherFetchMs = now;
-      unawaited(refreshWeatherAndLocation(pos.latitude, pos.longitude));
+      unawaited(refreshWeatherAndLocation(fix.lat, fix.lng));
     } else if (now - _lastGeoFetchMs > 30000) {
       _lastGeoFetchMs = now;
-      unawaited(_refreshReverseGeo(pos.latitude, pos.longitude));
+      unawaited(_refreshReverseGeo(fix.lat, fix.lng));
     }
 
     if (isNavigating && activeRoute != null) {
@@ -689,7 +694,7 @@ class DashboardController extends ChangeNotifier {
     isNavigating = true;
     activeStepIndex = 0;
     _activeRouteInitialSoc = effective.combinedSocPct;
-    unawaited(WakelockPlus.enable());
+    unawaited(PlatformToolsChannel.setWakelock(true));
     if (settings.voiceNavEnabled && activeRoute!.steps.isNotEmpty) {
       final s0 = activeRoute!.steps.first;
       unawaited(_voice.speak('Navigasi dimulai. ${s0.instruction}', force: true));
@@ -705,7 +710,7 @@ class DashboardController extends ChangeNotifier {
   void stopNavigation() {
     isNavigating = false;
     isRideLocked = false;
-    unawaited(WakelockPlus.disable());
+    unawaited(PlatformToolsChannel.setWakelock(false));
     notifyListeners();
   }
 
@@ -713,7 +718,8 @@ class DashboardController extends ChangeNotifier {
     final route = activeRoute;
     if (route == null || route.steps.isEmpty) return;
 
-    final step = route.steps[activeStepIndex.clamp(0, route.steps.length - 1)];
+    final int stepIdx = activeStepIndex.clamp(0, route.steps.length - 1).toInt();
+    final step = route.steps[stepIdx];
     distToNextStepM = RoutePhysics.haversineKm(pos, step.location) * 1000.0;
 
     if (distToNextStepM < 30.0 && activeStepIndex < route.steps.length - 1) {
@@ -913,8 +919,8 @@ class DashboardController extends ChangeNotifier {
 
   Future<void> startScreenMirror() async {
     final ok = await _btClassic.startScreenMirror(
-      width: settings.mapsSnapWidth,
-      height: settings.mapsSnapHeight,
+      width: settings.mapsSnapWidth.clamp(64, 350).toInt(),
+      height: settings.mapsSnapHeight.clamp(64, 500).toInt(),
       intervalMs: math.max(350, settings.mapsIntervalMs ~/ 2),
     );
     screenMirrorActive = ok;
@@ -1028,7 +1034,7 @@ class DashboardController extends ChangeNotifier {
         speedKmh: spd,
         vbat: vbat,
         ibat: ibat,
-        throttlePct: spd > 15 ? (spd * 1.1).clamp(0, 100) : 0,
+        throttlePct: spd > 15 ? (spd * 1.1).clamp(0.0, 100.0).toDouble() : 0.0,
         socPct: (84.0 - step * 0.03).clamp(15.0, 100.0),
         sohPct: 96.0,
         odoKm: settings.odoBackupKm > 0 ? settings.odoBackupKm + 1.2 : 1842.5,
@@ -1087,6 +1093,8 @@ class DashboardController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _notifyTimer?.cancel();
     _tick1HzTimer?.cancel();
     _mapsTimer?.cancel();
     _devSimTimer?.cancel();

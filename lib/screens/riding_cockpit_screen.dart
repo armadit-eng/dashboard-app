@@ -3,8 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../services/platform_tools_channel.dart';
 import '../state/dashboard_controller.dart';
 import '../theme/app_theme.dart';
 import '../widgets/cockpit_painters.dart';
@@ -27,7 +27,7 @@ class _RidingCockpitScreenState extends State<RidingCockpitScreen>
       vsync: this,
       duration: const Duration(milliseconds: 1400),
     )..repeat();
-    unawaited(WakelockPlus.enable());
+    unawaited(PlatformToolsChannel.setWakelock(true));
     unawaited(SystemChrome.setPreferredOrientations([
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
@@ -38,7 +38,7 @@ class _RidingCockpitScreenState extends State<RidingCockpitScreen>
   @override
   void dispose() {
     _flowCtrl.dispose();
-    unawaited(WakelockPlus.disable());
+    unawaited(PlatformToolsChannel.setWakelock(false));
     unawaited(SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
@@ -147,7 +147,7 @@ class _RidingCockpitScreenState extends State<RidingCockpitScreen>
                           child: Stack(
                             alignment: Alignment.center,
                             children: [
-                              CustomPaint(
+                              RepaintBoundary(child: CustomPaint(
                                 size: const Size.square(260),
                                 painter: SpeedoGaugePainter(
                                   speedKmh: eff.speedKmh ?? 0,
@@ -159,7 +159,7 @@ class _RidingCockpitScreenState extends State<RidingCockpitScreen>
                                   trackColor: const Color(0xFF1F2A37),
                                   isRegen: eff.isRegen,
                                 ),
-                              ),
+                              )),
                               Column(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
@@ -246,7 +246,7 @@ class _RidingCockpitScreenState extends State<RidingCockpitScreen>
                                   width: double.infinity,
                                   child: AnimatedBuilder(
                                     animation: _flowCtrl,
-                                    builder: (_, __) => CustomPaint(
+                                    builder: (_, __) => RepaintBoundary(child: CustomPaint(
                                       painter: EnergyFlowPainter(
                                         phase: _flowCtrl.value,
                                         powerW: eff.combinedPowerW ?? 0,
@@ -256,7 +256,7 @@ class _RidingCockpitScreenState extends State<RidingCockpitScreen>
                                         regenColor: c.regen,
                                         idleColor: const Color(0xFF334155),
                                       ),
-                                    ),
+                                    )),
                                   ),
                                 ),
                               ],

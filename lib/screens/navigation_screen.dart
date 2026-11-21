@@ -3,13 +3,12 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
-import 'package:share_plus/share_plus.dart';
 
 import '../models/navigation_models.dart';
 import '../models/telemetry_models.dart';
+import '../services/platform_tools_channel.dart';
 import '../services/remote_apis_service.dart';
 import '../services/route_physics.dart';
 import '../state/dashboard_controller.dart';
@@ -73,7 +72,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
     return Stack(
       children: [
         // 1. Live Interactive Map
-        FlutterMap(
+        RepaintBoundary(child: FlutterMap(
           mapController: _mapCtrl,
           options: MapOptions(
             initialCenter: center,
@@ -179,7 +178,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
               ],
             ),
           ],
-        ),
+        )),
 
         // 2. Top Search & Turn Banner
         SafeArea(
@@ -585,13 +584,13 @@ class _NavigationScreenState extends State<NavigationScreen> {
               SizedBox(
                 height: 62,
                 width: double.infinity,
-                child: CustomPaint(
+                child: RepaintBoundary(child: CustomPaint(
                   painter: ElevationProfilePainter(
                     samples: route.elevationSamples,
                     trackColor: c.borderSubtle,
                     labelColor: c.textMuted,
                   ),
-                ),
+                )),
               ),
             ],
           ],
@@ -882,7 +881,10 @@ class _NavigationScreenState extends State<NavigationScreen> {
                         : () {
                             final gpx =
                                 RoutePhysics.exportFieldNotesGpx(ctrl.fieldNotes);
-                            Share.share(gpx, subject: 'FieldNotes_EV.gpx');
+                            PlatformToolsChannel.shareText(
+                              gpx,
+                              subject: 'FieldNotes_EV.gpx',
+                            );
                           },
                     icon: const Icon(Icons.share_rounded, size: 16),
                     label: const Text('GPX'),
@@ -1017,11 +1019,10 @@ class _NavigationScreenState extends State<NavigationScreen> {
                   ),
                   TextButton(
                     onPressed: () async {
-                      final picked = await ImagePicker()
-                          .pickImage(source: ImageSource.gallery);
-                      if (picked != null) {
+                      final path = await PlatformToolsChannel.pickImage();
+                      if (path != null && path.isNotEmpty) {
                         await cCtrl.updateSettings(cCtrl.settings.copyWith(
-                          customWallpaperPath: picked.path,
+                          customWallpaperPath: path,
                           customWallpaperEnabled: true,
                         ));
                       }

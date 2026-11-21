@@ -1,10 +1,12 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
 
+import '../models/app_models.dart';
 import '../models/telemetry_models.dart';
+import '../services/mid_frame_renderer.dart';
+import '../services/platform_tools_channel.dart';
 import '../state/dashboard_controller.dart';
 import '../theme/app_theme.dart';
 import 'motovlog_cam_screen.dart';
@@ -80,11 +82,10 @@ class _GarageAccountScreenState extends State<GarageAccountScreen> {
                 children: [
                   GestureDetector(
                     onTap: () async {
-                      final img = await ImagePicker()
-                          .pickImage(source: ImageSource.gallery);
-                      if (img != null) {
+                      final path = await PlatformToolsChannel.pickImage();
+                      if (path != null && path.isNotEmpty) {
                         await ctrl.updateSettings(
-                            s.copyWith(avatarPath: img.path));
+                            s.copyWith(avatarPath: path));
                       }
                     },
                     child: CircleAvatar(
@@ -405,6 +406,66 @@ class _GarageAccountScreenState extends State<GarageAccountScreen> {
         ),
         const SizedBox(height: 14),
 
+        // Resolusi Maps (AT+MAPS)
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Resolusi Maps (AT+MAPS)',
+                    style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 6),
+                Text(
+                  'Ukuran frame ke layar MID. Batas ${MidFrameRenderer.maxMapsChars} karakter; '
+                  'kualitas JPEG turun otomatis agar muat.',
+                  style: const TextStyle(fontSize: 12),
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 4,
+                  children: [
+                    for (final p in const [
+                      ('Kecil', 280, 176),
+                      ('Standar', 350, 220),
+                      ('Besar', 480, 300),
+                      ('Persegi', 320, 320),
+                    ])
+                      ChoiceChip(
+                        label: Text('${p.$1} (${p.$2}×${p.$3})'),
+                        selected: s.mapsSnapWidth == p.$2 &&
+                            s.mapsSnapHeight == p.$3,
+                        onSelected: (_) => ctrl.updateSettings(s.copyWith(
+                            mapsSnapWidth: p.$2, mapsSnapHeight: p.$3)),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                _sliderSetting(
+                  label: 'Lebar',
+                  valueText: '${s.mapsSnapWidth} px',
+                  value: s.mapsSnapWidth.clamp(64, 1024).toDouble(),
+                  min: 64,
+                  max: 1024,
+                  onChanged: (v) => ctrl
+                      .updateSettings(s.copyWith(mapsSnapWidth: v.round())),
+                ),
+                _sliderSetting(
+                  label: 'Tinggi',
+                  valueText: '${s.mapsSnapHeight} px',
+                  value: s.mapsSnapHeight.clamp(64, 1024).toDouble(),
+                  min: 64,
+                  max: 1024,
+                  onChanged: (v) => ctrl
+                      .updateSettings(s.copyWith(mapsSnapHeight: v.round())),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+
         // 4. Dual Battery & Route Physics Calibration
         Card(
           child: Padding(
@@ -555,7 +616,7 @@ class _GarageAccountScreenState extends State<GarageAccountScreen> {
   Widget _slotToggle(
     String label,
     bool selected,
-    dynamic Function(bool) updater,
+    AtNavSlotConfig Function(bool) updater,
     DashboardController ctrl,
   ) {
     return FilterChip(

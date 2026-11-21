@@ -221,8 +221,8 @@ class AppSettings {
     this.dataSaverMap = false,
     this.mapsLayout = 'split',
     this.mapsRiderPos = 'low',
-    this.mapsSnapWidth = 240,
-    this.mapsSnapHeight = 180,
+    this.mapsSnapWidth = 350,
+    this.mapsSnapHeight = 220,
     this.mapsLeChunkSize = 100,
     this.mapsLeDelayMs = 30,
     this.mapsIntervalMs = 1000,
@@ -455,8 +455,17 @@ class AppSettings {
         dataSaverMap: m['dataSaverMap'] ?? false,
         mapsLayout: m['mapsLayout']?.toString() ?? 'split',
         mapsRiderPos: m['mapsRiderPos']?.toString() ?? 'low',
-        mapsSnapWidth: (m['mapsSnapWidth'] as num?)?.toInt() ?? 240,
-        mapsSnapHeight: (m['mapsSnapHeight'] as num?)?.toInt() ?? 180,
+        // Migrasi: default lama 240x180 -> default referensi 350x220
+        mapsSnapWidth: (() {
+          final w = (m['mapsSnapWidth'] as num?)?.toInt() ?? 350;
+          final h = (m['mapsSnapHeight'] as num?)?.toInt() ?? 220;
+          return (w == 240 && h == 180) ? 350 : w;
+        })(),
+        mapsSnapHeight: (() {
+          final w = (m['mapsSnapWidth'] as num?)?.toInt() ?? 350;
+          final h = (m['mapsSnapHeight'] as num?)?.toInt() ?? 220;
+          return (w == 240 && h == 180) ? 220 : h;
+        })(),
         mapsLeChunkSize: (m['mapsLeChunkSize'] as num?)?.toInt() ?? 100,
         mapsLeDelayMs: (m['mapsLeDelayMs'] as num?)?.toInt() ?? 30,
         mapsIntervalMs: (m['mapsIntervalMs'] as num?)?.toInt() ?? 1000,

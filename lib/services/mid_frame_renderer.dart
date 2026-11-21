@@ -11,6 +11,9 @@ import '../models/navigation_models.dart';
 import '../models/telemetry_models.dart';
 
 class MidFrameRenderer {
+  /// Batas karakter base64 untuk AT+MAPS (sama dengan MAPS_MAX_CHARS di referensi).
+  static const int maxMapsChars = 7000;
+
   static Future<String> renderFrameBase64({
     required AppSettings settings,
     required GpsState gps,
@@ -20,10 +23,10 @@ class MidFrameRenderer {
     required int activeStepIndex,
     required double distToNextStepM,
     required double etaMin,
-    int maxChars = 11500,
+    int maxChars = maxMapsChars,
   }) async {
-    final w = settings.mapsSnapWidth.clamp(160, 480);
-    final h = settings.mapsSnapHeight.clamp(120, 360);
+    final int w = settings.mapsSnapWidth.clamp(64, 1024).toInt();
+    final int h = settings.mapsSnapHeight.clamp(64, 1024).toInt();
 
     if (settings.customWallpaperEnabled &&
         settings.customWallpaperPath.isNotEmpty) {
@@ -112,15 +115,22 @@ class MidFrameRenderer {
   }
 
   static String _encodeWithinBudget(img.Image image, int maxChars) {
-    const qualities = [72, 58, 46, 36, 28, 20];
-    String last = '';
-    for (final q in qualities) {
-      final jpg = img.encodeJpg(image, quality: q);
-      final b64 = base64Encode(jpg);
-      last = b64;
-      if (b64.length <= maxChars) return b64;
+    // Turunkan kualitas dulu; kalau masih kebesaran, kecilkan resolusi.
+    // Frame yang tidak bisa dimuat dalam batas TIDAK dikirim (return '').
+    const qualities = [72, 58, 46, 36, 28, 20, 14, 10];
+    var current = image;
+    for (var attempt = 0; attempt < 4; attempt++) {
+      for (final q in qualities) {
+        final jpg = img.encodeJpg(current, quality: q);
+        final b64 = base64Encode(jpg);
+        if (b64.length <= maxChars) return b64;
+      }
+      final nw = (current.width * 0.85).round();
+      final nh = (current.height * 0.85).round();
+      if (nw < 64 || nh < 64) break;
+      current = img.copyResize(current, width: nw, height: nh);
     }
-    return last;
+    return '';
   }
 
   static void _drawMiniMapArea({

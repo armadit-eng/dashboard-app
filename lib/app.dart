@@ -52,13 +52,27 @@ class _MainShellState extends State<_MainShell> {
     final c = context.cockpit;
     final wide = MediaQuery.of(context).size.width >= 720;
 
-    final pages = [
-      HomeCockpitScreen(onNavigateTab: (idx) => setState(() => _tabIndex = idx)),
-      const DiagnosisScreen(),
-      const NavigationScreen(),
-      const StatsScreen(),
-      const GarageAccountScreen(),
-    ];
+    // Hanya tab aktif yang dibangun: tab tersembunyi tidak ikut rebuild.
+    Widget buildPage(int i) {
+      switch (i) {
+        case 0:
+          return HomeCockpitScreen(
+              onNavigateTab: (idx) => setState(() => _tabIndex = idx));
+        case 1:
+          return const DiagnosisScreen();
+        case 2:
+          return const NavigationScreen();
+        case 3:
+          return const StatsScreen();
+        default:
+          return const GarageAccountScreen();
+      }
+    }
+
+    final page = KeyedSubtree(
+      key: ValueKey<int>(_tabIndex),
+      child: buildPage(_tabIndex),
+    );
 
     const items = [
       (icon: Icons.dashboard_rounded, label: 'Kokpit'),
@@ -85,7 +99,7 @@ class _MainShellState extends State<_MainShell> {
                     .toList(),
               ),
               const VerticalDivider(width: 1),
-              Expanded(child: IndexedStack(index: _tabIndex, children: pages)),
+              Expanded(child: page),
             ],
           ),
         ),
@@ -96,7 +110,7 @@ class _MainShellState extends State<_MainShell> {
       extendBody: true,
       body: SafeArea(
         bottom: false,
-        child: IndexedStack(index: _tabIndex, children: pages),
+        child: page,
       ),
       bottomNavigationBar: Padding(
         padding: EdgeInsets.fromLTRB(

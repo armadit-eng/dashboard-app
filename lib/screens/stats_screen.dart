@@ -3,9 +3,9 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
-import 'package:share_plus/share_plus.dart';
 
 import '../models/app_models.dart';
+import '../services/platform_tools_channel.dart';
 import '../services/route_physics.dart';
 import '../services/telemetry_engine.dart';
 import '../state/dashboard_controller.dart';
@@ -60,7 +60,10 @@ class StatsScreen extends StatelessWidget {
                   ? null
                   : () {
                       final csv = RoutePhysics.exportTripsCsv(trips);
-                      Share.share(csv, subject: 'Riwayat_Trip_EV.csv');
+                      PlatformToolsChannel.shareText(
+                        csv,
+                        subject: 'Riwayat_Trip_EV.csv',
+                      );
                     },
               icon: const Icon(Icons.ios_share_rounded),
             ),
@@ -313,7 +316,7 @@ class StatsScreen extends StatelessWidget {
               SizedBox(
                 height: 120,
                 width: double.infinity,
-                child: CustomPaint(
+                child: RepaintBoundary(child: CustomPaint(
                   painter: MultiSeriesChartPainter(
                     gridColor: c.borderSubtle,
                     series: [
@@ -329,7 +332,7 @@ class StatsScreen extends StatelessWidget {
                       ),
                     ],
                   ),
-                ),
+                )),
               ),
             const SizedBox(height: 14),
             Row(
@@ -338,7 +341,10 @@ class StatsScreen extends StatelessWidget {
                   child: OutlinedButton.icon(
                     onPressed: () {
                       final gpx = RoutePhysics.exportTripGpx(t);
-                      Share.share(gpx, subject: 'Trip_${t.id}.gpx');
+                      PlatformToolsChannel.shareText(
+                        gpx,
+                        subject: 'Trip_${t.id}.gpx',
+                      );
                     },
                     icon: const Icon(Icons.share_rounded, size: 17),
                     label: const Text('Ekspor GPX'),

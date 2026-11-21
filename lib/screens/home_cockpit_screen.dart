@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
+import '../models/app_models.dart';
 import '../models/navigation_models.dart';
 import '../models/telemetry_models.dart';
 import '../services/route_physics.dart';
@@ -279,7 +280,7 @@ class _HomeCockpitScreenState extends State<HomeCockpitScreen> {
                       child: Stack(
                         alignment: Alignment.center,
                         children: [
-                          CustomPaint(
+                          RepaintBoundary(child: CustomPaint(
                             size: const Size(112, 112),
                             painter: SpeedoGaugePainter(
                               speedKmh: eff.speedKmh ?? 0,
@@ -291,7 +292,7 @@ class _HomeCockpitScreenState extends State<HomeCockpitScreen> {
                               trackColor: c.borderSubtle,
                               isRegen: eff.isRegen,
                             ),
-                          ),
+                          )),
                           Column(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -603,9 +604,9 @@ class _HomeCockpitScreenState extends State<HomeCockpitScreen> {
                       value: maint.progressPct,
                       minHeight: 8,
                       borderRadius: BorderRadius.circular(4),
-                      color: maint.level.name == 'due'
+                      color: maint.level == MaintHealthLevel.due
                           ? c.danger
-                          : maint.level.name == 'warn'
+                          : maint.level == MaintHealthLevel.warn
                               ? c.warning
                               : c.accent,
                     ),

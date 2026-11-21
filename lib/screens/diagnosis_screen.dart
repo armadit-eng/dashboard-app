@@ -515,12 +515,12 @@ class _DiagnosisScreenState extends State<DiagnosisScreen>
                         style: TextStyle(color: c.textMuted),
                       ),
                     )
-                  : CustomPaint(
+                  : RepaintBoundary(child: CustomPaint(
                       painter: MultiSeriesChartPainter(
                         series: series,
                         gridColor: c.borderSubtle,
                       ),
-                    ),
+                    )),
             ),
           ],
         ),
