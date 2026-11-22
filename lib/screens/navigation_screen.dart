@@ -202,6 +202,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
                   _activeTurnCard(context, ctrl)
                 else
                   _searchBar(context, ctrl),
+                if (ctrl.gpsState.location == null) _gpsBanner(context),
                 if (_searchResults.isNotEmpty)
                   Container(
                     margin: const EdgeInsets.only(top: 6),
@@ -540,6 +541,57 @@ class _NavigationScreenState extends State<NavigationScreen> {
     );
   }
 
+  Widget _gpsBanner(BuildContext context) {
+    final c = context.cockpit;
+    return GestureDetector(
+      onTap: () async {
+        final text = await PlatformToolsChannel.gpsDiag();
+        if (!context.mounted) return;
+        showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Diagnosis GPS'),
+            content: Text(text),
+            actions: [
+              TextButton(
+                onPressed: () async {
+                  await PlatformToolsChannel.requestPermissions();
+                  await PlatformToolsChannel.startGps();
+                  if (ctx.mounted) Navigator.pop(ctx);
+                },
+                child: const Text('Coba ulang GPS'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Tutup'),
+              ),
+            ],
+          ),
+        );
+      },
+      child: Container(
+        margin: const EdgeInsets.only(top: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: c.surfaceCard.withOpacity(0.96),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: c.borderSubtle),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.gps_not_fixed_rounded, size: 16, color: c.accent),
+            const SizedBox(width: 8),
+            const Flexible(
+              child: Text('Menunggu GPS… ketuk untuk diagnosis',
+                  style: TextStyle(fontSize: 12)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _routeBottomCard(BuildContext context, DashboardController ctrl) {
     final c = context.cockpit;
     final route = ctrl.activeRoute!;
@@ -577,6 +629,12 @@ class _NavigationScreenState extends State<NavigationScreen> {
                     tooltip: 'Lihat Multi-Stop',
                     onPressed: () => _openMultiStopSheet(context, ctrl),
                     icon: const Icon(Icons.format_list_numbered_rounded),
+                  ),
+                if (!ctrl.isNavigating)
+                  IconButton(
+                    tooltip: 'Tutup rute',
+                    onPressed: () => ctrl.clearRoute(),
+                    icon: const Icon(Icons.close_rounded),
                   ),
                 if (!ctrl.isNavigating)
                   FilledButton.icon(
