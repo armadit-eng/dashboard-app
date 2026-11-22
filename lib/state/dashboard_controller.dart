@@ -123,6 +123,9 @@ class DashboardController extends ChangeNotifier {
   Timer? _mapsTimer;
   Timer? _devSimTimer;
   StreamSubscription<NativeGpsFix>? _gpsSub;
+  int _lastGpsFixMs = 0;
+  Timer? _gpsWatchdog;
+  String mapsStatus = 'Belum ada frame';
   int _lastWeatherFetchMs = 0;
   int _lastGeoFetchMs = 0;
   int _lastOffRouteCheckMs = 0;
@@ -370,7 +373,7 @@ class DashboardController extends ChangeNotifier {
       // Push AT+TRIP & AT+NAV slot rotation to Motor MID when connected
       if (motorConnState == ConnectionStateX.connected) {
         final nowSec = now ~/ 1000;
-        if (nowSec % 5 == 0) {
+        if (nowSec % 2 == 0) {
           sendMotorTripRange(eff.rangeKm);
         }
         if ((nowSec - _atNavLastSentSec) >= settings.atNavSlots.intervalSec) {
@@ -407,9 +410,19 @@ class DashboardController extends ChangeNotifier {
       _onGpsFix,
       onError: (_) {},
     );
+    // Watchdog: kalau 12 detik tanpa fix, minta native mendaftar ulang GPS.
+    _gpsWatchdog?.cancel();
+    _gpsWatchdog = Timer.periodic(const Duration(seconds: 12), (_) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - _lastGpsFixMs > 12000) {
+        unawaited(PlatformToolsChannel.requestPermissions());
+        unawaited(PlatformToolsChannel.startGps());
+      }
+    });
   }
 
   void _onGpsFix(NativeGpsFix fix) {
+    _lastGpsFixMs = DateTime.now().millisecondsSinceEpoch;
     final gp = GeoPointX(fix.lat, fix.lng, altM: fix.altM);
     final spdKmh = fix.speedMs > 0.3 ? (fix.speedMs * 3.6) : 0.0;
     gpsState = gpsState.copyWith(
@@ -882,37 +895,62 @@ class DashboardController extends ChangeNotifier {
   }
 
   Future<void> sendSingleMidFrame() async {
-    if (motorConnState != ConnectionStateX.connected) return;
+    if (motorConnState != ConnectionStateX.connected) {
+      mapsStatus = 'Motor belum terhubung (hubungkan dulu di tab Diagnosis)';
+      notifyListeners();
+      return;
+    }
     if (_btClassic.isMapsSending) return;
-    final b64 = await MidFrameRenderer.renderFrameBase64(
-      settings: settings,
-      gps: gpsState,
-      eff: effective,
-      activeRoute: activeRoute,
-      isNavigating: isNavigating,
-      activeStepIndex: activeStepIndex,
-      distToNextStepM: distToNextStepM,
-      etaMin: etaMin,
-    );
-    if (b64.isEmpty) return;
-
-    if (motorViaBle) {
-      final t0 = DateTime.now().millisecondsSinceEpoch;
-      await _ble.sendMotorBleMapsFrame(
-        b64,
-        chunkSize: settings.mapsLeChunkSize,
-        delayMs: settings.mapsLeDelayMs,
+    String b64;
+    try {
+      b64 = await MidFrameRenderer.renderFrameBase64(
+        settings: settings,
+        gps: gpsState,
+        eff: effective,
+        activeRoute: activeRoute,
+        isNavigating: isNavigating,
+        activeStepIndex: activeStepIndex,
+        distToNextStepM: distToNextStepM,
+        etaMin: etaMin,
       );
-      mapsFramesSent++;
-      mapsLastMs = DateTime.now().millisecondsSinceEpoch - t0;
-      mapsLastChars = b64.length;
-    } else {
-      final ms = await _btClassic.sendMapsFrame(b64);
-      if (ms != null) {
+    } catch (e) {
+      mapsStatus = 'Gagal membuat frame: $e';
+      notifyListeners();
+      return;
+    }
+    if (b64.isEmpty) {
+      mapsStatus =
+          'Frame melebihi ${MidFrameRenderer.maxMapsChars} karakter '
+          '(terkecil ${MidFrameRenderer.lastMinChars}). Kecilkan resolusi.';
+      notifyListeners();
+      return;
+    }
+
+    try {
+      if (motorViaBle) {
+        final t0 = DateTime.now().millisecondsSinceEpoch;
+        await _ble.sendMotorBleMapsFrame(
+          b64,
+          chunkSize: settings.mapsLeChunkSize,
+          delayMs: settings.mapsLeDelayMs,
+        );
         mapsFramesSent++;
-        mapsLastMs = ms;
+        mapsLastMs = DateTime.now().millisecondsSinceEpoch - t0;
         mapsLastChars = b64.length;
+        mapsStatus = 'OK (BLE)';
+      } else {
+        final ms = await _btClassic.sendMapsFrame(b64);
+        if (ms != null) {
+          mapsFramesSent++;
+          mapsLastMs = ms;
+          mapsLastChars = b64.length;
+          mapsStatus = 'OK (SPP)';
+        } else {
+          mapsStatus = 'Gagal kirim ke motor (cek koneksi Bluetooth SPP)';
+        }
       }
+    } catch (e) {
+      mapsStatus = 'Gagal kirim: $e';
     }
     notifyListeners();
   }
@@ -1094,6 +1132,7 @@ class DashboardController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _gpsWatchdog?.cancel();
     _notifyTimer?.cancel();
     _tick1HzTimer?.cancel();
     _mapsTimer?.cancel();
