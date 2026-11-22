@@ -185,37 +185,68 @@ class PlatformToolsBridge(private val activity: Activity) :
         }
     }
 
+    private val regProviders = mutableSetOf<String>()
+
     @SuppressLint("MissingPermission")
     private fun startGpsInternal() {
         val hasFine = activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         val hasCoarse = activity.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         if (!hasFine && !hasCoarse) return
 
+        // Posisi terakhir yang diketahui (langsung ditampilkan)
         try {
-            val last = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            val last = (if (hasFine) runCatching { locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER) }.getOrNull() else null)
+                ?: runCatching { locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) }.getOrNull()
             if (last != null) emitLocation(last)
+        } catch (_: Exception) {
+        }
 
-            if (!gpsListening) {
-                gpsListening = true
+        // Daftarkan tiap provider sendiri-sendiri; gagal satu tidak membatalkan yang lain.
+        if (hasFine && !regProviders.contains(LocationManager.GPS_PROVIDER)) {
+            try {
                 if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                    locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1200L, 3f, this, Looper.getMainLooper())
+                    locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, this, Looper.getMainLooper())
+                    regProviders.add(LocationManager.GPS_PROVIDER)
                 }
+            } catch (_: Exception) {
+            }
+        }
+        if (!regProviders.contains(LocationManager.NETWORK_PROVIDER)) {
+            try {
                 if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                    locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 3500L, 10f, this, Looper.getMainLooper())
+                    locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 3000L, 0f, this, Looper.getMainLooper())
+                    regProviders.add(LocationManager.NETWORK_PROVIDER)
+                }
+            } catch (_: Exception) {
+            }
+        }
+        gpsListening = regProviders.isNotEmpty()
+
+        // Fix cepat satu kali (Android 11+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val prov = when {
+                hasFine && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
+                locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
+                else -> null
+            }
+            if (prov != null) {
+                try {
+                    locationManager.getCurrentLocation(prov, null, activity.mainExecutor) { loc ->
+                        if (loc != null) emitLocation(loc)
+                    }
+                } catch (_: Exception) {
                 }
             }
-        } catch (_: Exception) {
         }
     }
 
     private fun stopGpsInternal() {
-        if (!gpsListening) return
-        gpsListening = false
         try {
             locationManager.removeUpdates(this)
         } catch (_: Exception) {
         }
+        regProviders.clear()
+        gpsListening = false
     }
 
     override fun onLocationChanged(location: Location) {
@@ -224,7 +255,9 @@ class PlatformToolsBridge(private val activity: Activity) :
 
     @Deprecated("Deprecated in Android API")
     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-    override fun onProviderEnabled(provider: String) {}
+    override fun onProviderEnabled(provider: String) {
+        mainHandler.post { startGpsInternal() }
+    }
     override fun onProviderDisabled(provider: String) {}
 
     private fun emitLocation(loc: Location) {
