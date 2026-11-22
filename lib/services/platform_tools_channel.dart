@@ -48,10 +48,16 @@ class PlatformToolsChannel {
     }
   }
 
-  static Future<void> requestPermissions() async {
-    try {
-      await _method.invokeMethod('requestPermissions');
-    } catch (_) {}
+  static Future<void>? _permFuture;
+
+  /// Satu permintaan izin pada satu waktu (pemanggil lain ikut menunggu).
+  static Future<void> requestPermissions() {
+    return _permFuture ??= () async {
+      try {
+        await _method.invokeMethod('requestPermissions');
+      } catch (_) {}
+    }()
+        .whenComplete(() => _permFuture = null);
   }
 
   static Future<String> gpsDiag() async {
