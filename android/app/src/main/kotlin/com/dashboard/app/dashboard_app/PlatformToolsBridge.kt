@@ -146,39 +146,53 @@ class PlatformToolsBridge(private val activity: Activity) :
             "Fix diterima: $gpsEmitCount ($age)"
     }
 
-    private fun requestAllRuntimePermissions(result: MethodChannel.Result) {
-        val needed = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION,
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
-        )
+    // ---- Izin runtime: diminta BERTAHAP (lokasi dulu) dan tidak pernah tumpang tindih ----
+    private val permWaiters = mutableListOf<MethodChannel.Result>()
+    private var permInFlight = false
+    private val askedThisRound = mutableSetOf<String>()
+
+    private fun permissionGroups(): List<List<String>> {
+        val g = mutableListOf<List<String>>()
+        g.add(listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            needed.add(Manifest.permission.BLUETOOTH_SCAN)
-            needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            g.add(listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT))
         }
+        g.add(listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            needed.add(Manifest.permission.POST_NOTIFICATIONS)
+            g.add(listOf(Manifest.permission.POST_NOTIFICATIONS))
         }
-        val missing = needed.filter {
-            activity.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        return g
+    }
+
+    private fun requestAllRuntimePermissions(result: MethodChannel.Result) {
+        permWaiters.add(result)
+        if (permInFlight) return // sudah ada proses; ikut menunggu hasilnya
+        permInFlight = true
+        askedThisRound.clear()
+        requestNextPermissionGroup()
+    }
+
+    private fun requestNextPermissionGroup() {
+        for (group in permissionGroups()) {
+            val missing = group.filter {
+                activity.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (missing.isNotEmpty() && askedThisRound.add(group.first())) {
+                activity.requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
+                return
+            }
         }
-        if (missing.isEmpty()) {
-            startGpsInternal()
-            result.success(true)
-            return
-        }
-        // Selesaikan permintaan lama agar Future di Dart tidak menggantung
-        pendingPermResult?.success(false)
-        pendingPermResult = result
-        activity.requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
+        permInFlight = false
+        startGpsInternal()
+        val waiters = permWaiters.toList()
+        permWaiters.clear()
+        waiters.forEach { it.success(true) }
     }
 
     fun onRequestPermissionsResult(requestCode: Int) {
         if (requestCode == REQ_PERMISSIONS) {
             startGpsInternal()
-            pendingPermResult?.success(true)
-            pendingPermResult = null
+            requestNextPermissionGroup()
         }
     }
 
