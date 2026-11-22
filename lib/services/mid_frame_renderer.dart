@@ -14,6 +14,9 @@ class MidFrameRenderer {
   /// Batas karakter base64 untuk AT+MAPS (sama dengan MAPS_MAX_CHARS di referensi).
   static const int maxMapsChars = 7000;
 
+  /// Ukuran base64 terkecil yang pernah dicoba pada frame terakhir (untuk diagnosis).
+  static int lastMinChars = 0;
+
   static Future<String> renderFrameBase64({
     required AppSettings settings,
     required GpsState gps,
@@ -119,10 +122,14 @@ class MidFrameRenderer {
     // Frame yang tidak bisa dimuat dalam batas TIDAK dikirim (return '').
     const qualities = [72, 58, 46, 36, 28, 20, 14, 10];
     var current = image;
+    lastMinChars = 0;
     for (var attempt = 0; attempt < 4; attempt++) {
       for (final q in qualities) {
         final jpg = img.encodeJpg(current, quality: q);
         final b64 = base64Encode(jpg);
+        if (lastMinChars == 0 || b64.length < lastMinChars) {
+          lastMinChars = b64.length;
+        }
         if (b64.length <= maxChars) return b64;
       }
       final nw = (current.width * 0.85).round();
