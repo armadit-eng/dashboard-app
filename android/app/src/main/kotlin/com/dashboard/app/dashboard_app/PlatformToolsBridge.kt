@@ -122,8 +122,28 @@ class PlatformToolsBridge(private val activity: Activity) :
                 @Suppress("DEPRECATION")
                 activity.startActivityForResult(Intent.createChooser(intent, "Pilih Gambar"), REQ_PICK_IMAGE)
             }
+            "gpsDiag" -> result.success(gpsDiagText())
             else -> result.notImplemented()
         }
+    }
+
+    private var gpsEmitCount = 0
+    private var gpsLastEmitMs = 0L
+
+    @SuppressLint("MissingPermission")
+    private fun gpsDiagText(): String {
+        val fine = activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarse = activity.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val gpsOn = runCatching { locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false)
+        val netOn = runCatching { locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) }.getOrDefault(false)
+        val age = if (gpsLastEmitMs == 0L) "belum pernah" else "${(System.currentTimeMillis() - gpsLastEmitMs) / 1000} dtk lalu"
+        return "Izin lokasi presisi: ${if (fine) "ya" else "TIDAK"}\n" +
+            "Izin lokasi perkiraan: ${if (coarse) "ya" else "TIDAK"}\n" +
+            "GPS HP aktif: ${if (gpsOn) "ya" else "TIDAK (nyalakan Lokasi)"}\n" +
+            "Lokasi jaringan aktif: ${if (netOn) "ya" else "tidak"}\n" +
+            "Provider terdaftar: ${if (regProviders.isEmpty()) "tidak ada" else regProviders.joinToString()}\n" +
+            "Penerima data aplikasi: ${if (gpsSink != null) "siap" else "BELUM"}\n" +
+            "Fix diterima: $gpsEmitCount ($age)"
     }
 
     private fun requestAllRuntimePermissions(result: MethodChannel.Result) {
@@ -148,6 +168,8 @@ class PlatformToolsBridge(private val activity: Activity) :
             result.success(true)
             return
         }
+        // Selesaikan permintaan lama agar Future di Dart tidak menggantung
+        pendingPermResult?.success(false)
         pendingPermResult = result
         activity.requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
     }
@@ -261,6 +283,8 @@ class PlatformToolsBridge(private val activity: Activity) :
     override fun onProviderDisabled(provider: String) {}
 
     private fun emitLocation(loc: Location) {
+        gpsEmitCount++
+        gpsLastEmitMs = System.currentTimeMillis()
         mainHandler.post {
             gpsSink?.success(
                 mapOf(
