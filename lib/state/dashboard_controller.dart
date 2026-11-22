@@ -417,7 +417,6 @@ class DashboardController extends ChangeNotifier {
     _gpsWatchdog = Timer.periodic(const Duration(seconds: 12), (_) {
       final now = DateTime.now().millisecondsSinceEpoch;
       if (now - _lastGpsFixMs > 12000) {
-        unawaited(PlatformToolsChannel.requestPermissions());
         unawaited(PlatformToolsChannel.startGps());
       }
     });
