@@ -54,6 +54,14 @@ class PlatformToolsChannel {
     } catch (_) {}
   }
 
+  static Future<String> gpsDiag() async {
+    try {
+      return await _method.invokeMethod<String>('gpsDiag') ?? '-';
+    } catch (e) {
+      return 'Diagnosis gagal: $e';
+    }
+  }
+
   static Stream<NativeGpsFix> gpsStream() {
     _gpsStream ??= _gpsEvents.receiveBroadcastStream().map((ev) {
       final m = Map<String, dynamic>.from(ev as Map);
