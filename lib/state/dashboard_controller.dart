@@ -403,13 +403,15 @@ class DashboardController extends ChangeNotifier {
   }
 
   Future<void> _initLocationStream() async {
-    await PlatformToolsChannel.requestPermissions();
-    await PlatformToolsChannel.startGps();
+    // Dengarkan stream lebih dulu; jangan menunggu dialog izin (bisa menggantung).
     _gpsSub?.cancel();
     _gpsSub = PlatformToolsChannel.gpsStream().listen(
       _onGpsFix,
       onError: (_) {},
     );
+    unawaited(PlatformToolsChannel.requestPermissions()
+        .timeout(const Duration(seconds: 90), onTimeout: () {})
+        .then((_) => PlatformToolsChannel.startGps()));
     // Watchdog: kalau 12 detik tanpa fix, minta native mendaftar ulang GPS.
     _gpsWatchdog?.cancel();
     _gpsWatchdog = Timer.periodic(const Duration(seconds: 12), (_) {
@@ -659,6 +661,16 @@ class DashboardController extends ChangeNotifier {
     plannedStops = [stop];
     notifyListeners();
     await calculateRoute();
+  }
+
+  /// Tutup pratinjau rute: hapus semua tujuan dan rute aktif.
+  void clearRoute() {
+    plannedStops = [];
+    activeRoute = null;
+    isNavigating = false;
+    isRideLocked = false;
+    unawaited(PlatformToolsChannel.setWakelock(false));
+    notifyListeners();
   }
 
   Future<void> removeStopAt(int index) async {
