@@ -4,6 +4,8 @@ import android.graphics.Paint
 import android.graphics.Typeface
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.padding
@@ -20,11 +22,13 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.dashboard.app.dashboard_app.model.ElevationSample
 import com.dashboard.app.dashboard_app.model.HillGrade
 import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.min
@@ -220,17 +224,48 @@ fun ElevationProfileChart(
     samples: List<ElevationSample>,
     trackColor: Color,
     labelColor: Color,
+    selectedSampleIndex: Int? = null,
+    highlightStartDistM: Double? = null,
+    highlightEndDistM: Double? = null,
+    onScrubIndex: ((Int?) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
-    Canvas(modifier = modifier) {
+    val interactiveMod = if (onScrubIndex != null && samples.size >= 2) {
+        modifier
+            .pointerInput(samples) {
+                detectTapGestures(
+                    onTap = { off ->
+                        val frac = (off.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                        val idx = (frac * (samples.size - 1)).roundToInt().coerceIn(0, samples.lastIndex)
+                        onScrubIndex(idx)
+                    }
+                )
+            }
+            .pointerInput(samples) {
+                detectHorizontalDragGestures(
+                    onDragStart = { off ->
+                        val frac = (off.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                        onScrubIndex((frac * (samples.size - 1)).roundToInt().coerceIn(0, samples.lastIndex))
+                    },
+                    onHorizontalDrag = { change, _ ->
+                        change.consume()
+                        val frac = (change.position.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                        onScrubIndex((frac * (samples.size - 1)).roundToInt().coerceIn(0, samples.lastIndex))
+                    }
+                )
+            }
+    } else modifier
+
+    Canvas(modifier = interactiveMod) {
         if (samples.size < 2) return@Canvas
         val minE = samples.minOf { it.elevationM }
         val maxRaw = samples.maxOf { it.elevationM }
         val maxE = if ((maxRaw - minE) < 8.0) minE + 8.0 else maxRaw
+        val totalKm = samples.last().distanceKm.coerceAtLeast(0.1)
 
-        val padL = 8.dp.toPx()
+        val padL = 30.dp.toPx()
         val padR = 8.dp.toPx()
-        val padT = 14.dp.toPx()
+        val padT = 12.dp.toPx()
         val padB = 18.dp.toPx()
         val w = (size.width - padL - padR).coerceAtLeast(10f)
         val h = (size.height - padT - padB).coerceAtLeast(10f)
@@ -252,50 +287,81 @@ fun ElevationProfileChart(
             return Offset(x, y)
         }
 
-        val fillPath = Path().apply {
-            moveTo(padL, padT + h)
-            for (i in samples.indices) {
-                val p = pt(i)
-                lineTo(p.dxOrX(p), p.y)
-            }
-            lineTo(padL + w, padT + h)
-            close()
+        fun gradeColor(s: ElevationSample): Color = when {
+            s.gradePct >= 7.0 -> Color(0xFFEF4444)
+            s.gradePct >= 4.0 -> Color(0xFFF59E0B)
+            s.gradePct >= 2.0 -> Color(0xFFFACC15)
+            s.gradePct <= -7.0 -> Color(0xFF6366F1)
+            s.gradePct <= -4.0 -> Color(0xFFA855F7)
+            s.gradePct <= -2.0 -> Color(0xFFC084FC)
+            else -> Color(0xFF00E5A3)
         }
-        drawPath(path = fillPath, color = Color(0xFF00E5A3).copy(alpha = 0.12f))
+
+        // Highlight selected hill span background
+        if (highlightStartDistM != null && highlightEndDistM != null && highlightEndDistM > highlightStartDistM) {
+            val x1 = padL + ((highlightStartDistM / 1000.0) / totalKm).coerceIn(0.0, 1.0).toFloat() * w
+            val x2 = padL + ((highlightEndDistM / 1000.0) / totalKm).coerceIn(0.0, 1.0).toFloat() * w
+            drawRect(
+                color = Color(0xFFF59E0B).copy(alpha = 0.16f),
+                topLeft = Offset(x1, padT),
+                size = Size((x2 - x1).coerceAtLeast(4f), h)
+            )
+        }
+
+        // Vertical grade bars like reference chart
+        val colW = (w / samples.size.toFloat() * 0.72f).coerceIn(2f, 10.dp.toPx())
+        for (i in samples.indices) {
+            val p = pt(i)
+            val col = gradeColor(samples[i])
+            drawRect(
+                color = col.copy(alpha = 0.30f),
+                topLeft = Offset(p.x - colW / 2f, p.y),
+                size = Size(colW, (padT + h - p.y).coerceAtLeast(2f))
+            )
+        }
 
         for (i in 1 until samples.size) {
-            val col = when (samples[i].gradeType) {
-                HillGrade.UPHILL_STEEP -> Color(0xFFEF4444)
-                HillGrade.UPHILL_MILD -> Color(0xFFF59E0B)
-                HillGrade.DOWNHILL -> Color(0xFF38BDF8)
-                HillGrade.FLAT -> Color(0xFF00E5A3)
-            }
             drawLine(
-                color = col,
+                color = gradeColor(samples[i]),
                 start = pt(i - 1),
                 end = pt(i),
-                strokeWidth = 3.dp.toPx(),
+                strokeWidth = 2.6.dp.toPx(),
                 cap = StrokeCap.Round
             )
         }
 
+        if (selectedSampleIndex != null && selectedSampleIndex in samples.indices) {
+            val sp = pt(selectedSampleIndex)
+            drawLine(
+                color = Color.White.copy(alpha = 0.85f),
+                start = Offset(sp.x, padT),
+                end = Offset(sp.x, padT + h),
+                strokeWidth = 1.6.dp.toPx()
+            )
+            drawCircle(color = Color.White, radius = 5.dp.toPx(), center = sp)
+            drawCircle(color = Color(0xFF38BDF8), radius = 3.dp.toPx(), center = sp)
+        }
+
         val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = labelColor.toArgb()
-            textSize = 10f * density
+            textSize = 9.5f * density
             typeface = Typeface.DEFAULT
         }
+        drawContext.canvas.nativeCanvas.drawText("${maxRaw.roundToInt()}m", 0f, padT + 7f * density, tp)
+        drawContext.canvas.nativeCanvas.drawText("${minE.roundToInt()}m", 0f, padT + h, tp)
+        drawContext.canvas.nativeCanvas.drawText("0", padL, padT + h + 13f * density, tp)
+        val midTxt = String.format(Locale.US, "%.1f", totalKm / 2.0)
         drawContext.canvas.nativeCanvas.drawText(
-            "${minE.roundToInt()}m",
-            padL,
+            midTxt,
+            padL + w * 0.5f - tp.measureText(midTxt) * 0.5f,
             padT + h + 13f * density,
             tp
         )
-        val maxTxt = "Puncak ${maxRaw.roundToInt()}m"
-        val tw = tp.measureText(maxTxt)
+        val endTxt = String.format(Locale.US, "%.1f km", totalKm)
         drawContext.canvas.nativeCanvas.drawText(
-            maxTxt,
-            (padL + w - tw).coerceAtLeast(padL),
-            10f * density,
+            endTxt,
+            (padL + w - tp.measureText(endTxt)).coerceAtLeast(padL),
+            padT + h + 13f * density,
             tp
         )
     }

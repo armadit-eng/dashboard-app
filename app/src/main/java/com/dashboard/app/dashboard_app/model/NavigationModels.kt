@@ -118,6 +118,44 @@ data class WaypointArrivalSummary(
 )
 
 @Serializable
+data class HillSegment(
+    val id: Int,
+    val isUphill: Boolean,
+    val startDistM: Double,
+    val endDistM: Double,
+    val lengthM: Double,
+    val gainM: Double,
+    val avgGradePct: Double,
+    val maxGradePct: Double,
+    val dWh: Double,
+    val socPct: Double?,
+    val notable: Boolean,
+    val steep: Boolean
+)
+
+@Serializable
+data class DestWeatherSummary(
+    val tempC: Double,
+    val description: String,
+    val windKmh: Double,
+    val windDirLabel: String,
+    val rainProbAtArrivalPct: Int?,
+    val weatherCode: Int
+)
+
+@Serializable
+data class NavRouteAltOption(
+    val geometry: List<GeoPointX>,
+    val steps: List<RouteStepX>,
+    val distanceM: Double,
+    val durationSec: Double,
+    val elevationSamples: List<ElevationSample> = emptyList(),
+    val energyEstimate: RouteEnergyEstimate? = null,
+    val hillSegments: List<HillSegment> = emptyList(),
+    val legSummaries: List<WaypointArrivalSummary> = emptyList()
+)
+
+@Serializable
 data class NavRouteX(
     val geometry: List<GeoPointX>,
     val steps: List<RouteStepX>,
@@ -125,7 +163,11 @@ data class NavRouteX(
     val durationSec: Double,
     val elevationSamples: List<ElevationSample> = emptyList(),
     val energyEstimate: RouteEnergyEstimate? = null,
-    val legSummaries: List<WaypointArrivalSummary> = emptyList()
+    val legSummaries: List<WaypointArrivalSummary> = emptyList(),
+    val hillSegments: List<HillSegment> = emptyList(),
+    val destWeather: DestWeatherSummary? = null,
+    val selectedAlternativeIndex: Int = 0,
+    val alternativeOptions: List<NavRouteAltOption> = emptyList()
 )
 
 @Serializable

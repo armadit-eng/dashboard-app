@@ -239,4 +239,44 @@ class TelemetryAndPhysicsTest {
         assertTrue(RemoteApisService.isMapsShortUrl("https://maps.app.goo.gl/AbCd123"))
         assertFalse(RemoteApisService.isMapsShortUrl("Jl. Sudirman Jakarta"))
     }
+
+    @Test
+    fun analyzesHillSegmentsAndWeatherHelpers() {
+        assertEquals("Utara", RoutePhysics.windDirText(0.0))
+        assertEquals("Barat", RoutePhysics.windDirText(270.0))
+        assertEquals("curam", RoutePhysics.gradeLabel(8.2))
+        assertEquals("sedang", RoutePhysics.gradeLabel(-5.5))
+
+        val points = (0..12).map { i ->
+            GeoPointX(-7.0 + i * 0.0022, 111.0)
+        }
+        val elevs = listOf(100.0, 102.0, 112.0, 126.0, 142.0, 158.0, 160.0, 158.0, 145.0, 130.0, 116.0, 115.0, 115.0)
+        val res = RoutePhysics.buildElevationAndEnergy(
+            sampledPoints = points,
+            elevations = elevs,
+            totalDistanceKm = 3.0,
+            durationMin = 8.0,
+            bikeKg = 95.0,
+            riderKg = 70.0,
+            loadKg = 5.0,
+            calFactor = 1.0,
+            totalPackWh = 1440.0,
+            currentSocPct = 80.0
+        )
+        val hills = RoutePhysics.analyzeHillSegments(
+            samples = res.samples,
+            bikeKg = 95.0,
+            riderKg = 70.0,
+            loadKg = 5.0,
+            calFactor = 1.0,
+            totalPackWh = 1440.0
+        )
+        assertTrue(hills.any { it.isUphill && it.notable })
+        assertTrue(hills.any { !it.isUphill && it.notable })
+        val climb = hills.first { it.isUphill && it.notable }
+        assertTrue(climb.dWh > 0.0)
+        assertTrue(climb.gainM > 20.0)
+        val descent = hills.first { !it.isUphill && it.notable }
+        assertTrue(descent.dWh < 0.0)
+    }
 }

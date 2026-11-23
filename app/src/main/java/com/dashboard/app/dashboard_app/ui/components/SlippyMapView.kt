@@ -85,7 +85,11 @@ fun SlippyMapView(
     plannedStops: List<PlannedStop>,
     nearbySpklu: List<SpkluStation>,
     fieldNotes: List<FieldNotePin>,
+    selectedPin: GeoPointX? = null,
+    highlightCursorPoint: GeoPointX? = null,
+    highlightedHillPoints: List<GeoPointX> = emptyList(),
     onMapPanZoom: (newCenter: GeoPointX, newZoom: Double) -> Unit,
+    onMapTap: ((GeoPointX) -> Unit)? = null,
     onMapLongPress: (GeoPointX) -> Unit,
     onSpkluClick: (SpkluStation) -> Unit,
     onFieldNoteClick: ((FieldNotePin) -> Unit)? = null,
@@ -203,6 +207,9 @@ fun SlippyMapView(
                 }
                 .pointerInput(center, clampedZoom, widthPx, heightPx) {
                     detectTapGestures(
+                        onTap = { offset ->
+                            onMapTap?.invoke(screenToGeo(offset))
+                        },
                         onLongPress = { offset ->
                             onMapLongPress(screenToGeo(offset))
                         }
@@ -256,6 +263,51 @@ fun SlippyMapView(
                     color = c.accent,
                     style = Stroke(width = 5.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
                 )
+            }
+
+            // 2b. Highlighted hill stretch
+            if (highlightedHillPoints.size >= 2) {
+                val hPath = Path()
+                highlightedHillPoints.forEachIndexed { idx, gp ->
+                    val pt = geoToScreen(gp)
+                    if (idx == 0) hPath.moveTo(pt.x, pt.y) else hPath.lineTo(pt.x, pt.y)
+                }
+                drawPath(
+                    path = hPath,
+                    color = Color(0xFFF59E0B),
+                    style = Stroke(width = 7.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
+                )
+            }
+
+            // 2c. Elevation scrub cursor on map
+            if (highlightCursorPoint != null) {
+                val pt = geoToScreen(highlightCursorPoint)
+                drawCircle(color = Color.White, radius = 9.dp.toPx(), center = pt)
+                drawCircle(color = Color(0xFF38BDF8), radius = 6.dp.toPx(), center = pt)
+            }
+        }
+
+        // 2d. Tapped point pin marker
+        if (selectedPin != null) {
+            val pos = geoToScreen(selectedPin)
+            if (pos.x in -40f..(widthPx + 40f) && pos.y in -40f..(heightPx + 40f)) {
+                val dpX = with(density) { pos.x.toDp() - 16.dp }
+                val dpY = with(density) { pos.y.toDp() - 16.dp }
+                Box(
+                    modifier = Modifier
+                        .offset(x = dpX, y = dpY)
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFFEF4444).copy(alpha = 0.92f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .clip(CircleShape)
+                            .background(Color.White)
+                    )
+                }
             }
         }
 

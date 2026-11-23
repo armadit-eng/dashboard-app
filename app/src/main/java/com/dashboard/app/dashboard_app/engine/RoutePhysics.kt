@@ -4,16 +4,19 @@ import com.dashboard.app.dashboard_app.model.ElevationSample
 import com.dashboard.app.dashboard_app.model.FieldNotePin
 import com.dashboard.app.dashboard_app.model.GeoPointX
 import com.dashboard.app.dashboard_app.model.HillGrade
+import com.dashboard.app.dashboard_app.model.HillSegment
 import com.dashboard.app.dashboard_app.model.RouteEnergyEstimate
 import com.dashboard.app.dashboard_app.model.TripRecord
 import java.util.Locale
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -298,6 +301,108 @@ object RoutePhysics {
         }
         sb.appendLine("</gpx>")
         return sb.toString()
+    }
+
+    fun windDirText(deg: Double): String {
+        val dirs = listOf(
+            "Utara", "Timur Laut", "Timur", "Tenggara",
+            "Selatan", "Barat Daya", "Barat", "Barat Laut"
+        )
+        val idx = ((((deg % 360.0) + 360.0) % 360.0) / 45.0).roundToInt() % 8
+        return dirs[idx]
+    }
+
+    fun gradeLabel(gradePct: Double): String {
+        val g = abs(gradePct)
+        return when {
+            g >= 7.0 -> "curam"
+            g >= 4.0 -> "sedang"
+            else -> "landai"
+        }
+    }
+
+    fun analyzeHillSegments(
+        samples: List<ElevationSample>,
+        bikeKg: Double,
+        riderKg: Double,
+        loadKg: Double,
+        calFactor: Double,
+        totalPackWh: Double
+    ): List<HillSegment> {
+        if (samples.size < 3) return emptyList()
+        data class RawRun(val startIdx: Int, var endIdx: Int, val isUp: Boolean, var maxAbsG: Double)
+        val runs = mutableListOf<RawRun>()
+        var cur: RawRun? = null
+        for (i in 1 until samples.size) {
+            val g = samples[i].gradePct
+            if (abs(g) < 1.6) {
+                if (cur != null) {
+                    runs.add(cur)
+                    cur = null
+                }
+                continue
+            }
+            val up = g > 0.0
+            if (cur == null) {
+                cur = RawRun(i - 1, i, up, abs(g))
+            } else if (cur.isUp == up) {
+                cur.endIdx = i
+                cur.maxAbsG = max(cur.maxAbsG, abs(g))
+            } else {
+                runs.add(cur)
+                cur = RawRun(i - 1, i, up, abs(g))
+            }
+        }
+        if (cur != null) runs.add(cur)
+
+        // Merge same-direction runs separated by < 120m
+        val merged = mutableListOf<RawRun>()
+        for (r in runs) {
+            val prev = merged.lastOrNull()
+            val gapM = if (prev != null) {
+                (samples[r.startIdx].distanceKm - samples[prev.endIdx].distanceKm) * 1000.0
+            } else Double.MAX_VALUE
+            if (prev != null && prev.isUp == r.isUp && gapM <= 120.0) {
+                prev.endIdx = r.endIdx
+                prev.maxAbsG = max(prev.maxAbsG, r.maxAbsG)
+            } else {
+                merged.add(r)
+            }
+        }
+
+        val totalMassKg = bikeKg + riderKg + loadKg
+        val out = mutableListOf<HillSegment>()
+        merged.forEachIndexed { _, r ->
+            val startM = samples[r.startIdx].distanceKm * 1000.0
+            val endM = samples[r.endIdx].distanceKm * 1000.0
+            val lenM = max(1.0, endM - startM)
+            val gainM = samples[r.endIdx].elevationM - samples[r.startIdx].elevationM
+            if (lenM < 100.0 || abs(gainM) < 4.0) return@forEachIndexed
+            val avgG = (gainM / lenM) * 100.0
+            val gravWh = if (gainM >= 0.0) {
+                ((totalMassKg * GRAVITY * gainM) / 3600.0 / ETA_DRIVE) * calFactor
+            } else {
+                -((totalMassKg * GRAVITY * (-gainM)) / 3600.0 * ETA_REGEN)
+            }
+            val socPct = if (totalPackWh > 0.0) -(gravWh / totalPackWh) * 100.0 else null
+            out.add(
+                HillSegment(
+                    id = out.size,
+                    isUphill = r.isUp,
+                    startDistM = startM,
+                    endDistM = endM,
+                    lengthM = lenM,
+                    gainM = gainM,
+                    avgGradePct = avgG,
+                    maxGradePct = if (r.isUp) r.maxAbsG else -r.maxAbsG,
+                    dWh = gravWh,
+                    socPct = socPct,
+                    notable = abs(avgG) >= 3.5 && abs(gainM) >= 12.0,
+                    steep = abs(avgG) >= 6.0 || r.maxAbsG >= 8.0
+                )
+            )
+        }
+        return out
     }
 
     private fun xmlEscape(s: String): String =

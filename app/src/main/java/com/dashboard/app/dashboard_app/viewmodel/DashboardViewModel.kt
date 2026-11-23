@@ -1029,6 +1029,40 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun reorderStop(fromIndex: Int, toIndex: Int) {
+        val cur = _uiState.value.plannedStops.toMutableList()
+        if (fromIndex !in cur.indices || toIndex !in cur.indices || fromIndex == toIndex) return
+        val item = cur.removeAt(fromIndex)
+        cur.add(toIndex, item)
+        _uiState.update { it.copy(plannedStops = cur) }
+        calculateRoute()
+    }
+
+    fun selectRouteAlternative(index: Int) {
+        val route = _uiState.value.activeRoute ?: return
+        val alt = route.alternativeOptions.getOrNull(index) ?: return
+        val updated = route.copy(
+            geometry = alt.geometry,
+            steps = alt.steps,
+            distanceM = alt.distanceM,
+            durationSec = alt.durationSec,
+            elevationSamples = alt.elevationSamples,
+            energyEstimate = alt.energyEstimate,
+            hillSegments = alt.hillSegments,
+            legSummaries = alt.legSummaries,
+            selectedAlternativeIndex = index
+        )
+        _uiState.update {
+            it.copy(
+                activeRoute = updated,
+                activeStepIndex = 0,
+                remainingDistKm = updated.distanceM / 1000.0,
+                etaMin = updated.durationSec / 60.0,
+                distToNextStepM = updated.steps.firstOrNull()?.distanceM ?: 0.0
+            )
+        }
+    }
+
     fun calculateRoute() {
         val cur = _uiState.value
         if (cur.plannedStops.isEmpty()) return
@@ -1204,7 +1238,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 viewModelScope.launch { storage.saveCalibrationLogs(nextCalib) }
             }
         }
-        saveCurrentTripAndReset(isPartial = false)
+        saveCurrentTripAndReset(isPartial = false, predictedWh = est?.netWh)
     }
 
     fun refreshNearbySpklu(onDone: (() -> Unit)? = null) {
@@ -1244,13 +1278,17 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun addFieldNote(name: String, category: String, note: String) {
         val loc = _uiState.value.gpsState.location ?: GeoPointX(-6.1754, 106.8272)
+        addFieldNoteAt(name, category, note, loc.lat, loc.lng)
+    }
+
+    fun addFieldNoteAt(name: String, category: String, note: String, lat: Double, lng: Double) {
         val pin = FieldNotePin(
             id = "fn_${System.currentTimeMillis()}",
             name = name,
             category = category,
             note = note,
-            lat = loc.lat,
-            lng = loc.lng,
+            lat = lat,
+            lng = lng,
             timestampMs = System.currentTimeMillis()
         )
         val next = listOf(pin) + _uiState.value.fieldNotes
@@ -1262,6 +1300,10 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         val next = _uiState.value.fieldNotes.filterNot { it.id == id }
         _uiState.update { it.copy(fieldNotes = next) }
         viewModelScope.launch { storage.saveFieldNotes(next) }
+    }
+
+    fun dismissTripSummaryCard() {
+        _uiState.update { it.copy(tripSummaryCard = null) }
     }
 
     fun savePlace(place: SavedPlace) {
@@ -1397,7 +1439,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(screenMirrorActive = false) }
     }
 
-    fun saveCurrentTripAndReset(isPartial: Boolean = false) {
+    fun saveCurrentTripAndReset(isPartial: Boolean = false, predictedWh: Double? = null) {
         val st = _uiState.value
         val trip = st.liveTrip
         if (trip.distanceKm < 0.05 && trip.energyWh < 1.0) {
@@ -1428,15 +1470,23 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             samples = st.liveChartPoints.toList()
         )
         val durMin = ((now - startMs) / 60_000L).toInt().coerceAtLeast(1)
+        val errPct = if (predictedWh != null && predictedWh > 5.0) {
+            ((rec.energyWh - predictedWh) / predictedWh) * 100.0
+        } else null
         val summaryCard = TripSummaryCardData(
             title = if (isPartial) "RINGKASAN TRIP (JEDA)" else "RINGKASAN PERJALANAN",
             distanceKm = rec.distanceKm,
             durationMin = durMin,
             energyWh = rec.energyWh,
+            regenWh = rec.regenWh,
             whPerKm = rec.whPerKm,
             maxSpeedKmh = rec.maxSpeedKmh,
+            avgSpeedKmh = rec.avgSpeedKmh,
+            maxPowerW = rec.maxPowerW,
             ridingScore = rec.ridingScore,
-            expiresAtMs = now + 22_000L
+            predictedWh = predictedWh,
+            errorPct = errPct,
+            expiresAtMs = now + 25_000L
         )
         val nextHistory = listOf(rec) + st.tripHistory
         _uiState.update {

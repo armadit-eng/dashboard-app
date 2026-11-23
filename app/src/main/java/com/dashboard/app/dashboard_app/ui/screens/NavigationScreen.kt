@@ -7,6 +7,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,11 +26,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AddLocationAlt
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.BookmarkAdd
@@ -39,6 +42,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.EvStation
+import androidx.compose.material.icons.rounded.FitScreen
 import androidx.compose.material.icons.rounded.GpsFixed
 import androidx.compose.material.icons.rounded.GpsOff
 import androidx.compose.material.icons.rounded.Image
@@ -47,8 +51,12 @@ import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.MyLocation
 import androidx.compose.material.icons.rounded.Navigation
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Remove
+import androidx.compose.material.icons.rounded.Route
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -95,21 +103,31 @@ import com.dashboard.app.dashboard_app.MirrorRegionOverlay
 import com.dashboard.app.dashboard_app.engine.RoutePhysics
 import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.GeoPointX
+import com.dashboard.app.dashboard_app.model.HillSegment
 import com.dashboard.app.dashboard_app.model.MapStyleOption
 import com.dashboard.app.dashboard_app.model.PlannedStop
 import com.dashboard.app.dashboard_app.model.SavedPlace
 import com.dashboard.app.dashboard_app.model.SpkluStation
 import com.dashboard.app.dashboard_app.service.RemoteApisService
 import com.dashboard.app.dashboard_app.service.TileCacheService
-import com.dashboard.app.dashboard_app.ui.components.CockpitCard
-import com.dashboard.app.dashboard_app.ui.components.ElevationProfileChart
+import com.dashboard.app.dashboard_app.ui.components.CatatNamaDialog
+import com.dashboard.app.dashboard_app.ui.components.FavoritesBottomSheet
+import com.dashboard.app.dashboard_app.ui.components.MapPlacePopupCard
+import com.dashboard.app.dashboard_app.ui.components.MultiStopPlannerSheet
 import com.dashboard.app.dashboard_app.ui.components.OfflineMapSection
+import com.dashboard.app.dashboard_app.ui.components.RoutePreviewSheetCard
 import com.dashboard.app.dashboard_app.ui.components.SlippyMapView
+import com.dashboard.app.dashboard_app.ui.components.TappedMapPlace
+import com.dashboard.app.dashboard_app.ui.components.TripPrepDialog
 import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
 import com.dashboard.app.dashboard_app.viewmodel.DashboardUiState
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -119,13 +137,16 @@ fun NavigationScreen(
     onSetSingleDestination: (PlannedStop) -> Unit,
     onAddStop: (PlannedStop) -> Unit,
     onRemoveStopAt: (Int) -> Unit,
+    onReorderStop: (Int, Int) -> Unit,
+    onSelectRouteAlternative: (Int) -> Unit,
     onClearRoute: () -> Unit,
     onStartNavigation: () -> Unit,
     onStopNavigation: () -> Unit,
     onRefreshSpklu: ((() -> Unit)?) -> Unit,
     onAddUserSpklu: (name: String, socket: String, lat: Double, lng: Double) -> Unit,
-    onAddFieldNote: (name: String, category: String, note: String) -> Unit,
+    onAddFieldNoteAt: (name: String, category: String, note: String, lat: Double, lng: Double) -> Unit,
     onSavePlace: (SavedPlace) -> Unit,
+    onRemoveSavedPlace: (String) -> Unit,
     onStartMidStreaming: () -> Unit,
     onStopMidStreaming: () -> Unit,
     onRequestScreenMirror: () -> Unit,
@@ -162,10 +183,92 @@ fun NavigationScreen(
     var showNotesSheet by remember { mutableStateOf(false) }
     var showMidSheet by remember { mutableStateOf(false) }
     var showMultiStopSheet by remember { mutableStateOf(false) }
+    var showFavoritesSheet by remember { mutableStateOf(false) }
     var showGpsDiag by remember { mutableStateOf(false) }
     var spkluDialogItem by remember { mutableStateOf<SpkluStation?>(null) }
 
-    var longPressPoint by remember { mutableStateOf<GeoPointX?>(null) }
+    var showRoutePreview by remember { mutableStateOf(false) }
+    var previewDetailsExpanded by remember { mutableStateOf(true) }
+    var showTripPrepDialog by remember { mutableStateOf(false) }
+    var tappedPlace by remember { mutableStateOf<TappedMapPlace?>(null) }
+    var catatTargetPoint by remember { mutableStateOf<GeoPointX?>(null) }
+    var plannerPickMode by remember { mutableStateOf(false) }
+    var scrubSampleIdx by remember { mutableStateOf<Int?>(null) }
+    var selectedHill by remember { mutableStateOf<HillSegment?>(null) }
+    var showAllHills by remember { mutableStateOf(false) }
+
+    val route = state.activeRoute
+    LaunchedEffect(route) {
+        scrubSampleIdx = null
+        selectedHill = null
+        showAllHills = false
+        if (route == null) {
+            showRoutePreview = false
+        } else if (!state.isNavigating) {
+            showRoutePreview = true
+            tappedPlace = null
+        }
+    }
+    LaunchedEffect(state.isNavigating) {
+        if (state.isNavigating) {
+            showRoutePreview = false
+            tappedPlace = null
+            followRider = true
+            state.gpsState.location?.let { mapCenter = it }
+            if (mapZoom < 16.0) mapZoom = 16.5
+        }
+    }
+
+    fun selectPointOnMap(gp: GeoPointX) {
+        if (state.isRideLocked) return
+        if (plannerPickMode) {
+            plannerPickMode = false
+            onAddStop(
+                PlannedStop(
+                    id = "pick_${System.currentTimeMillis()}",
+                    label = String.format(Locale.US, "Titik %.4f, %.4f", gp.lat, gp.lng),
+                    lat = gp.lat,
+                    lng = gp.lng
+                )
+            )
+            return
+        }
+        searchResults = emptyList()
+        val origin = state.gpsState.location
+        val straightKm = origin?.let { RoutePhysics.haversineKm(it, gp) }
+        tappedPlace = TappedMapPlace(
+            point = gp,
+            name = "Titik Peta",
+            address = "",
+            loading = true,
+            straightKm = straightKm
+        )
+        scope.launch {
+            val geoDeferred = async { RemoteApisService.reverseGeocode(gp.lat, gp.lng) }
+            val routeDeferred = async {
+                if (origin != null) RemoteApisService.fetchQuickRouteSummary(origin, gp) else null
+            }
+            val geo = geoDeferred.await()
+            val rt = routeDeferred.await()
+            val cur = tappedPlace
+            if (cur != null && cur.point == gp) {
+                val placeName = geo?.road?.takeIf { it.isNotBlank() }
+                    ?: geo?.area?.takeIf { it.isNotBlank() }
+                    ?: "Titik Peta"
+                val addr = listOfNotNull(
+                    geo?.road?.takeIf { it.isNotBlank() },
+                    geo?.area?.takeIf { it.isNotBlank() }
+                ).distinct().joinToString(", ")
+                tappedPlace = cur.copy(
+                    name = placeName,
+                    address = addr,
+                    loading = false,
+                    routeKm = rt?.first,
+                    routeMin = rt?.second
+                )
+            }
+        }
+    }
 
     fun runSearch() {
         val q = searchQuery.trim()
@@ -212,7 +315,6 @@ fun NavigationScreen(
     }
 
     val style = MapStyleOption.fromId(state.settings.mapStyleId)
-    val route = state.activeRoute
 
     // Dialogs & Bottom Sheets
     if (showGpsDiag) {
@@ -285,46 +387,54 @@ fun NavigationScreen(
         )
     }
 
-    longPressPoint?.let { gp ->
-        AlertDialog(
-            onDismissRequest = { longPressPoint = null },
-            title = { Text("Titik Peta Dipilih") },
-            text = {
-                Text(String.format(Locale.US, "Koordinat: %.5f, %.5f", gp.lat, gp.lng))
+    catatTargetPoint?.let { cPt ->
+        CatatNamaDialog(
+            initialLat = cPt.lat,
+            initialLng = cPt.lng,
+            gpsLocation = state.gpsState.location,
+            onSaveNoteAt = onAddFieldNoteAt,
+            onDismiss = { catatTargetPoint = null }
+        )
+    }
+
+    if (showTripPrepDialog && route != null) {
+        TripPrepDialog(
+            settings = state.settings,
+            route = route,
+            currentSocPct = state.effective.combinedSocPct,
+            onUpdateSettings = onUpdateSettings,
+            onSkip = {
+                showTripPrepDialog = false
+                showRoutePreview = false
+                onStartNavigation()
             },
-            confirmButton = {
-                Button(onClick = {
-                    longPressPoint = null
-                    onSetSingleDestination(
-                        PlannedStop(
-                            id = "pin_${System.currentTimeMillis()}",
-                            label = "Pin Peta",
-                            lat = gp.lat,
-                            lng = gp.lng
-                        )
+            onStartWithWeights = { rKg, lKg, noAsk ->
+                onUpdateSettings(
+                    state.settings.copy(
+                        riderWeightKg = rKg,
+                        loadWeightKg = lKg,
+                        tripPrepAsk = if (noAsk) false else state.settings.tripPrepAsk
                     )
-                }) {
-                    Text("Navigasi ke Sini")
-                }
+                )
+                showTripPrepDialog = false
+                showRoutePreview = false
+                onStartNavigation()
             },
-            dismissButton = {
-                Row {
-                    TextButton(onClick = {
-                        longPressPoint = null
-                        onAddStop(
-                            PlannedStop(
-                                id = "stop_${System.currentTimeMillis()}",
-                                label = "Stop Peta",
-                                lat = gp.lat,
-                                lng = gp.lng
-                            )
-                        )
-                    }) {
-                        Text("Tambah Stop")
-                    }
-                    TextButton(onClick = { longPressPoint = null }) { Text("Batal") }
-                }
-            }
+            onDismiss = { showTripPrepDialog = false }
+        )
+    }
+
+    if (showFavoritesSheet) {
+        FavoritesBottomSheet(
+            places = state.savedPlaces,
+            onSelectPlace = { p ->
+                showFavoritesSheet = false
+                onSetSingleDestination(PlannedStop(id = p.id, label = p.name, lat = p.lat, lng = p.lng))
+                followRider = false
+                mapCenter = GeoPointX(p.lat, p.lng)
+            },
+            onDeletePlace = onRemoveSavedPlace,
+            onDismiss = { showFavoritesSheet = false }
         )
     }
 
@@ -583,42 +693,6 @@ fun NavigationScreen(
     }
 
     if (showNotesSheet) {
-        var noteTitle by remember { mutableStateOf("") }
-        var noteBody by remember { mutableStateOf("") }
-        var cat by remember { mutableStateOf("Charger / Colokan") }
-        var showAddNoteDialog by remember { mutableStateOf(false) }
-
-        if (showAddNoteDialog) {
-            AlertDialog(
-                onDismissRequest = { showAddNoteDialog = false },
-                title = { Text("Pin Lokasi Lapangan") },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(value = noteTitle, onValueChange = { noteTitle = it }, label = { Text("Nama Lokasi") })
-                        OutlinedTextField(value = noteBody, onValueChange = { noteBody = it }, label = { Text("Catatan") })
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            listOf("Charger / Colokan", "Bengkel EV", "Rute Favorit").forEach { itemCat ->
-                                FilterChip(selected = cat == itemCat, onClick = { cat = itemCat }, label = { Text(itemCat) })
-                            }
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(onClick = {
-                        if (noteTitle.isNotBlank()) {
-                            onAddFieldNote(noteTitle.trim(), cat, noteBody.trim())
-                            noteTitle = ""
-                            noteBody = ""
-                        }
-                        showAddNoteDialog = false
-                    }) {
-                        Text("Simpan Pin")
-                    }
-                },
-                dismissButton = { TextButton(onClick = { showAddNoteDialog = false }) { Text("Batal") } }
-            )
-        }
-
         ModalBottomSheet(
             onDismissRequest = { showNotesSheet = false },
             containerColor = c.surfaceCard
@@ -633,7 +707,10 @@ fun NavigationScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Catatan Lapangan", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
-                    TextButton(onClick = { showAddNoteDialog = true }) {
+                    TextButton(onClick = {
+                        showNotesSheet = false
+                        catatTargetPoint = state.gpsState.location ?: mapCenter
+                    }) {
                         Text("+ Tambah Pin")
                     }
                     if (state.fieldNotes.isNotEmpty()) {
@@ -645,7 +722,11 @@ fun NavigationScreen(
                     }
                 }
                 if (state.fieldNotes.isEmpty()) {
-                    Text("Belum ada pin lapangan tersimpan.", color = c.textMuted, modifier = Modifier.padding(vertical = 20.dp))
+                    Text(
+                        "Belum ada pin lapangan. Ketuk peta lalu pilih \"Catat nama\" atau tekan + Tambah Pin.",
+                        color = c.textMuted,
+                        modifier = Modifier.padding(vertical = 20.dp)
+                    )
                 } else {
                     LazyColumn(
                         modifier = Modifier.heightIn(max = 360.dp),
@@ -845,56 +926,37 @@ fun NavigationScreen(
     }
 
     if (showMultiStopSheet) {
-        ModalBottomSheet(
-            onDismissRequest = { showMultiStopSheet = false },
-            containerColor = c.surfaceCard
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 8.dp)
-            ) {
-                Text("Perencana Multi-Stop", style = MaterialTheme.typography.headlineSmall)
-                Spacer(Modifier.height(10.dp))
-                LazyColumn(
-                    modifier = Modifier.heightIn(max = 320.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    itemsIndexed(state.plannedStops) { idx, st ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(28.dp)
-                                    .clip(CircleShape)
-                                    .background(c.accent),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text("${idx + 1}", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            }
-                            Spacer(Modifier.width(10.dp))
-                            Text(st.label, modifier = Modifier.weight(1f))
-                            IconButton(onClick = { onRemoveStopAt(idx) }) {
-                                Icon(Icons.Rounded.DeleteOutline, contentDescription = "Hapus titik", tint = c.danger)
-                            }
-                        }
-                    }
-                }
-                Spacer(Modifier.height(12.dp))
-                OutlinedButton(
-                    onClick = {
-                        showMultiStopSheet = false
-                        onClearRoute()
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Hapus Semua Rute")
-                }
-                Spacer(Modifier.height(18.dp))
-            }
-        }
+        MultiStopPlannerSheet(
+            stops = state.plannedStops,
+            hasGps = state.gpsState.location != null,
+            onAddCurrentLocationStop = {
+                val loc = state.gpsState.location ?: return@MultiStopPlannerSheet
+                onAddStop(
+                    PlannedStop(
+                        id = "cur_${System.currentTimeMillis()}",
+                        label = "Lokasi Saat Ini",
+                        lat = loc.lat,
+                        lng = loc.lng
+                    )
+                )
+            },
+            onPickOnMap = { plannerPickMode = true },
+            onMoveStop = onReorderStop,
+            onRemoveStopAt = onRemoveStopAt,
+            onClearAll = onClearRoute,
+            onDismiss = { showMultiStopSheet = false }
+        )
+    }
+
+    val scrubPoint = scrubSampleIdx?.let { route?.elevationSamples?.getOrNull(it)?.point }
+    val highlightedHillPts = remember(route, selectedHill) {
+        val h = selectedHill
+        if (route != null && h != null && route.elevationSamples.size >= 2) {
+            route.elevationSamples.filter {
+                val dM = it.distanceKm * 1000.0
+                dM >= h.startDistM - 80.0 && dM <= h.endDistM + 80.0
+            }.map { it.point }
+        } else emptyList()
     }
 
     // Main Map + Floating HUD Stack
@@ -912,16 +974,21 @@ fun NavigationScreen(
             plannedStops = state.plannedStops,
             nearbySpklu = state.nearbySpklu,
             fieldNotes = state.fieldNotes,
+            selectedPin = tappedPlace?.point,
+            highlightCursorPoint = scrubPoint,
+            highlightedHillPoints = highlightedHillPts,
             onMapPanZoom = { newCenter, newZoom ->
                 followRider = false
                 mapCenter = newCenter
                 mapZoom = newZoom
             },
-            onMapLongPress = { gp ->
-                longPressPoint = gp
-            },
+            onMapTap = { gp -> selectPointOnMap(gp) },
+            onMapLongPress = { gp -> selectPointOnMap(gp) },
             onSpkluClick = { s ->
                 spkluDialogItem = s
+            },
+            onFieldNoteClick = { n ->
+                selectPointOnMap(GeoPointX(n.lat, n.lng))
             },
             modifier = Modifier.fillMaxSize()
         )
@@ -936,28 +1003,80 @@ fun NavigationScreen(
         ) {
             if (state.isNavigating && route != null && route.steps.isNotEmpty()) {
                 val curStep = route.steps[state.activeStepIndex.coerceIn(0, route.steps.lastIndex)]
+                val arriveTimeStr = remember(state.etaMin) {
+                    val etaMs = System.currentTimeMillis() + (state.etaMin.coerceAtLeast(1.0) * 60_000.0).toLong()
+                    SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(etaMs))
+                }
+                val arrSoc = route.energyEstimate?.socAtArrivalPct
+                val steepAhead = route.hillSegments.firstOrNull { it.steep }
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     color = c.surfaceCard.copy(alpha = 0.94f),
                     border = BorderStroke(1.5.dp, c.accent)
                 ) {
-                    Row(
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Icon(Icons.Rounded.Navigation, contentDescription = null, tint = c.accent, modifier = Modifier.size(32.dp))
-                        Spacer(Modifier.width(12.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("${state.distToNextStepM.roundToInt()} m", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = c.accent)
-                            Text(curStep.instruction, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                        }
-                        IconButton(
-                            onClick = { onSetRideLocked(true) },
-                            modifier = Modifier.testTag("lock_screen_nav_button")
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Rounded.Lock, contentDescription = "Kunci Layar Berkendara", tint = c.warning)
+                            Icon(Icons.Rounded.Navigation, contentDescription = null, tint = c.accent, modifier = Modifier.size(30.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("${state.distToNextStepM.roundToInt()} m", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = c.accent)
+                                Text(curStep.instruction, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                            IconButton(
+                                onClick = { onSetRideLocked(true) },
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .testTag("lock_screen_nav_button")
+                            ) {
+                                Icon(Icons.Rounded.Lock, contentDescription = "Kunci Layar Berkendara", tint = c.warning)
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "${state.etaMin.roundToInt()} mnt • tiba $arriveTimeStr • ${String.format(Locale.US, "%.1f", state.remainingDistKm)} km",
+                                fontSize = 11.5.sp,
+                                color = c.textMuted,
+                                modifier = Modifier.weight(1f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (arrSoc != null) {
+                                Surface(
+                                    shape = CircleShape,
+                                    color = if (arrSoc < 15.0) c.danger.copy(alpha = 0.18f) else c.accent.copy(alpha = 0.16f),
+                                    modifier = Modifier
+                                        .clip(CircleShape)
+                                        .clickable { showSpkluSheet = true }
+                                ) {
+                                    Text(
+                                        "Tiba ${arrSoc.roundToInt()}%" +
+                                            if (state.spkluAheadKm != null) " • SPKLU ${String.format(Locale.US, "%.1f", state.spkluAheadKm)}km" else "",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (arrSoc < 15.0) c.danger else c.accent,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                    )
+                                }
+                            }
+                        }
+                        if (steepAhead != null) {
+                            Text(
+                                "${if (steepAhead.isUphill) "▲ Tanjakan" else "▼ Turunan"} maks ${abs(steepAhead.maxGradePct).roundToInt()}% di km ${String.format(Locale.US, "%.1f", steepAhead.startDistM / 1000.0)}",
+                                fontSize = 11.sp,
+                                color = c.warning
+                            )
                         }
                     }
                 }
@@ -1053,6 +1172,118 @@ fun NavigationScreen(
                         }
                     }
                 }
+                // Quick action pills below search bar (Favorit, Simpan, Trip Planner)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Surface(
+                        shape = CircleShape,
+                        color = c.surfaceCard.copy(alpha = 0.94f),
+                        border = BorderStroke(1.dp, c.borderSubtle),
+                        modifier = Modifier
+                            .height(38.dp)
+                            .clip(CircleShape)
+                            .clickable { showFavoritesSheet = true }
+                            .testTag("quick_favorites_chip")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Rounded.Star, contentDescription = null, tint = Color(0xFFFACC15), modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(5.dp))
+                            Text("Favorit", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                    Surface(
+                        shape = CircleShape,
+                        color = c.surfaceCard.copy(alpha = 0.94f),
+                        border = BorderStroke(1.dp, c.borderSubtle),
+                        modifier = Modifier
+                            .height(38.dp)
+                            .clip(CircleShape)
+                            .clickable {
+                                val target = state.plannedStops.lastOrNull()?.let {
+                                    SavedPlace(it.id, it.label, "Disimpan", it.lat, it.lng, System.currentTimeMillis())
+                                } ?: state.gpsState.location?.let { gp ->
+                                    SavedPlace(
+                                        id = "loc_${System.currentTimeMillis()}",
+                                        name = state.gpsState.roadName.ifBlank { "Lokasi Tersimpan" },
+                                        category = "Lokasi Saya",
+                                        lat = gp.lat,
+                                        lng = gp.lng,
+                                        createdAtMs = System.currentTimeMillis()
+                                    )
+                                }
+                                if (target != null) {
+                                    onSavePlace(target)
+                                } else {
+                                    showFavoritesSheet = true
+                                }
+                            }
+                            .testTag("quick_save_chip")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Rounded.Add, contentDescription = null, tint = c.accent, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Simpan", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                    Surface(
+                        shape = CircleShape,
+                        color = c.surfaceCard.copy(alpha = 0.94f),
+                        border = BorderStroke(1.dp, c.borderSubtle),
+                        modifier = Modifier
+                            .height(38.dp)
+                            .clip(CircleShape)
+                            .clickable { showMultiStopSheet = true }
+                            .testTag("quick_trip_planner_chip")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Rounded.Route, contentDescription = null, tint = c.accentSecondary, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(5.dp))
+                            Text("Trip Planner", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
+
+            if (plannerPickMode) {
+                Surface(
+                    shape = CircleShape,
+                    color = c.accent,
+                    modifier = Modifier.align(Alignment.CenterHorizontally)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Ketuk di peta untuk memilih titik tujuan",
+                            color = Color.Black,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Icon(
+                            Icons.Rounded.Close,
+                            contentDescription = "Batal pilih peta",
+                            tint = Color.Black,
+                            modifier = Modifier
+                                .size(18.dp)
+                                .clickable { plannerPickMode = false }
+                        )
+                    }
+                }
             }
 
             if (state.gpsState.location == null) {
@@ -1075,15 +1306,84 @@ fun NavigationScreen(
                     }
                 }
             }
+
+            // Compact live speed/telemetry pill on top-left when preview & popup aren't covering map
+            if (!showRoutePreview && tappedPlace == null) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = c.surfaceCard.copy(alpha = 0.92f),
+                    border = BorderStroke(1.dp, c.borderSubtle),
+                    modifier = Modifier.align(Alignment.Start)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            "${state.effective.speedKmh?.roundToInt()?.toString() ?: "0"} km/h",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = c.accent
+                        )
+                        Text(
+                            "${state.effective.combinedSocPct?.roundToInt()?.toString() ?: "—"}%",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            "${state.effective.combinedPowerW?.roundToInt()?.toString() ?: "—"}W",
+                            fontSize = 11.5.sp,
+                            color = c.textMuted
+                        )
+                    }
+                }
+            }
         }
 
         // Right Map Floating Buttons (>=48dp touch targets)
+        val rightButtonsBottom = when {
+            showRoutePreview && route != null -> 310.dp
+            tappedPlace != null -> 295.dp
+            state.isNavigating -> 166.dp
+            else -> 108.dp
+        }
         Column(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 12.dp, bottom = if (route != null) 250.dp else 108.dp),
+                .padding(end = 12.dp, bottom = rightButtonsBottom),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            MapFabButton(
+                icon = Icons.Rounded.Add,
+                desc = "Perbesar Peta",
+                tint = Color.White,
+                testTag = "map_zoom_in_fab"
+            ) {
+                mapZoom = (mapZoom + 1.0).coerceAtMost(18.0)
+            }
+            MapFabButton(
+                icon = Icons.Rounded.Remove,
+                desc = "Perkecil Peta",
+                tint = Color.White,
+                testTag = "map_zoom_out_fab"
+            ) {
+                mapZoom = (mapZoom - 1.0).coerceAtLeast(5.0)
+            }
+            if (route != null && route.geometry.size >= 2) {
+                MapFabButton(
+                    icon = Icons.Rounded.FitScreen,
+                    desc = "Lihat Seluruh Rute",
+                    tint = c.accentSecondary,
+                    testTag = "map_fit_route_fab"
+                ) {
+                    followRider = false
+                    val lats = route.geometry.map { it.lat }
+                    val lngs = route.geometry.map { it.lng }
+                    mapCenter = GeoPointX((lats.min() + lats.max()) / 2.0, (lngs.min() + lngs.max()) / 2.0)
+                    mapZoom = 12.8
+                }
+            }
             MapFabButton(
                 icon = Icons.Rounded.MyLocation,
                 desc = "Ikuti Posisi Pengendara",
@@ -1119,80 +1419,236 @@ fun NavigationScreen(
             ) { showMidSheet = true }
         }
 
-        // Bottom Route Card
-        if (route != null) {
-            val est = route.energyEstimate
-            CockpitCard(
+        // Bottom Stack: Tapped Place Popup OR Route Preview OR Compact Active Navigation Bar
+        val tp = tappedPlace
+        val totalPackWh = state.settings.b1NominalV * state.settings.b1CapacityAh +
+            if (state.settings.savedEsp2Address != null) state.settings.b2NominalV * state.settings.b2CapacityAh else 0.0
+
+        if (tp != null) {
+            MapPlacePopupCard(
+                place = tp,
+                currentSocPct = state.effective.combinedSocPct,
+                refWhPerKm = state.settings.refWhPerKm,
+                totalPackWh = totalPackWh,
+                hasActiveStops = state.plannedStops.isNotEmpty(),
+                onRouteHere = {
+                    tappedPlace = null
+                    onSetSingleDestination(
+                        PlannedStop(
+                            id = "tap_${System.currentTimeMillis()}",
+                            label = tp.name,
+                            lat = tp.point.lat,
+                            lng = tp.point.lng
+                        )
+                    )
+                },
+                onAddStopHere = {
+                    tappedPlace = null
+                    onAddStop(
+                        PlannedStop(
+                            id = "stop_${System.currentTimeMillis()}",
+                            label = tp.name,
+                            lat = tp.point.lat,
+                            lng = tp.point.lng
+                        )
+                    )
+                },
+                onSavePlace = {
+                    onSavePlace(
+                        SavedPlace(
+                            id = "fav_${System.currentTimeMillis()}",
+                            name = tp.name,
+                            category = tp.address.ifBlank { "Pin Peta" },
+                            lat = tp.point.lat,
+                            lng = tp.point.lng,
+                            createdAtMs = System.currentTimeMillis()
+                        )
+                    )
+                    tappedPlace = null
+                },
+                onSharePlace = {
+                    val shareStr = "${tp.name}\n${tp.address}\nhttps://www.google.com/maps?q=${tp.point.lat},${tp.point.lng}"
+                    onShareText(shareStr.trim(), tp.name)
+                },
+                onOpenInExternalMaps = {
+                    val uri = Uri.parse(
+                        "geo:${tp.point.lat},${tp.point.lng}?q=${tp.point.lat},${tp.point.lng}(${Uri.encode(tp.name)})"
+                    )
+                    val geoIntent = Intent(Intent.ACTION_VIEW, uri)
+                    runCatching { context.startActivity(geoIntent) }
+                        .onFailure {
+                            onShareText("https://www.google.com/maps?q=${tp.point.lat},${tp.point.lng}", tp.name)
+                        }
+                },
+                onOpenCatatNama = {
+                    catatTargetPoint = tp.point
+                    tappedPlace = null
+                },
+                onReportToOsm = {
+                    val osmUrl = String.format(
+                        Locale.US,
+                        "https://www.openstreetmap.org/note/new#map=19/%.6f/%.6f",
+                        tp.point.lat,
+                        tp.point.lng
+                    )
+                    runCatching {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(osmUrl)))
+                    }
+                },
+                onDismiss = { tappedPlace = null },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(start = 12.dp, end = 12.dp, bottom = 92.dp)
+            )
+        } else if (route != null && showRoutePreview) {
+            val destStop = state.plannedStops.lastOrNull()
+            val destLabel = destStop?.label ?: "Tujuan"
+            val isFav = destStop != null && state.savedPlaces.any {
+                abs(it.lat - destStop.lat) < 0.0005 && abs(it.lng - destStop.lng) < 0.0005
+            }
+            RoutePreviewSheetCard(
+                state = state,
+                route = route,
+                destLabel = destLabel,
+                isFavorite = isFav,
+                detailsExpanded = previewDetailsExpanded,
+                scrubSampleIndex = scrubSampleIdx,
+                selectedHill = selectedHill,
+                showAllHills = showAllHills,
+                onToggleFavorite = {
+                    if (destStop != null) {
+                        val existing = state.savedPlaces.firstOrNull {
+                            abs(it.lat - destStop.lat) < 0.0005 && abs(it.lng - destStop.lng) < 0.0005
+                        }
+                        if (existing != null) {
+                            onRemoveSavedPlace(existing.id)
+                        } else {
+                            onSavePlace(
+                                SavedPlace(
+                                    id = "fav_${System.currentTimeMillis()}",
+                                    name = destLabel,
+                                    category = "Favorit Rute",
+                                    lat = destStop.lat,
+                                    lng = destStop.lng,
+                                    createdAtMs = System.currentTimeMillis()
+                                )
+                            )
+                        }
+                    }
+                },
+                onToggleDetails = { previewDetailsExpanded = !previewDetailsExpanded },
+                onClosePreview = {
+                    // CRITICAL FIX: During active navigation, X ONLY closes preview without stopping navigation!
+                    showRoutePreview = false
+                    if (!state.isNavigating) {
+                        onClearRoute()
+                    }
+                },
+                onSelectAlternative = { idx -> onSelectRouteAlternative(idx) },
+                onScrubSample = { idx -> scrubSampleIdx = idx },
+                onSelectHill = { h ->
+                    selectedHill = if (selectedHill?.id == h.id) null else h
+                    val midDist = (h.startDistM + h.endDistM) / 2.0 / 1000.0
+                    val targetPt = route.elevationSamples.minByOrNull { abs(it.distanceKm - midDist) }?.point
+                    if (targetPt != null) {
+                        followRider = false
+                        mapCenter = targetPt
+                    }
+                },
+                onToggleShowAllHills = { showAllHills = !showAllHills },
+                onStartOrPrepareNav = {
+                    if (state.settings.tripPrepAsk) {
+                        showTripPrepDialog = true
+                    } else {
+                        showRoutePreview = false
+                        onStartNavigation()
+                    }
+                },
+                onStopNavigation = {
+                    showRoutePreview = false
+                    onStopNavigation()
+                },
+                onOpenMultiStop = { showMultiStopSheet = true },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(start = 12.dp, end = 12.dp, bottom = 92.dp)
+            )
+        } else if (route != null && state.isNavigating) {
+            // Compact unobstructed bottom nav control bar during active navigation
+            Surface(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .padding(start = 12.dp, end = 12.dp, bottom = 92.dp),
-                contentPadding = 14.dp
+                shape = RoundedCornerShape(18.dp),
+                color = c.surfaceCard.copy(alpha = 0.95f),
+                border = BorderStroke(1.dp, c.borderSubtle),
+                shadowElevation = 6.dp
             ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             "${String.format(Locale.US, "%.1f", state.remainingDistKm)} km • ${state.etaMin.roundToInt()} mnt",
-                            fontSize = 18.sp,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.Bold
                         )
-                        if (est != null) {
-                            Text(
-                                "Prediksi ${est.netWh.roundToInt()} Wh (${String.format(Locale.US, "%.0f", est.whPerKm)} Wh/km) • Tiba SOC ${est.socAtArrivalPct?.roundToInt()?.toString() ?: "—"}%",
-                                fontSize = 12.sp,
-                                color = if ((est.socAtArrivalPct ?: 50.0) < 12.0) c.danger else c.accent
-                            )
-                        }
-                    }
-                    if (state.plannedStops.size > 1) {
-                        TextButton(onClick = { showMultiStopSheet = true }) {
-                            Text("${state.plannedStops.size} Stop")
-                        }
-                    }
-                    IconButton(onClick = onClearRoute) {
-                        Icon(Icons.Rounded.Close, contentDescription = "Tutup Rute")
-                    }
-                }
-                if (route.elevationSamples.size >= 2) {
-                    Spacer(Modifier.height(6.dp))
-                    ElevationProfileChart(
-                        samples = route.elevationSamples,
-                        trackColor = c.borderSubtle,
-                        labelColor = c.textMuted,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(66.dp)
-                    )
-                }
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .testTag("start_stop_nav_button"),
-                        onClick = {
-                            if (state.isNavigating) onStopNavigation() else onStartNavigation()
-                        }
-                    ) {
-                        Text(if (state.isNavigating) "Selesai Navigasi" else "Mulai Navigasi")
+                        val arrSoc = route.energyEstimate?.socAtArrivalPct
+                        Text(
+                            "Trip ${String.format(Locale.US, "%.1f", state.liveTrip.distanceKm)} km" +
+                                if (arrSoc != null) " • Tiba ${arrSoc.roundToInt()}%" else "",
+                            fontSize = 11.5.sp,
+                            color = c.textMuted,
+                            maxLines = 1
+                        )
                     }
                     OutlinedButton(
+                        onClick = { showRoutePreview = true },
                         modifier = Modifier
                             .height(48.dp)
-                            .testTag("open_multistop_button"),
-                        onClick = { showMultiStopSheet = true }
+                            .testTag("reopen_route_preview_button")
                     ) {
-                        Icon(Icons.Rounded.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Rute")
+                        Text("Detail", fontSize = 12.sp)
                     }
+                    Button(
+                        onClick = onStopNavigation,
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("stop_active_nav_button")
+                    ) {
+                        Icon(Icons.Rounded.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Stop", fontSize = 12.5.sp)
+                    }
+                }
+            }
+        } else if (route != null && !showRoutePreview) {
+            // Collapsed pre-nav route pill so user can reopen preview anytime
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(start = 12.dp, end = 12.dp, bottom = 92.dp)
+                    .clickable { showRoutePreview = true },
+                shape = CircleShape,
+                color = c.surfaceCard.copy(alpha = 0.95f),
+                border = BorderStroke(1.dp, c.accent)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(Icons.Rounded.Route, contentDescription = null, tint = c.accent, modifier = Modifier.size(18.dp))
+                    Text(
+                        "Preview Rute (${String.format(Locale.US, "%.1f", state.remainingDistKm)} km)",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
                 }
             }
         }

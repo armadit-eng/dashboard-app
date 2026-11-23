@@ -45,6 +45,9 @@ import androidx.compose.material.icons.rounded.Garage
 import androidx.compose.material.icons.rounded.MonitorHeart
 import androidx.compose.material.icons.rounded.Navigation
 import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
@@ -54,6 +57,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -76,6 +80,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.dashboard.app.dashboard_app.model.TripSummaryCardData
 import com.dashboard.app.dashboard_app.ui.components.DeviceConnectSheet
 import com.dashboard.app.dashboard_app.ui.screens.DiagnosisScreen
 import com.dashboard.app.dashboard_app.ui.screens.GarageAccountScreen
@@ -90,6 +95,9 @@ import com.dashboard.app.dashboard_app.viewmodel.DashboardUiState
 import com.dashboard.app.dashboard_app.viewmodel.DashboardViewModel
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @Serializable
 object RouteMainTabs
@@ -480,6 +488,13 @@ private fun DashboardRootApp(
                     }
                 )
             }
+
+            state.tripSummaryCard?.let { sum ->
+                TripSummaryDialog(
+                    summary = sum,
+                    onDismiss = { viewModel.dismissTripSummaryCard() }
+                )
+            }
         }
 
         composable<RouteRidingCockpit> {
@@ -585,6 +600,8 @@ private fun MainTabContent(
                 onSetSingleDestination = { viewModel.setSingleDestination(it) },
                 onAddStop = { viewModel.addStopAndRoute(it) },
                 onRemoveStopAt = { viewModel.removeStopAt(it) },
+                onReorderStop = { from, to -> viewModel.reorderStop(from, to) },
+                onSelectRouteAlternative = { idx -> viewModel.selectRouteAlternative(idx) },
                 onClearRoute = { viewModel.clearRoute() },
                 onStartNavigation = { viewModel.startNavigation() },
                 onStopNavigation = { viewModel.stopNavigation() },
@@ -592,13 +609,15 @@ private fun MainTabContent(
                 onAddUserSpklu = { n, sock, lat, lng ->
                     viewModel.addUserSpklu(n, sock, lat, lng)
                 },
-                onAddFieldNote = { n, cat, note ->
-                    viewModel.addFieldNote(n, cat, note)
+                onAddFieldNoteAt = { n, cat, note, lat, lng ->
+                    viewModel.addFieldNoteAt(n, cat, note, lat, lng)
+                    onShowSnackbar("Pin disimpan: $n")
                 },
                 onSavePlace = {
                     viewModel.savePlace(it)
                     onShowSnackbar("Tempat disimpan: ${it.name}")
                 },
+                onRemoveSavedPlace = { id -> viewModel.removeSavedPlace(id) },
                 onStartMidStreaming = { viewModel.startMidStreaming() },
                 onStopMidStreaming = { viewModel.stopMidStreaming() },
                 onRequestScreenMirror = onRequestScreenMirror,
@@ -642,3 +661,79 @@ private fun MainTabContent(
         }
     }
 }
+
+@Composable
+private fun TripSummaryDialog(
+    summary: TripSummaryCardData,
+    onDismiss: () -> Unit
+) {
+    val c = LocalCockpitColors.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = c.surfaceCard,
+        title = {
+            Text(
+                summary.title.ifBlank { "Ringkasan Perjalanan" },
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    TripSummaryStat("Jarak", String.format(Locale.US, "%.2f km", summary.distanceKm))
+                    TripSummaryStat("Durasi", "${summary.durationMin} mnt")
+                    TripSummaryStat("Energi", "${summary.energyWh.roundToInt()} Wh")
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    TripSummaryStat("Efisiensi", String.format(Locale.US, "%.1f Wh/km", summary.whPerKm))
+                    TripSummaryStat("Regen", "${summary.regenWh.roundToInt()} Wh")
+                    TripSummaryStat("Skor", summary.ridingScore?.toString() ?: "—")
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    TripSummaryStat("Max Speed", "${summary.maxSpeedKmh.roundToInt()} km/j")
+                    TripSummaryStat("Avg Speed", "${summary.avgSpeedKmh.roundToInt()} km/j")
+                    TripSummaryStat("Max Power", "${summary.maxPowerW.roundToInt()} W")
+                }
+                if (summary.predictedWh != null) {
+                    HorizontalDivider(color = c.borderSubtle)
+                    val errLabel = summary.errorPct?.let { err ->
+                        val sign = if (err >= 0) "+" else ""
+                        " ($sign${err.roundToInt()}%)"
+                    }.orEmpty()
+                    Text(
+                        "Prediksi vs Aktual: ${summary.predictedWh.roundToInt()} Wh → ${summary.energyWh.roundToInt()} Wh$errLabel",
+                        fontSize = 12.sp,
+                        color = if ((summary.errorPct?.let { abs(it) } ?: 0.0) <= 15.0) c.accent else c.warning
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                modifier = Modifier.testTag("trip_summary_dismiss_button")
+            ) {
+                Text("Tutup")
+            }
+        }
+    )
+}
+
+@Composable
+private fun TripSummaryStat(label: String, value: String) {
+    val c = LocalCockpitColors.current
+    Column {
+        Text(label, fontSize = 11.sp, color = c.textMuted)
+        Text(value, fontSize = 13.5.sp, fontWeight = FontWeight.Bold)
+    }
+}
+

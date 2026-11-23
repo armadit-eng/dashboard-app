@@ -2,7 +2,9 @@ package com.dashboard.app.dashboard_app.service
 
 import com.dashboard.app.dashboard_app.engine.RoutePhysics
 import com.dashboard.app.dashboard_app.model.AppSettings
+import com.dashboard.app.dashboard_app.model.DestWeatherSummary
 import com.dashboard.app.dashboard_app.model.GeoPointX
+import com.dashboard.app.dashboard_app.model.NavRouteAltOption
 import com.dashboard.app.dashboard_app.model.NavRouteX
 import com.dashboard.app.dashboard_app.model.PlannedStop
 import com.dashboard.app.dashboard_app.model.RouteStepX
@@ -17,9 +19,12 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 data class ReverseGeocodeResult(val road: String, val area: String)
@@ -126,6 +131,72 @@ object RemoteApisService {
             null
         }
     }
+
+    suspend fun fetchDestWeather(
+        lat: Double,
+        lng: Double,
+        etaMin: Double
+    ): DestWeatherSummary? = withContext(Dispatchers.IO) {
+        try {
+            val url = "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lng" +
+                "&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m" +
+                "&hourly=precipitation_probability&timezone=auto&forecast_days=2"
+            val body = httpGet(url, 8_000) ?: return@withContext null
+            val j = JSONObject(body)
+            val cur = j.optJSONObject("current") ?: return@withContext null
+            val hourly = j.optJSONObject("hourly")
+            val times = hourly?.optJSONArray("time")
+            val probs = hourly?.optJSONArray("precipitation_probability")
+            var rainAtArrival: Int? = null
+            if (times != null && probs != null && times.length() > 0 && probs.length() > 0) {
+                val arriveMs = System.currentTimeMillis() + (etaMin.coerceAtLeast(0.0) * 60_000.0).toLong()
+                val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm", Locale.US)
+                var bestIdx = 0
+                var bestDiff = Long.MAX_VALUE
+                for (i in 0 until min(times.length(), probs.length())) {
+                    val parsed = try { sdf.parse(times.optString(i))?.time } catch (_: Exception) { null }
+                    if (parsed != null) {
+                        val diff = abs(parsed - arriveMs)
+                        if (diff < bestDiff) {
+                            bestDiff = diff
+                            bestIdx = i
+                        }
+                    }
+                }
+                if (!probs.isNull(bestIdx)) {
+                    rainAtArrival = probs.optInt(bestIdx)
+                }
+            }
+            val code = cur.optInt("weather_code", 1)
+            val windDeg = cur.optDouble("wind_direction_10m", 0.0)
+            DestWeatherSummary(
+                tempC = cur.optDouble("temperature_2m", 28.0),
+                description = RoutePhysics.decodeWeatherCode(code).desc,
+                windKmh = cur.optDouble("wind_speed_10m", 0.0),
+                windDirLabel = RoutePhysics.windDirText(windDeg),
+                rainProbAtArrivalPct = rainAtArrival,
+                weatherCode = code
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    suspend fun fetchQuickRouteSummary(origin: GeoPointX, dest: GeoPointX): Pair<Double, Double>? =
+        withContext(Dispatchers.IO) {
+            try {
+                val coordStr = String.format(Locale.US, "%.6f,%.6f;%.6f,%.6f", origin.lng, origin.lat, dest.lng, dest.lat)
+                val url = "https://router.project-osrm.org/route/v1/driving/$coordStr?overview=false"
+                val body = httpGet(url, 6_000) ?: return@withContext null
+                val j = JSONObject(body)
+                val route0 = j.optJSONArray("routes")?.optJSONObject(0) ?: return@withContext null
+                val km = route0.optDouble("distance", 0.0) / 1000.0
+                val min = max(1.0, route0.optDouble("duration", 0.0) / 60.0)
+                km to min
+            } catch (_: Exception) {
+                null
+            }
+        }
 
     suspend fun reverseGeocode(lat: Double, lng: Double): ReverseGeocodeResult? = withContext(Dispatchers.IO) {
         try {
@@ -301,101 +372,132 @@ object RemoteApisService {
             String.format(Locale.US, "%.6f,%.6f", it.lng, it.lat)
         }
         try {
-            val url = "https://router.project-osrm.org/route/v1/driving/$coordStr?overview=full&geometries=geojson&steps=true"
+            val altsParam = if (stops.size == 1) "&alternatives=true" else ""
+            val url = "https://router.project-osrm.org/route/v1/driving/$coordStr?overview=full&geometries=geojson&steps=true$altsParam"
             val body = httpGet(url, 12_000) ?: return@withContext null
             val j = JSONObject(body)
             val routes = j.optJSONArray("routes") ?: return@withContext null
             if (routes.length() == 0) return@withContext null
-            val route0 = routes.getJSONObject(0)
-
-            val distM = route0.optDouble("distance", 0.0)
-            val durSec = route0.optDouble("duration", 0.0)
-
-            val geomObj = route0.optJSONObject("geometry")
-            val rawCoords = geomObj?.optJSONArray("coordinates") ?: JSONArray()
-            val geometry = mutableListOf<GeoPointX>()
-            for (i in 0 until rawCoords.length()) {
-                val c = rawCoords.optJSONArray(i) ?: continue
-                if (c.length() < 2) continue
-                geometry.add(GeoPointX(lat = c.getDouble(1), lng = c.getDouble(0)))
-            }
-
-            val steps = mutableListOf<RouteStepX>()
-            val legSummaries = mutableListOf<WaypointArrivalSummary>()
-            val legs = route0.optJSONArray("legs") ?: JSONArray()
 
             val totalPackWh = settings.b1NominalV * settings.b1CapacityAh +
                 if (settings.savedEsp2Address != null) settings.b2NominalV * settings.b2CapacityAh else 0.0
 
-            var runningSoc = currentSocPct ?: 100.0
-            for (i in 0 until legs.length()) {
-                val leg = legs.getJSONObject(i)
-                val legDistKm = leg.optDouble("distance", 0.0) / 1000.0
-                val legDurMin = leg.optDouble("duration", 0.0) / 60.0
-                val estWh = legDistKm * settings.refWhPerKm * settings.routeCalFactor
-                val socDrop = if (totalPackWh > 0.0) (estWh / totalPackWh) * 100.0 else 0.0
-                runningSoc = (runningSoc - socDrop).coerceIn(0.0, 100.0)
-
-                val stopMeta = stops.getOrNull(i)
-                legSummaries.add(
-                    WaypointArrivalSummary(
-                        label = stopMeta?.label ?: "Tujuan ${i + 1}",
-                        legDistKm = legDistKm,
-                        legEtaMin = legDurMin,
-                        arrivalSocPct = if (currentSocPct != null) runningSoc else null,
-                        isChargingStop = stopMeta?.isSpklu == true
-                    )
-                )
-                if (stopMeta?.isSpklu == true && currentSocPct != null) {
-                    runningSoc = max(runningSoc, 85.0)
+            val options = mutableListOf<NavRouteAltOption>()
+            val count = min(3, routes.length())
+            for (rIdx in 0 until count) {
+                val routeObj = routes.optJSONObject(rIdx) ?: continue
+                val distM = routeObj.optDouble("distance", 0.0)
+                val durSec = routeObj.optDouble("duration", 0.0)
+                val geomObj = routeObj.optJSONObject("geometry")
+                val rawCoords = geomObj?.optJSONArray("coordinates") ?: JSONArray()
+                val geometry = mutableListOf<GeoPointX>()
+                for (i in 0 until rawCoords.length()) {
+                    val c = rawCoords.optJSONArray(i) ?: continue
+                    if (c.length() < 2) continue
+                    geometry.add(GeoPointX(lat = c.getDouble(1), lng = c.getDouble(0)))
                 }
 
-                val legSteps = leg.optJSONArray("steps") ?: JSONArray()
-                for (sIdx in 0 until legSteps.length()) {
-                    val st = legSteps.getJSONObject(sIdx)
-                    val man = st.optJSONObject("maneuver") ?: JSONObject()
-                    val locArr = man.optJSONArray("location") ?: continue
-                    if (locArr.length() < 2) continue
-                    val roadName = st.optString("name", "")
-                    val manType = man.optString("type", "continue")
-                    val modifier = if (man.has("modifier") && !man.isNull("modifier")) man.optString("modifier") else null
-                    steps.add(
-                        RouteStepX(
-                            instruction = RoutePhysics.translateOsrmManeuver(manType, modifier, roadName),
-                            roadName = roadName,
-                            distanceM = st.optDouble("distance", 0.0),
-                            durationSec = st.optDouble("duration", 0.0),
-                            maneuverType = manType,
-                            modifier = modifier,
-                            location = GeoPointX(lat = locArr.getDouble(1), lng = locArr.getDouble(0))
+                val steps = mutableListOf<RouteStepX>()
+                val legSummaries = mutableListOf<WaypointArrivalSummary>()
+                val legs = routeObj.optJSONArray("legs") ?: JSONArray()
+                var runningSoc = currentSocPct ?: 100.0
+                for (i in 0 until legs.length()) {
+                    val leg = legs.getJSONObject(i)
+                    val legDistKm = leg.optDouble("distance", 0.0) / 1000.0
+                    val legDurMin = leg.optDouble("duration", 0.0) / 60.0
+                    val estWh = legDistKm * settings.refWhPerKm * settings.routeCalFactor
+                    val socDrop = if (totalPackWh > 0.0) (estWh / totalPackWh) * 100.0 else 0.0
+                    runningSoc = (runningSoc - socDrop).coerceIn(0.0, 100.0)
+
+                    val stopMeta = stops.getOrNull(i)
+                    legSummaries.add(
+                        WaypointArrivalSummary(
+                            label = stopMeta?.label ?: "Tujuan ${i + 1}",
+                            legDistKm = legDistKm,
+                            legEtaMin = legDurMin,
+                            arrivalSocPct = if (currentSocPct != null) runningSoc else null,
+                            isChargingStop = stopMeta?.isSpklu == true
                         )
                     )
+                    if (stopMeta?.isSpklu == true && currentSocPct != null) {
+                        runningSoc = max(runningSoc, 85.0)
+                    }
+
+                    val legSteps = leg.optJSONArray("steps") ?: JSONArray()
+                    for (sIdx in 0 until legSteps.length()) {
+                        val st = legSteps.getJSONObject(sIdx)
+                        val man = st.optJSONObject("maneuver") ?: JSONObject()
+                        val locArr = man.optJSONArray("location") ?: continue
+                        if (locArr.length() < 2) continue
+                        val roadName = st.optString("name", "")
+                        val manType = man.optString("type", "continue")
+                        val modifier = if (man.has("modifier") && !man.isNull("modifier")) man.optString("modifier") else null
+                        steps.add(
+                            RouteStepX(
+                                instruction = RoutePhysics.translateOsrmManeuver(manType, modifier, roadName),
+                                roadName = roadName,
+                                distanceM = st.optDouble("distance", 0.0),
+                                durationSec = st.optDouble("duration", 0.0),
+                                maneuverType = manType,
+                                modifier = modifier,
+                                location = GeoPointX(lat = locArr.getDouble(1), lng = locArr.getDouble(0))
+                            )
+                        )
+                    }
                 }
+
+                val downsampled = RoutePhysics.downsamplePoints(geometry, maxSamples = 36)
+                val elevations = fetchElevations(downsampled) ?: emptyList()
+                val physics = RoutePhysics.buildElevationAndEnergy(
+                    sampledPoints = downsampled,
+                    elevations = elevations,
+                    totalDistanceKm = distM / 1000.0,
+                    durationMin = durSec / 60.0,
+                    bikeKg = settings.bikeWeightKg,
+                    riderKg = settings.riderWeightKg,
+                    loadKg = settings.loadWeightKg,
+                    calFactor = settings.routeCalFactor,
+                    totalPackWh = totalPackWh,
+                    currentSocPct = currentSocPct
+                )
+                val hills = RoutePhysics.analyzeHillSegments(
+                    samples = physics.samples,
+                    bikeKg = settings.bikeWeightKg,
+                    riderKg = settings.riderWeightKg,
+                    loadKg = settings.loadWeightKg,
+                    calFactor = settings.routeCalFactor,
+                    totalPackWh = totalPackWh
+                )
+                options.add(
+                    NavRouteAltOption(
+                        geometry = geometry,
+                        steps = steps,
+                        distanceM = distM,
+                        durationSec = durSec,
+                        elevationSamples = physics.samples,
+                        energyEstimate = physics.estimate,
+                        hillSegments = hills,
+                        legSummaries = legSummaries
+                    )
+                )
             }
 
-            val downsampled = RoutePhysics.downsamplePoints(geometry, maxSamples = 36)
-            val elevations = fetchElevations(downsampled) ?: emptyList()
-            val physics = RoutePhysics.buildElevationAndEnergy(
-                sampledPoints = downsampled,
-                elevations = elevations,
-                totalDistanceKm = distM / 1000.0,
-                durationMin = durSec / 60.0,
-                bikeKg = settings.bikeWeightKg,
-                riderKg = settings.riderWeightKg,
-                loadKg = settings.loadWeightKg,
-                calFactor = settings.routeCalFactor,
-                totalPackWh = totalPackWh,
-                currentSocPct = currentSocPct
-            )
+            val primary = options.firstOrNull() ?: return@withContext null
+            val lastStop = stops.last()
+            val weather = fetchDestWeather(lastStop.lat, lastStop.lng, primary.durationSec / 60.0)
 
             NavRouteX(
-                geometry = geometry,
-                steps = steps,
-                distanceM = distM,
-                durationSec = durSec,
-                elevationSamples = physics.samples,
-                energyEstimate = physics.estimate,
-                legSummaries = legSummaries
+                geometry = primary.geometry,
+                steps = primary.steps,
+                distanceM = primary.distanceM,
+                durationSec = primary.durationSec,
+                elevationSamples = primary.elevationSamples,
+                energyEstimate = primary.energyEstimate,
+                legSummaries = primary.legSummaries,
+                hillSegments = primary.hillSegments,
+                destWeather = weather,
+                selectedAlternativeIndex = 0,
+                alternativeOptions = options
             )
         } catch (_: Exception) {
             null

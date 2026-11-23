@@ -89,7 +89,9 @@ data class AppSettings(
     val routeCacheEnabled: Boolean = true,
     val physAutoCal: Boolean = false,
     val lastParkSocPct: Double? = null,
-    val lastParkTsMs: Long = 0L
+    val lastParkTsMs: Long = 0L,
+    val tripPrepAsk: Boolean = true,
+    val showElevationInPreview: Boolean = true
 ) {
     val batteryPriority: BatterySourcePriority
         get() = BatterySourcePriority.fromId(batteryPriorityId)
@@ -146,9 +148,14 @@ data class TripSummaryCardData(
     val distanceKm: Double,
     val durationMin: Int,
     val energyWh: Double,
+    val regenWh: Double = 0.0,
     val whPerKm: Double,
     val maxSpeedKmh: Double,
+    val avgSpeedKmh: Double = 0.0,
+    val maxPowerW: Double = 0.0,
     val ridingScore: Int?,
+    val predictedWh: Double? = null,
+    val errorPct: Double? = null,
     val expiresAtMs: Long
 )
 
