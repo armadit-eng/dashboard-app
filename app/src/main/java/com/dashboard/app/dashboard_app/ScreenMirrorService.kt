@@ -8,7 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
@@ -20,6 +23,8 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Base64
 import java.io.ByteArrayOutputStream
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 class ScreenMirrorService : Service() {
@@ -91,6 +96,10 @@ class ScreenMirrorService : Service() {
     private var outHeight = 220
     private var jpegQuality = 55
     private var intervalMs = 500L
+    private var capWidth = 700
+    private var capHeight = 1400
+    private var lastDispW = 0
+    private var lastDispH = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -127,6 +136,109 @@ class ScreenMirrorService : Service() {
         return START_NOT_STICKY
     }
 
+    private fun computeCaptureDimensions(): Pair<Int, Int> {
+        val dm = resources.displayMetrics
+        val dispW = dm.widthPixels.coerceAtLeast(1)
+        val dispH = dm.heightPixels.coerceAtLeast(1)
+        lastDispW = dispW
+        lastDispH = dispH
+        val targetShort = max(outWidth, outHeight) * 2
+        val scale = targetShort.toDouble() / min(dispW, dispH).toDouble()
+        val w = (dispW * scale).roundToInt().coerceIn(240, 1440)
+        val h = (dispH * scale).roundToInt().coerceIn(240, 1440)
+        return w to h
+    }
+
+    private fun attachImageReader(
+        reader: ImageReader,
+        handler: Handler
+    ) {
+        reader.setOnImageAvailableListener({ ir ->
+            val dm = resources.displayMetrics
+            if (dm.widthPixels != lastDispW || dm.heightPixels != lastDispH) {
+                val (newW, newH) = computeCaptureDimensions()
+                if (newW != capWidth || newH != capHeight) {
+                    capWidth = newW
+                    capHeight = newH
+                    val nextReader = ImageReader.newInstance(capWidth, capHeight, PixelFormat.RGBA_8888, 2)
+                    attachImageReader(nextReader, handler)
+                    virtualDisplay?.resize(capWidth, capHeight, dm.densityDpi)
+                    virtualDisplay?.surface = nextReader.surface
+                    val oldReader = imageReader
+                    imageReader = nextReader
+                    try {
+                        oldReader?.close()
+                    } catch (_: Exception) {
+                    }
+                    return@setOnImageAvailableListener
+                }
+            }
+
+            val now = System.currentTimeMillis()
+            val img = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                if (now - lastFrameAt < intervalMs) return@setOnImageAvailableListener
+                lastFrameAt = now
+
+                val imgW = img.width
+                val imgH = img.height
+                val plane = img.planes[0]
+                val buffer = plane.buffer
+                val pixelStride = plane.pixelStride.coerceAtLeast(1)
+                val rowStride = plane.rowStride
+                val rowPadding = (rowStride - pixelStride * imgW).coerceAtLeast(0)
+                val rawBmp = Bitmap.createBitmap(
+                    imgW + rowPadding / pixelStride,
+                    imgH,
+                    Bitmap.Config.ARGB_8888
+                )
+                rawBmp.copyPixelsFromBuffer(buffer)
+                val cropped = if (rawBmp.width != imgW || rawBmp.height != imgH) {
+                    val c = Bitmap.createBitmap(rawBmp, 0, 0, imgW, imgH)
+                    rawBmp.recycle()
+                    c
+                } else {
+                    rawBmp
+                }
+
+                // Aspect-fill crop onto outWidth x outHeight so portrait/landscape fills the MID without black bars
+                val targetAspect = outWidth.toFloat() / outHeight.toFloat()
+                val srcAspect = imgW.toFloat() / imgH.toFloat()
+                val srcRect = if (srcAspect < targetAspect) {
+                    val cropH = (imgW / targetAspect).roundToInt().coerceIn(1, imgH)
+                    val top = ((imgH - cropH) * 0.38f).roundToInt().coerceIn(0, imgH - cropH)
+                    Rect(0, top, imgW, top + cropH)
+                } else if (srcAspect > targetAspect) {
+                    val cropW = (imgH * targetAspect).roundToInt().coerceIn(1, imgW)
+                    val left = ((imgW - cropW) / 2f).roundToInt().coerceIn(0, imgW - cropW)
+                    Rect(left, 0, left + cropW, imgH)
+                } else {
+                    Rect(0, 0, imgW, imgH)
+                }
+
+                val outBmp = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(outBmp)
+                canvas.drawBitmap(cropped, srcRect, Rect(0, 0, outWidth, outHeight), Paint(Paint.FILTER_BITMAP_FLAG))
+                cropped.recycle()
+
+                var q = jpegQuality
+                var b64: String
+                while (true) {
+                    val baos = ByteArrayOutputStream()
+                    outBmp.compress(Bitmap.CompressFormat.JPEG, q, baos)
+                    b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                    if (b64.length <= 7000 || q <= 8) break
+                    q -= 7
+                }
+                outBmp.recycle()
+                if (b64.length <= 7000) onFrameReady?.invoke(b64)
+            } catch (_: Exception) {
+            } finally {
+                img.close()
+            }
+        }, handler)
+    }
+
     private fun startProjection(resultCode: Int, data: Intent) {
         stopProjectionOnly()
         val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -147,60 +259,23 @@ class ScreenMirrorService : Service() {
             }
         }, handler)
 
-        val capW = outWidth * 2
-        val capH = outHeight * 2
-        val reader = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2)
+        val (cw, ch) = computeCaptureDimensions()
+        capWidth = cw
+        capHeight = ch
+        val reader = ImageReader.newInstance(capWidth, capHeight, PixelFormat.RGBA_8888, 2)
         imageReader = reader
+        attachImageReader(reader, handler)
+
         virtualDisplay = projection.createVirtualDisplay(
             "DashboardMidMirror",
-            capW,
-            capH,
+            capWidth,
+            capHeight,
             resources.displayMetrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader.surface,
             null,
             handler
         )
-
-        reader.setOnImageAvailableListener({ ir ->
-            val now = System.currentTimeMillis()
-            val img = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                if (now - lastFrameAt < intervalMs) return@setOnImageAvailableListener
-                lastFrameAt = now
-
-                val plane = img.planes[0]
-                val buffer = plane.buffer
-                val pixelStride = plane.pixelStride
-                val rowStride = plane.rowStride
-                val rowPadding = rowStride - pixelStride * capW
-                val rawBmp = Bitmap.createBitmap(
-                    capW + (rowPadding.toFloat() / pixelStride).roundToInt(),
-                    capH,
-                    Bitmap.Config.ARGB_8888
-                )
-                rawBmp.copyPixelsFromBuffer(buffer)
-                val cropped = Bitmap.createBitmap(rawBmp, 0, 0, capW, capH)
-                if (cropped != rawBmp) rawBmp.recycle()
-                val scaled = Bitmap.createScaledBitmap(cropped, outWidth, outHeight, true)
-                if (scaled != cropped) cropped.recycle()
-
-                var q = jpegQuality
-                var b64: String
-                while (true) {
-                    val baos = ByteArrayOutputStream()
-                    scaled.compress(Bitmap.CompressFormat.JPEG, q, baos)
-                    b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                    if (b64.length <= 7000 || q <= 10) break
-                    q -= 8
-                }
-                scaled.recycle()
-                if (b64.length <= 7000) onFrameReady?.invoke(b64)
-            } catch (_: Exception) {
-            } finally {
-                img.close()
-            }
-        }, handler)
 
         isRunning = true
         onMirrorStateChanged?.invoke(true)

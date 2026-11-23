@@ -266,6 +266,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             viewModelScope.launch {
                 val st = _uiState.value
                 if (st.motorConnState != ConnectionStateX.CONNECTED) return@launch
+                if (!st.motorViaBle && btClassic.isMapsSending) return@launch
                 if (st.motorViaBle) {
                     ble.sendMotorBleMapsFrame(
                         b64,
@@ -1013,6 +1014,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     // MID Streaming (AT+MAPS)
     fun startMidStreaming() {
         if (_uiState.value.midStreaming) return
+        if (_uiState.value.screenMirrorActive) stopScreenMirror()
         _uiState.update { it.copy(midStreaming = true) }
         mapsStreamJob?.cancel()
         mapsStreamJob = viewModelScope.launch {
@@ -1042,6 +1044,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
         val b64 = try {
             MidFrameRenderer.renderFrameBase64(
+                context = getApplication(),
                 settings = st.settings,
                 gps = st.gpsState,
                 eff = st.effective,
@@ -1106,13 +1109,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun startScreenMirrorWithGrant(resultCode: Int, dataIntent: Intent) {
+        if (_uiState.value.midStreaming) stopMidStreaming()
         val s = _uiState.value.settings
         ScreenMirrorService.startService(
             context = getApplication(),
             resultCode = resultCode,
             dataIntent = dataIntent,
-            width = s.mapsSnapWidth.coerceIn(64, 350),
-            height = s.mapsSnapHeight.coerceIn(64, 500),
+            width = s.mapsSnapWidth.coerceIn(160, 480),
+            height = s.mapsSnapHeight.coerceIn(120, 360),
             intervalMs = max(350L, (s.mapsIntervalMs / 2).toLong())
         )
         _uiState.update { it.copy(screenMirrorActive = true) }

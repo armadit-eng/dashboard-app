@@ -635,7 +635,12 @@ fun NavigationScreen(
                             .height(48.dp)
                             .testTag("toggle_screen_mirror_button"),
                         onClick = {
-                            if (state.screenMirrorActive) onStopScreenMirror() else onRequestScreenMirror()
+                            if (state.screenMirrorActive) {
+                                onStopScreenMirror()
+                            } else {
+                                showMidSheet = false
+                                onRequestScreenMirror()
+                            }
                         }
                     ) {
                         Text(if (state.screenMirrorActive) "Stop Mirror" else "Mirror Layar")

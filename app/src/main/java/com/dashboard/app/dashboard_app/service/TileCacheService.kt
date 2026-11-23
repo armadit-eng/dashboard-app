@@ -1,6 +1,7 @@
 package com.dashboard.app.dashboard_app.service
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.LruCache
 import androidx.compose.ui.graphics.ImageBitmap
@@ -32,7 +33,7 @@ object TileCacheService {
 
     const val MAX_TILES_PER_DOWNLOAD = 3500
 
-    private val memCache = LruCache<String, ImageBitmap>(160)
+    private val memCache = LruCache<String, Bitmap>(160)
 
     private fun rootDir(context: Context): File = File(context.filesDir, "tile_cache")
 
@@ -45,16 +46,16 @@ object TileCacheService {
             .replace("{x}", x.toString())
             .replace("{y}", y.toString())
 
-    suspend fun getTileBitmap(
+    suspend fun getTileAndroidBitmap(
         context: Context,
         styleId: String,
         urlTemplate: String,
         z: Int,
         x: Int,
         y: Int
-    ): ImageBitmap? {
+    ): Bitmap? {
         val key = "$styleId/$z/$x/$y"
-        memCache.get(key)?.let { return it }
+        memCache.get(key)?.takeIf { !it.isRecycled }?.let { return it }
 
         val bytes = withContext(Dispatchers.IO) {
             val f = tileFile(context, styleId, z, x, y)
@@ -74,14 +75,22 @@ object TileCacheService {
         return withContext(Dispatchers.Default) {
             try {
                 val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@withContext null
-                val img = bmp.asImageBitmap()
-                memCache.put(key, img)
-                img
+                memCache.put(key, bmp)
+                bmp
             } catch (_: Exception) {
                 null
             }
         }
     }
+
+    suspend fun getTileBitmap(
+        context: Context,
+        styleId: String,
+        urlTemplate: String,
+        z: Int,
+        x: Int,
+        y: Int
+    ): ImageBitmap? = getTileAndroidBitmap(context, styleId, urlTemplate, z, x, y)?.asImageBitmap()
 
     private fun fetchBytes(urlStr: String): ByteArray? {
         var conn: HttpURLConnection? = null

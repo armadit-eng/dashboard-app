@@ -1,9 +1,12 @@
 package com.dashboard.app.dashboard_app.service
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
@@ -16,14 +19,20 @@ import com.dashboard.app.dashboard_app.model.EffectiveTelemetry
 import com.dashboard.app.dashboard_app.model.GeoPointX
 import com.dashboard.app.dashboard_app.model.GpsState
 import com.dashboard.app.dashboard_app.model.HillGrade
+import com.dashboard.app.dashboard_app.model.MapStyleOption
 import com.dashboard.app.dashboard_app.model.NavRouteX
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.floor
 import kotlin.math.ln
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -36,6 +45,7 @@ object MidFrameRenderer {
         private set
 
     suspend fun renderFrameBase64(
+        context: Context,
         settings: AppSettings,
         gps: GpsState,
         eff: EffectiveTelemetry,
@@ -69,11 +79,14 @@ object MidFrameRenderer {
 
         val isSplit = settings.mapsLayout == "split"
         val mapW = if (isSplit) (w * 0.54f).roundToInt().toFloat() else w.toFloat()
+        val style = MapStyleOption.fromId(settings.mapStyleId)
 
         drawMiniMapArea(
+            context = context,
             canvas = canvas,
             mapW = mapW,
             h = h.toFloat(),
+            mapStyle = style,
             gps = gps,
             route = activeRoute,
             isNavigating = isNavigating,
@@ -123,11 +136,11 @@ object MidFrameRenderer {
     }
 
     private fun encodeWithinBudget(source: Bitmap, maxChars: Int): String {
-        val qualities = intArrayOf(72, 58, 46, 36, 28, 20, 14, 10)
+        val qualities = intArrayOf(72, 58, 46, 36, 28, 20, 14, 10, 8, 6)
         var current = source
         lastMinChars = 0
 
-        for (attempt in 0 until 4) {
+        for (attempt in 0 until 5) {
             for (q in qualities) {
                 val baos = ByteArrayOutputStream()
                 current.compress(Bitmap.CompressFormat.JPEG, q, baos)
@@ -142,7 +155,7 @@ object MidFrameRenderer {
             }
             val nw = (current.width * 0.85f).roundToInt()
             val nh = (current.height * 0.85f).roundToInt()
-            if (nw < 64 || nh < 64) break
+            if (nw < 48 || nh < 48) break
             val next = Bitmap.createScaledBitmap(current, nw, nh, true)
             if (current !== source) current.recycle()
             current = next
@@ -151,15 +164,75 @@ object MidFrameRenderer {
         return ""
     }
 
-    private fun drawMiniMapArea(
+    private suspend fun drawMiniMapArea(
+        context: Context,
         canvas: Canvas,
         mapW: Float,
         h: Float,
+        mapStyle: MapStyleOption,
         gps: GpsState,
         route: NavRouteX?,
         isNavigating: Boolean,
         riderLow: Boolean
     ) {
+        val origin = gps.location
+            ?: route?.geometry?.firstOrNull()
+            ?: GeoPointX(-6.1754, 106.8272)
+
+        val riderX = mapW * 0.5f
+        val riderY = if (isNavigating && riderLow) h * 0.70f else h * 0.50f
+        val zoom = 16
+        val tilePx = 256.0
+        val scale = tilePx * (1 shl zoom)
+
+        fun worldX(lng: Double) = ((lng + 180.0) / 360.0) * scale
+        fun worldY(lat: Double): Double {
+            val rad = lat.coerceIn(-85.0511, 85.0511) * PI / 180.0
+            val sinLat = sin(rad)
+            return (0.5 - ln((1.0 + sinLat) / (1.0 - sinLat)) / (4.0 * PI)) * scale
+        }
+
+        val ox = worldX(origin.lng)
+        val oy = worldY(origin.lat)
+        fun toScreen(gp: GeoPointX): Pair<Float, Float> = Pair(
+            (riderX + (worldX(gp.lng) - ox)).toFloat(),
+            (riderY + (worldY(gp.lat) - oy)).toFloat()
+        )
+
+        val numTiles = 1 shl zoom
+        val minTx = floor((ox - riderX) / tilePx).toInt()
+        val maxTx = floor((ox - riderX + mapW) / tilePx).toInt()
+        val minTy = floor((oy - riderY) / tilePx).toInt()
+        val maxTy = floor((oy - riderY + h) / tilePx).toInt()
+
+        val tileCoords = buildList {
+            for (ty in minTy..maxTy) {
+                if (ty !in 0 until numTiles) continue
+                for (tx in minTx..maxTx) {
+                    val wrappedX = ((tx % numTiles) + numTiles) % numTiles
+                    add(Triple(tx, ty, wrappedX))
+                }
+            }
+        }
+
+        val fetchedTiles: List<Pair<Triple<Int, Int, Int>, Bitmap?>> = coroutineScope {
+            tileCoords.map { coord ->
+                async {
+                    val bmp = withTimeoutOrNull(2500L) {
+                        TileCacheService.getTileAndroidBitmap(
+                            context = context,
+                            styleId = mapStyle.id,
+                            urlTemplate = mapStyle.tileUrlTemplate,
+                            z = zoom,
+                            x = coord.third,
+                            y = coord.second
+                        )
+                    }
+                    coord to bmp
+                }
+            }.awaitAll()
+        }
+
         canvas.save()
         canvas.clipRect(0f, 0f, mapW, h)
 
@@ -178,27 +251,35 @@ object MidFrameRenderer {
             gy += 24f
         }
 
-        val origin = gps.location
-            ?: route?.geometry?.firstOrNull()
-            ?: GeoPointX(-6.1754, 106.8272)
-
-        val riderX = mapW * 0.5f
-        val riderY = if (isNavigating && riderLow) h * 0.70f else h * 0.50f
-        val scale = 256.0 * (1 shl 16)
-
-        fun worldX(lng: Double) = ((lng + 180.0) / 360.0) * scale
-        fun worldY(lat: Double): Double {
-            val rad = lat.coerceIn(-85.0511, 85.0511) * PI / 180.0
-            val sinLat = sin(rad)
-            return (0.5 - ln((1.0 + sinLat) / (1.0 - sinLat)) / (4.0 * PI)) * scale
+        val tilePaint: Paint? = if (mapStyle == MapStyleOption.DARK_CARTO) {
+            Paint(Paint.FILTER_BITMAP_FLAG).apply {
+                colorFilter = ColorMatrixColorFilter(
+                    ColorMatrix(
+                        floatArrayOf(
+                            1.5f, 0f, 0f, 0f, 12f,
+                            0f, 1.5f, 0f, 0f, 12f,
+                            0f, 0f, 1.5f, 0f, 14f,
+                            0f, 0f, 0f, 1f, 0f
+                        )
+                    )
+                )
+            }
+        } else {
+            Paint(Paint.FILTER_BITMAP_FLAG)
         }
 
-        val ox = worldX(origin.lng)
-        val oy = worldY(origin.lat)
-        fun toScreen(gp: GeoPointX): Pair<Float, Float> = Pair(
-            (riderX + (worldX(gp.lng) - ox)).toFloat(),
-            (riderY + (worldY(gp.lat) - oy)).toFloat()
-        )
+        for ((coord, tileBmp) in fetchedTiles) {
+            if (tileBmp != null && !tileBmp.isRecycled) {
+                val sx = (riderX + (coord.first * tilePx - ox)).toFloat()
+                val sy = (riderY + (coord.second * tilePx - oy)).toFloat()
+                canvas.drawBitmap(
+                    tileBmp,
+                    null,
+                    RectF(sx, sy, sx + tilePx.toFloat() + 0.5f, sy + tilePx.toFloat() + 0.5f),
+                    tilePaint
+                )
+            }
+        }
 
         if (route != null && route.geometry.size >= 2) {
             val path = Path()
@@ -222,6 +303,15 @@ object MidFrameRenderer {
             }
             canvas.drawPath(path, bgStroke)
             canvas.drawPath(path, fgStroke)
+
+            val dest = route.geometry.last()
+            val (dx, dy) = toScreen(dest)
+            canvas.drawCircle(dx, dy, 6f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#EF4444") })
+            canvas.drawCircle(dx, dy, 6f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = 1.5f
+            })
         }
 
         // Rider arrow
