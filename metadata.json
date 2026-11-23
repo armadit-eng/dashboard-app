@@ -1,0 +1,8 @@
+{
+  "name": "Dashboard App",
+  "description": "EV Motorcycle Smart Telemetry, Dual-Battery BMS Diagnostics, Navigation & MID AT+MAPS Cockpit",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

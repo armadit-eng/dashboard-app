@@ -1,26 +1,8 @@
-# Dashboard App (Flutter 3.38.5 — AndroidIDE Ready)
+# Dashboard App (EV Motorcycle Smart Telemetry & Cockpit)
 
-Proyek Flutter lengkap untuk dashboard motor listrik (*EV Cockpit, Dual-Battery BMS Diagnostics, Smart Navigation, MID AT+MAPS Streaming & Motovlog HUD*).
+Native Android (Kotlin + Jetpack Compose + Material 3) companion application for electric motorcycles with:
 
-## Konfigurasi Proyek (Sesuai AndroidIDE)
-- **Project Name**: `Dashboard App` (`dashboard_app`)
-- **Organization**: `com.dashboard.app`
-- **Application ID / Namespace**: `com.dashboard.app.dashboard_app`
-- **Target Platform**: Android (`minSdk 24`, `compileSdk 35`)
-- **Target Flutter Version**: `3.38.5`
-
-## Cara Membuka & Build di AndroidIDE
-1. Salin folder `dashboard_app` ini ke direktori proyek AndroidIDE Anda (misalnya `/storage/emulated/0/AndroidIDEProjects/dashboard_app` atau folder workspace AndroidIDE).
-2. Buka terminal di dalam folder `dashboard_app`, lalu jalankan:
-   ```bash
-   flutter pub get
-   ```
-3. Build atau Run langsung melalui tombol **Run** di AndroidIDE atau perintah:
-   ```bash
-   flutter build apk --release
-   ```
-
-## Catatan Arsitektur Native Bridge
-- **Bluetooth Classic (SPP/RFCOMM)** untuk Motor MID diimplementasikan langsung via native Kotlin (`BtClassicBridge.kt`) menggunakan `MethodChannel` + `EventChannel` (`com.dashboard.app/bt_classic`) agar 100% kompatibel dengan Flutter 3.38.5 dan AGP 8+ tanpa kendala package pihak ketiga yang usang.
-- **BLE GATT** untuk JK-BMS (`0xFFE0/FFE1/FFF2`), ESP32 #1, dan ESP32 #2 (`Nordic UART 6E400001`) menggunakan `flutter_blue_plus`.
-- **Screen Mirror -> MID (`AT+MAPS`)** menggunakan `MediaProjection` Foreground Service native (`ScreenMirrorService.kt`) dan juga mendukung frame canvas Flutter langsung tanpa izin tangkap layar.
+- **Dual-Battery Telemetry & Diagnostics**: Motor MID (`AT+` over Classic Bluetooth SPP / BLE GATT fallback), JK-BMS (300-byte binary frame over BLE), ESP32 #1 (Relay Kontak, Side-Stand, Cruise, Reverse, LED Matrix, DFPlayer, Nav Voice), and ESP32 #2 (Battery 2 CAN/SIM + cell array).
+- **1 Hz Live Integrator & Riding Score**: Weighted dual-battery SOC/SOH, blended Wh/km range & charge ETA estimator, live 240-point telemetry charts, DTC fault analyzer, and Dev Telemetry Simulator (`DEV-SIM MOTOR`).
+- **Smart EV Navigation & Offline Tile Maps**: OSRM turn-by-turn routing, Open-Meteo elevation & weather, route physics energy estimator, Overpass + OpenChargeMap SPKLU finder, disk-cached Slippy tile renderer with bulk offline area download (`Cockpit Gelap` z10–z16), Field Notes (+ GPX export), and `AT+MAPS` / MediaProjection screen mirror streaming to the motorcycle MID.
+- **Fullscreen Riding Cockpit & Motovlog Camera HUD**: Landscape immersive Speedometer & animated Energy Flow HUD, plus Camera2 + MediaRecorder 720p MP4 Motovlog recorder with live telemetry HUD overlay.

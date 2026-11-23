@@ -1,0 +1,1 @@
+-keep class com.dashboard.app.dashboard_app.model.** { *; }

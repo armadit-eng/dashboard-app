@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Dashboard App</string>
+    <string name="tab_cockpit">Kokpit</string>
+    <string name="tab_diagnosis">Diagnostik</string>
+    <string name="tab_navigation">Navigasi</string>
+    <string name="tab_stats">Statistik</string>
+    <string name="tab_garage">Garasi</string>
+</resources>
