@@ -81,7 +81,15 @@ data class AppSettings(
     val savedJkAddress: String? = null,
     val savedEsp1Address: String? = null,
     val savedEsp2Address: String? = null,
-    val ocmApiKey: String = ""
+    val ocmApiKey: String = "",
+    val cartoApiKey: String = "",
+    val mapsAutoStream: Boolean = true,
+    val mapsQualityPct: Int = 80,
+    val mapsCompassOn: Boolean = true,
+    val routeCacheEnabled: Boolean = true,
+    val physAutoCal: Boolean = false,
+    val lastParkSocPct: Double? = null,
+    val lastParkTsMs: Long = 0L
 ) {
     val batteryPriority: BatterySourcePriority
         get() = BatterySourcePriority.fromId(batteryPriorityId)
@@ -98,6 +106,11 @@ data class TripRecord(
     val maxSpeedKmh: Double,
     val avgSpeedKmh: Double,
     val maxPowerW: Double,
+    val maxCurrentA: Double = 0.0,
+    val minVbat: Double? = null,
+    val maxVbat: Double? = null,
+    val maxTbatC: Double? = null,
+    val isPartial: Boolean = false,
     val ridingScore: Int? = null,
     val startArea: String = "",
     val endArea: String = "",
@@ -107,6 +120,58 @@ data class TripRecord(
     val whPerKm: Double
         get() = if (distanceKm > 0.05) energyWh / distanceKm else 0.0
 }
+
+@Serializable
+data class ChargingLogEntry(
+    val id: String,
+    val timestampMs: Long,
+    val startSocPct: Double,
+    val endSocPct: Double,
+    val energyAddedWh: Double,
+    val durationMin: Int,
+    val avgPowerW: Double = 0.0,
+    val locationLabel: String = ""
+)
+
+@Serializable
+data class SohSample(
+    val timestampMs: Long,
+    val sohPct: Double,
+    val odoKm: Double? = null,
+    val cycles: Int? = null
+)
+
+data class TripSummaryCardData(
+    val title: String,
+    val distanceKm: Double,
+    val durationMin: Int,
+    val energyWh: Double,
+    val whPerKm: Double,
+    val maxSpeedKmh: Double,
+    val ridingScore: Int?,
+    val expiresAtMs: Long
+)
+
+data class PersonalRecords(
+    val longestTripKm: Double = 0.0,
+    val topSpeedKmh: Double = 0.0,
+    val highestRegenWh: Double = 0.0,
+    val bestWhPerKm: Double? = null,
+    val bestScore: Int? = null
+)
+
+data class EfficiencyTrend(
+    val recentAvgWhKm: Double,
+    val prevAvgWhKm: Double,
+    val deltaPct: Double // negative means improved efficiency
+)
+
+data class DailyChallenge(
+    val title: String,
+    val description: String,
+    val progress: Double,
+    val completed: Boolean
+)
 
 @Serializable
 data class MaintenanceLogEntry(

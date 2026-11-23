@@ -21,10 +21,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.BluetoothSearching
 import androidx.compose.material.icons.automirrored.rounded.ListAlt
 import androidx.compose.material.icons.rounded.Bluetooth
 import androidx.compose.material.icons.rounded.BluetoothDisabled
-import androidx.compose.material.icons.rounded.BluetoothSearching
 import androidx.compose.material.icons.rounded.LinkOff
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.SettingsBluetooth
@@ -118,7 +118,7 @@ fun DeviceConnectSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
-                    Icons.Rounded.BluetoothSearching,
+                    Icons.AutoMirrored.Rounded.BluetoothSearching,
                     contentDescription = "Pemindaian Bluetooth",
                     tint = c.accent
                 )
@@ -160,41 +160,65 @@ fun DeviceConnectSheet(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 item {
+                    val mSub = buildString {
+                        append(state.motorConnName.ifEmpty { "SPP / BLE" })
+                        if (state.motorConnState == ConnectionStateX.CONNECTED && state.motorRssiDbm != null) {
+                            append(" (${state.motorRssiDbm} dBm)")
+                        }
+                    }
                     SlotPill(
                         selected = selectedSlot == 0,
                         label = "Motor MID",
                         state = state.motorConnState,
-                        sub = state.motorConnName.ifEmpty { "SPP / BLE" },
+                        sub = mSub,
                         onSelect = { selectedSlot = 0 },
                         onDisconnect = onDisconnectMotor
                     )
                 }
                 item {
+                    val jkSub = buildString {
+                        append(state.jkConnName.ifEmpty { "Baterai 1 BLE" })
+                        if (state.jkConnState == ConnectionStateX.CONNECTED && state.jkRssiDbm != null) {
+                            append(" (${state.jkRssiDbm} dBm)")
+                        }
+                    }
                     SlotPill(
                         selected = selectedSlot == 1,
                         label = "JK-BMS",
                         state = state.jkConnState,
-                        sub = state.jkConnName.ifEmpty { "Baterai 1 BLE" },
+                        sub = jkSub,
                         onSelect = { selectedSlot = 1 },
                         onDisconnect = onDisconnectJkBms
                     )
                 }
                 item {
+                    val e1Sub = buildString {
+                        append(state.esp1ConnName.ifEmpty { "Kontak/Matrix" })
+                        if (state.esp1ConnState == ConnectionStateX.CONNECTED && state.esp1RssiDbm != null) {
+                            append(" (${state.esp1RssiDbm} dBm)")
+                        }
+                    }
                     SlotPill(
                         selected = selectedSlot == 2,
                         label = "ESP32 #1",
                         state = state.esp1ConnState,
-                        sub = state.esp1ConnName.ifEmpty { "Kontak/Matrix" },
+                        sub = e1Sub,
                         onSelect = { selectedSlot = 2 },
                         onDisconnect = { onDisconnectEspSlot(1) }
                     )
                 }
                 item {
+                    val e2Sub = buildString {
+                        append(state.esp2ConnName.ifEmpty { "Baterai 2 CAN" })
+                        if (state.esp2ConnState == ConnectionStateX.CONNECTED && state.esp2RssiDbm != null) {
+                            append(" (${state.esp2RssiDbm} dBm)")
+                        }
+                    }
                     SlotPill(
                         selected = selectedSlot == 3,
                         label = "ESP32 #2",
                         state = state.esp2ConnState,
-                        sub = state.esp2ConnName.ifEmpty { "Baterai 2 CAN" },
+                        sub = e2Sub,
                         onSelect = { selectedSlot = 3 },
                         onDisconnect = { onDisconnectEspSlot(2) }
                     )

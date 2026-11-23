@@ -103,6 +103,8 @@ data class MotorData(
     val tempInverterC: Double? = null,
     val tempMotorC: Double? = null,
     val tempBatteryC: Double? = null,
+    val rpm: Int? = null,
+    val timeStr: String? = null,
     val lastUpdatedMs: Long = 0L
 )
 
@@ -172,6 +174,10 @@ data class LiveTripMetrics(
     val maxSpeedKmh: Double = 0.0,
     val maxPowerW: Double = 0.0,
     val maxRegenW: Double = 0.0,
+    val maxCurrentA: Double = 0.0,
+    val minVbat: Double? = null,
+    val maxVbat: Double? = null,
+    val maxTbatC: Double? = null,
     val movingSeconds: Int = 0,
     val stopCount: Int = 0,
     val lastSampleMs: Long = 0L,

@@ -9,10 +9,16 @@ import com.dashboard.app.dashboard_app.model.Esp32Data
 import com.dashboard.app.dashboard_app.model.GeoPointX
 import com.dashboard.app.dashboard_app.model.JkBmsData
 import com.dashboard.app.dashboard_app.model.LiveTripMetrics
+import com.dashboard.app.dashboard_app.model.MapStyleOption
 import com.dashboard.app.dashboard_app.model.MotorData
 import com.dashboard.app.dashboard_app.model.RidingScoreState
+import com.dashboard.app.dashboard_app.model.TripRecord
+import com.dashboard.app.dashboard_app.service.RemoteApisService
+import com.dashboard.app.dashboard_app.service.TileCacheService
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -25,11 +31,21 @@ class TelemetryAndPhysicsTest {
         m = TelemetryEngine.parseMotorAtLine("+VBAT=73.4", m)!!
         m = TelemetryEngine.parseMotorAtLine("+IBAT=-12.0", m)!!
         m = TelemetryEngine.parseMotorAtLine("+ERR=0x09", m)!!
+        m = TelemetryEngine.parseMotorAtLine("AT+TINV:38.5 °C", m)!!
+        m = TelemetryEngine.parseMotorAtLine("+TMOT=46.2 C", m)!!
+        m = TelemetryEngine.parseMotorAtLine("+TBAT=\"33.1\"", m)!!
+        m = TelemetryEngine.parseMotorAtLine("AT+TIME=\"0915\"", m)!!
+        m = TelemetryEngine.parseMotorAtLine("+RPM=1840", m)!!
 
         assertEquals(48.5, m.speedKmh!!, 0.001)
         assertEquals(73.4, m.vbat!!, 0.001)
         assertEquals(-12.0, m.ibat!!, 0.001)
         assertEquals(9, m.errMask)
+        assertEquals(38.5, m.tempInverterC!!, 0.001)
+        assertEquals(46.2, m.tempMotorC!!, 0.001)
+        assertEquals(33.1, m.tempBatteryC!!, 0.001)
+        assertEquals("0915", m.timeStr)
+        assertEquals(1840, m.rpm)
 
         var backedUpOdo: Double? = null
         m = TelemetryEngine.parseMotorAtLine(
@@ -177,5 +193,50 @@ class TelemetryAndPhysicsTest {
         assertEquals(60.0, res.estimate.totalAscentM, 0.1)
         assertEquals(40.0, res.estimate.totalDescentM, 0.1)
         assertTrue(res.estimate.socAtArrivalPct!! < 80.0)
+    }
+
+    @Test
+    fun computesPersonalRecordsEfficiencyTrendAndIdleDrain() {
+        val baseTs = 1_700_000_000_000L
+        val trips = (0 until 6).map { i ->
+            val eWh = if (i < 3) 220.0 else 300.0
+            TripRecord(
+                id = "t_$i",
+                startTimeMs = baseTs - i * 3600_000L,
+                endTimeMs = baseTs - i * 3600_000L + 600_000L,
+                distanceKm = 10.0,
+                energyWh = eWh,
+                regenWh = (i + 1) * 5.0,
+                maxSpeedKmh = 50.0 + i * 3.0,
+                avgSpeedKmh = 35.0,
+                maxPowerW = 2400.0,
+                ridingScore = 80 + i
+            )
+        }
+        val pr = TelemetryEngine.computePersonalRecords(trips)
+        assertEquals(10.0, pr.longestTripKm, 0.01)
+        assertEquals(65.0, pr.topSpeedKmh, 0.01)
+        assertEquals(30.0, pr.highestRegenWh, 0.01)
+        assertEquals(22.0, pr.bestWhPerKm!!, 0.01)
+        assertEquals(85, pr.bestScore)
+
+        val trend = TelemetryEngine.computeEfficiencyTrend(trips)
+        assertNotNull(trend)
+        assertTrue(trend!!.deltaPct < -15.0)
+
+        val drain = TelemetryEngine.computeIdleDrainPct(80.0, baseTs - 3600_000L, 77.5, baseTs)
+        assertEquals(2.5, drain!!, 0.01)
+        assertNull(TelemetryEngine.computeIdleDrainPct(80.0, baseTs - 60_000L, 77.0, baseTs))
+    }
+
+    @Test
+    fun resolvesCartoTileKeyAndDetectsShortUrls() {
+        val noKey = TileCacheService.resolveTileUrl(MapStyleOption.DARK_CARTO.tileUrlTemplate, 15, 100, 200, "")
+        assertFalse(noKey.contains("?key="))
+        val withKey = TileCacheService.resolveTileUrl(MapStyleOption.CARTO_VOYAGER.tileUrlTemplate, 15, 100, 200, "test_carto_key")
+        assertTrue(withKey.endsWith("?key=test_carto_key"))
+
+        assertTrue(RemoteApisService.isMapsShortUrl("https://maps.app.goo.gl/AbCd123"))
+        assertFalse(RemoteApisService.isMapsShortUrl("Jl. Sudirman Jakarta"))
     }
 }

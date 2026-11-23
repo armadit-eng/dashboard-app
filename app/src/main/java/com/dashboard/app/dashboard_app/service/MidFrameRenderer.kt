@@ -24,6 +24,7 @@ import com.dashboard.app.dashboard_app.model.HillGrade
 import com.dashboard.app.dashboard_app.model.MapStyleOption
 import com.dashboard.app.dashboard_app.model.NavRouteX
 import com.dashboard.app.dashboard_app.model.RouteStepX
+import com.dashboard.app.dashboard_app.model.TripSummaryCardData
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -53,6 +54,10 @@ object MidFrameRenderer {
     var lastMinChars: Int = 0
         private set
 
+    @Volatile
+    var lastQuality: Int = 80
+        private set
+
     suspend fun renderFrameBase64(
         context: Context,
         settings: AppSettings,
@@ -63,10 +68,22 @@ object MidFrameRenderer {
         activeStepIndex: Int,
         distToNextStepM: Double,
         etaMin: Double,
+        spkluAheadKm: Double? = null,
+        tripSummary: TripSummaryCardData? = null,
         maxChars: Int = MAX_MAPS_CHARS
     ): String = withContext(Dispatchers.Default) {
         val w = settings.mapsSnapWidth.coerceIn(160, 480)
         val h = settings.mapsSnapHeight.coerceIn(120, 360)
+        val targetQ = settings.mapsQualityPct.coerceIn(30, 95)
+
+        if (tripSummary != null && System.currentTimeMillis() <= tripSummary.expiresAtMs) {
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            drawTripSumCanvas(canvas, w.toFloat(), h.toFloat(), w / 350f, tripSummary)
+            val encoded = encodeWithinBudget(bmp, targetQ, maxChars)
+            bmp.recycle()
+            return@withContext encoded
+        }
 
         if (settings.customWallpaperEnabled && settings.customWallpaperPath.isNotEmpty()) {
             val file = File(settings.customWallpaperPath)
@@ -75,7 +92,7 @@ object MidFrameRenderer {
                 if (decoded != null) {
                     val resized = Bitmap.createScaledBitmap(decoded, w, h, true)
                     if (resized != decoded) decoded.recycle()
-                    val b64 = encodeWithinBudget(resized, maxChars)
+                    val b64 = encodeWithinBudget(resized, targetQ, maxChars)
                     resized.recycle()
                     return@withContext b64
                 }
@@ -85,8 +102,7 @@ object MidFrameRenderer {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val style = MapStyleOption.fromId(settings.mapStyleId)
-        val isDark = style == MapStyleOption.DARK_CARTO
-        canvas.drawColor(if (isDark) 0xFF111111.toInt() else 0xFFE9E5DC.toInt())
+        canvas.drawColor(if (style.isDarkBase) 0xFF111111.toInt() else 0xFFE9E5DC.toInt())
 
         val sc = w / 350f
         val isSplit = settings.mapsLayout == "split"
@@ -101,6 +117,8 @@ object MidFrameRenderer {
             h = h.toFloat(),
             sc = sc,
             mapStyle = style,
+            cartoApiKey = settings.cartoApiKey,
+            compassOn = settings.mapsCompassOn,
             gps = gps,
             route = activeRoute,
             navOn = navOn,
@@ -120,7 +138,8 @@ object MidFrameRenderer {
                 route = activeRoute,
                 step = step,
                 distToNextStepM = distToNextStepM,
-                etaMin = etaMin
+                etaMin = etaMin,
+                spkluAheadKm = spkluAheadKm
             )
         } else if (navOn && step != null) {
             drawFullNavBar(
@@ -136,37 +155,83 @@ object MidFrameRenderer {
             )
         }
 
-        val encoded = encodeWithinBudget(bmp, maxChars)
+        val encoded = encodeWithinBudget(bmp, targetQ, maxChars)
         bmp.recycle()
         encoded
     }
 
-    private fun encodeWithinBudget(source: Bitmap, maxChars: Int): String {
-        val qualities = intArrayOf(78, 66, 54, 44, 34, 26, 18, 12, 8, 6)
-        var current = source
+    /**
+     * Keep exact w x h JPEG dimensions so MID firmware renders reliably;
+     * when quality alone can't fit under budget, pre-smooth at 0.6x and upscale back to exact w x h.
+     */
+    fun encodeWithinBudget(source: Bitmap, maxQuality: Int = 80, maxChars: Int = MAX_MAPS_CHARS): String {
+        val w = source.width
+        val h = source.height
+        val qualities = buildList {
+            var q = maxQuality.coerceIn(30, 95)
+            while (q > 20) {
+                add(q)
+                q -= 10
+            }
+            add(18); add(13); add(9); add(6); add(4)
+        }
         lastMinChars = 0
 
-        for (attempt in 0 until 5) {
-            for (q in qualities) {
+        for (q in qualities) {
+            val baos = ByteArrayOutputStream()
+            source.compress(Bitmap.CompressFormat.JPEG, q, baos)
+            val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+            if (lastMinChars == 0 || b64.length < lastMinChars) lastMinChars = b64.length
+            if (b64.length <= maxChars) {
+                lastQuality = q
+                return b64
+            }
+        }
+
+        // Pre-smooth high-frequency detail (0.6x downscale + upscale back to exact w x h)
+        val smW = (w * 0.6f).roundToInt().coerceAtLeast(64)
+        val smH = (h * 0.6f).roundToInt().coerceAtLeast(48)
+        val down = Bitmap.createScaledBitmap(source, smW, smH, true)
+        val smoothed = Bitmap.createScaledBitmap(down, w, h, true)
+        down.recycle()
+        try {
+            val smoothQualities = intArrayOf(58, 46, 36, 26, 18, 12, 7, 4)
+            for (q in smoothQualities) {
                 val baos = ByteArrayOutputStream()
-                current.compress(Bitmap.CompressFormat.JPEG, q, baos)
+                smoothed.compress(Bitmap.CompressFormat.JPEG, q, baos)
                 val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                if (lastMinChars == 0 || b64.length < lastMinChars) {
-                    lastMinChars = b64.length
-                }
+                if (b64.length < lastMinChars) lastMinChars = b64.length
                 if (b64.length <= maxChars) {
-                    if (current !== source) current.recycle()
+                    lastQuality = q
                     return b64
                 }
             }
-            val nw = (current.width * 0.85f).roundToInt()
-            val nh = (current.height * 0.85f).roundToInt()
-            if (nw < 48 || nh < 48) break
-            val next = Bitmap.createScaledBitmap(current, nw, nh, true)
-            if (current !== source) current.recycle()
-            current = next
+        } finally {
+            smoothed.recycle()
         }
-        if (current !== source) current.recycle()
+
+        // Emergency fallback shrink only if even q=4 smoothed exceeds budget
+        var cur = source
+        for (attempt in 0 until 3) {
+            val nw = (cur.width * 0.82f).roundToInt()
+            val nh = (cur.height * 0.82f).roundToInt()
+            if (nw < 64 || nh < 48) break
+            val next = Bitmap.createScaledBitmap(cur, nw, nh, true)
+            if (cur !== source) cur.recycle()
+            cur = next
+            for (q in intArrayOf(36, 22, 12, 6)) {
+                val baos = ByteArrayOutputStream()
+                cur.compress(Bitmap.CompressFormat.JPEG, q, baos)
+                val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                if (b64.length < lastMinChars) lastMinChars = b64.length
+                if (b64.length <= maxChars) {
+                    lastQuality = q
+                    if (cur !== source) cur.recycle()
+                    return b64
+                }
+            }
+        }
+        if (cur !== source) cur.recycle()
         return ""
     }
 
@@ -186,6 +251,8 @@ object MidFrameRenderer {
         h: Float,
         sc: Float,
         mapStyle: MapStyleOption,
+        cartoApiKey: String,
+        compassOn: Boolean,
         gps: GpsState,
         route: NavRouteX?,
         navOn: Boolean,
@@ -257,7 +324,8 @@ object MidFrameRenderer {
                             urlTemplate = mapStyle.tileUrlTemplate,
                             z = tz,
                             x = coord.third,
-                            y = coord.second
+                            y = coord.second,
+                            cartoApiKey = cartoApiKey
                         )
                     }
                     coord to bmp
@@ -334,7 +402,78 @@ object MidFrameRenderer {
         val accPx = gps.accuracyM?.let { (it / mpp).toFloat() } ?: 0f
         drawRiderMarker(canvas, mx, my, sc, navOn, accPx)
 
+        if (compassOn) {
+            drawCompassRose(canvas, 20f * sc, 20f * sc, hdg, sc)
+        }
+
         canvas.restore()
+    }
+
+    private fun drawCompassRose(canvas: Canvas, cx: Float, cy: Float, hdg: Float, sc: Float) {
+        val r = max(11f, 13f * sc)
+        val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xCC0B1620.toInt()
+            style = Paint.Style.FILL
+        }
+        val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF456477.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = max(1f, 1.2f * sc)
+        }
+        canvas.drawCircle(cx, cy, r, bg)
+        canvas.drawCircle(cx, cy, r, ring)
+
+        canvas.save()
+        canvas.translate(cx, cy)
+        canvas.rotate(-hdg)
+        val needle = Path().apply {
+            moveTo(0f, -r * 0.72f)
+            lineTo(r * 0.28f, 0f)
+            lineTo(-r * 0.28f, 0f)
+            close()
+        }
+        val np = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFFF5252.toInt()
+            style = Paint.Style.FILL
+        }
+        canvas.drawPath(needle, np)
+        canvas.restore()
+
+        val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textAlign = Paint.Align.CENTER
+            textSize = max(7.5f, 8.5f * sc)
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        }
+        canvas.drawText("U", cx, cy + r * 0.56f, tp)
+    }
+
+    private fun drawTripSumCanvas(canvas: Canvas, w: Float, h: Float, sc: Float, sum: TripSummaryCardData) {
+        val f = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        f.color = 0xFF0B1620.toInt()
+        canvas.drawRect(0f, 0f, w, h, f)
+        f.color = 0xFF00E676.toInt()
+        canvas.drawRect(0f, 0f, w, max(3f, 4f * sc), f)
+
+        val tp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+            style = Paint.Style.FILL_AND_STROKE
+            strokeWidth = max(0.6f, 0.75f * sc)
+            textAlign = Paint.Align.CENTER
+        }
+        fun drawCentered(txt: String, y: Float, color: Int, startSz: Float, minSz: Float) {
+            tp.color = color
+            fitText(tp, txt, w - 24f * sc, startSz, minSz)
+            canvas.drawText(txt, w / 2f, midBase(tp, y), tp)
+        }
+
+        drawCentered(sum.title, 26f * sc, 0xFF00E676.toInt(), 22f * sc, 13f * sc)
+        drawCentered(String.format(Locale.US, "%.1f km • %d mnt", sum.distanceKm, sum.durationMin), 66f * sc, Color.WHITE, 26f * sc, 13f * sc)
+        drawCentered("${sum.energyWh.roundToInt()} Wh (${String.format(Locale.US, "%.0f", sum.whPerKm)} Wh/km)", 106f * sc, 0xFFE3ECF2.toInt(), 20f * sc, 12f * sc)
+        drawCentered("MAKS ${sum.maxSpeedKmh.roundToInt()} km/h", 142f * sc, 0xFF8BFF98.toInt(), 18f * sc, 11f * sc)
+        if (sum.ridingScore != null) {
+            drawCentered("SKOR BERKENDARA ${sum.ridingScore}/100", 178f * sc, 0xFFFFD740.toInt(), 17f * sc, 11f * sc)
+        }
     }
 
     private fun drawProjectedRoute(
@@ -539,7 +678,8 @@ object MidFrameRenderer {
         route: NavRouteX?,
         step: RouteStepX?,
         distToNextStepM: Double,
-        etaMin: Double
+        etaMin: Double,
+        spkluAheadKm: Double? = null
     ) {
         val pw = w - x0
         val left = x0 + 8f * sc
@@ -590,7 +730,12 @@ object MidFrameRenderer {
             canvas.drawText("ETA $etaStr  $arr", left, midBase(tp, 108f * sc), tp)
 
             val arrSoc = route.energyEstimate?.socAtArrivalPct
-            if (arrSoc != null) {
+            if (arrSoc != null && arrSoc < 20.0 && spkluAheadKm != null) {
+                val warnTxt = "SPKLU TERDEKAT ${String.format(Locale.US, "%.1f", spkluAheadKm)} km"
+                tp.color = if (arrSoc < 5.0) 0xFFFF5252.toInt() else 0xFFFFB300.toInt()
+                fitText(tp, warnTxt, tw, 13.5f * sc, 9.5f * sc)
+                canvas.drawText(warnTxt, left, midBase(tp, 128f * sc), tp)
+            } else if (arrSoc != null) {
                 val socTxt = "TIBA SOC ${arrSoc.roundToInt().coerceAtLeast(0)}%"
                 tp.color = when {
                     arrSoc < 5.0 -> 0xFFFF5252.toInt()

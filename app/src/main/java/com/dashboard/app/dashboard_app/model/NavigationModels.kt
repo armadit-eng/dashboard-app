@@ -4,11 +4,53 @@ import kotlinx.serialization.Serializable
 
 enum class HillGrade { FLAT, UPHILL_MILD, UPHILL_STEEP, DOWNHILL }
 
-enum class MapStyleOption(val id: String, val label: String, val tileUrlTemplate: String) {
-    OSM_STANDARD("osm", "OSM Standar", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
-    DARK_CARTO("dark", "Cockpit Gelap", "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"),
-    SATELLITE("sat", "Satelit Esri", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
-    TOPO("topo", "Topografi", "https://a.tile.opentopomap.org/{z}/{x}/{y}.png");
+enum class MapStyleOption(
+    val id: String,
+    val label: String,
+    val tileUrlTemplate: String,
+    val isDarkBase: Boolean = false,
+    val usesCartoKey: Boolean = false
+) {
+    OSM_STANDARD(
+        id = "osm",
+        label = "OSM Standar",
+        tileUrlTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    ),
+    OSM_HOT(
+        id = "osm_hot",
+        label = "OSM Humanitarian",
+        tileUrlTemplate = "https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png"
+    ),
+    DARK_CARTO(
+        id = "dark",
+        label = "Carto Dark Matter",
+        tileUrlTemplate = "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png{keyQs}",
+        isDarkBase = true,
+        usesCartoKey = true
+    ),
+    CARTO_VOYAGER(
+        id = "carto_voyager",
+        label = "Carto Voyager",
+        tileUrlTemplate = "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png{keyQs}",
+        usesCartoKey = true
+    ),
+    CARTO_POSITRON(
+        id = "carto_positron",
+        label = "Carto Positron",
+        tileUrlTemplate = "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png{keyQs}",
+        usesCartoKey = true
+    ),
+    SATELLITE(
+        id = "sat",
+        label = "Satelit Esri",
+        tileUrlTemplate = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        isDarkBase = true
+    ),
+    TOPO(
+        id = "topo",
+        label = "Topografi",
+        tileUrlTemplate = "https://a.tile.opentopomap.org/{z}/{x}/{y}.png"
+    );
 
     companion object {
         fun fromId(id: String?): MapStyleOption =
@@ -33,6 +75,7 @@ data class GpsState(
     val isFromCache: Boolean = false
 )
 
+@Serializable
 data class RouteStepX(
     val instruction: String,
     val roadName: String,
@@ -43,6 +86,7 @@ data class RouteStepX(
     val location: GeoPointX
 )
 
+@Serializable
 data class ElevationSample(
     val distanceKm: Double,
     val elevationM: Double,
@@ -51,6 +95,7 @@ data class ElevationSample(
     val point: GeoPointX
 )
 
+@Serializable
 data class RouteEnergyEstimate(
     val totalWh: Double,
     val regenWh: Double,
@@ -63,6 +108,7 @@ data class RouteEnergyEstimate(
     val totalDescentM: Double
 )
 
+@Serializable
 data class WaypointArrivalSummary(
     val label: String,
     val legDistKm: Double,
@@ -71,6 +117,7 @@ data class WaypointArrivalSummary(
     val isChargingStop: Boolean = false
 )
 
+@Serializable
 data class NavRouteX(
     val geometry: List<GeoPointX>,
     val steps: List<RouteStepX>,

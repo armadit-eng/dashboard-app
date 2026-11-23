@@ -38,10 +38,14 @@ class BtClassicManager(private val context: Context) {
     var onLineReceived: ((String) -> Unit)? = null
     var onStateChanged: ((ConnectionStateX, String, String?) -> Unit)? = null
     var onLog: ((String, String, Boolean) -> Unit)? = null
+    var isNavOrMapsBusy: (() -> Boolean)? = null
 
     @Volatile
     var isMapsSending: Boolean = false
         private set
+
+    @Volatile
+    private var mapsSendStartedMs: Long = 0L
 
     @Volatile
     var lastMapsWriteMs: Long = 0L
@@ -56,8 +60,27 @@ class BtClassicManager(private val context: Context) {
     @Volatile
     private var writerRunning = false
 
+    private data class PollEntry(val cmd: String, val intervalMs: Long, var lastSentMs: Long = 0L)
+
+    private val pollSchedule = listOf(
+        PollEntry("AT+SPD?\r\n", 500L),
+        PollEntry("AT+IBAT?\r\n", 500L),
+        PollEntry("AT+VBAT?\r\n", 1000L),
+        PollEntry("AT+TRT?\r\n", 2000L),
+        PollEntry("AT+ODO?\r\n", 2000L),
+        PollEntry("AT+SOC?\r\n", 4000L),
+        PollEntry("AT+ERR?\r\n", 8000L),
+        PollEntry("AT+MODE?\r\n", 8000L),
+        PollEntry("AT+PARK?\r\n", 8000L),
+        PollEntry("AT+CBAT?\r\n", 8000L),
+        PollEntry("AT+TINV?\r\n", 15_000L),
+        PollEntry("AT+TMOT?\r\n", 15_000L),
+        PollEntry("AT+TBAT?\r\n", 15_000L),
+        PollEntry("AT+SOH?\r\n", 30_000L)
+    )
+
     private var pollFuture: ScheduledFuture<*>? = null
-    private var pollCycle = 0
+    private var timeFuture: ScheduledFuture<*>? = null
 
     private var socket: BluetoothSocket? = null
     private var outputStream: OutputStream? = null
@@ -272,6 +295,10 @@ class BtClassicManager(private val context: Context) {
     }
 
     fun mapsQueueDepth(): Int {
+        if (isMapsSending && mapsSendStartedMs > 0L && System.currentTimeMillis() - mapsSendStartedMs > 10_000L) {
+            isMapsSending = false
+            mapsSendStartedMs = 0L
+        }
         var count = if (isMapsSending) 1 else 0
         for (item in writeQueue) {
             if (item.startsWith("AT+MAPS=")) count++
@@ -337,7 +364,10 @@ class BtClassicManager(private val context: Context) {
                 }
                 val isMaps = cmd.startsWith("AT+MAPS=")
                 val t0 = System.currentTimeMillis()
-                if (isMaps) isMapsSending = true
+                if (isMaps) {
+                    isMapsSending = true
+                    mapsSendStartedMs = t0
+                }
                 try {
                     out.write(cmd.toByteArray(Charsets.UTF_8))
                     out.flush()
@@ -351,6 +381,7 @@ class BtClassicManager(private val context: Context) {
                     if (isMaps) {
                         lastMapsWriteMs = System.currentTimeMillis() - t0
                         isMapsSending = false
+                        mapsSendStartedMs = 0L
                     }
                 }
                 lastWriteAt = System.currentTimeMillis()
@@ -371,40 +402,54 @@ class BtClassicManager(private val context: Context) {
         isMapsSending = false
     }
 
-    private fun startPolling() {
-        stopPolling()
+    fun sendTimeNow() {
+        if (!connected) return
         val cal = Calendar.getInstance()
         val hh = cal.get(Calendar.HOUR_OF_DAY).toString().padStart(2, '0')
         val mm = cal.get(Calendar.MINUTE).toString().padStart(2, '0')
         sendCommand("AT+TIME=\"$hh$mm\"")
+    }
 
+    private fun startPolling() {
+        stopPolling()
+        pollSchedule.forEach { it.lastSentMs = 0L }
+
+        // Allow link/readLoop to settle (1.6s), then sync RTC clock every 60s
+        timeFuture = scheduler.scheduleAtFixedRate({
+            if (connected) sendTimeNow()
+        }, 1600, 60_000, TimeUnit.MILLISECONDS)
+
+        // Single most-overdue command per tick (prevents MID serial RX overflow)
         pollFuture = scheduler.scheduleAtFixedRate({
             if (!connected) return@scheduleAtFixedRate
-            enqueueCoalesced("AT+SPD?\r\n")
-            enqueueCoalesced("AT+IBAT?\r\n")
-            enqueueCoalesced("AT+VBAT?\r\n")
-            enqueueCoalesced("AT+TRT?\r\n")
-            if (pollCycle % 2 == 0) {
-                enqueueCoalesced("AT+SOC?\r\n")
-                enqueueCoalesced("AT+ERR?\r\n")
-                enqueueCoalesced("AT+MODE?\r\n")
-                enqueueCoalesced("AT+PARK?\r\n")
+            if (mapsQueueDepth() > 0 || writeQueue.size >= 2) return@scheduleAtFixedRate
+            val now = System.currentTimeMillis()
+            val navBusy = isNavOrMapsBusy?.invoke() == true
+            val bleBusy = BleConnectGate.isBusy()
+            var best: PollEntry? = null
+            var bestScore = 1.0
+            for (entry in pollSchedule) {
+                if (bleBusy && entry.intervalMs > 1000L) continue
+                val interval = ((if (navBusy && entry.intervalMs >= 8000L) entry.intervalMs * 2L else entry.intervalMs) *
+                    if (bleBusy) 2L else 1L)
+                val score = (now - entry.lastSentMs).toDouble() / interval.toDouble()
+                if (score >= bestScore) {
+                    best = entry
+                    bestScore = score
+                }
             }
-            if (pollCycle % 6 == 0) {
-                enqueueCoalesced("AT+CBAT?\r\n")
-                enqueueCoalesced("AT+ODO?\r\n")
-                enqueueCoalesced("AT+TINV?\r\n")
-                enqueueCoalesced("AT+TMOT?\r\n")
-                enqueueCoalesced("AT+TBAT?\r\n")
-                enqueueCoalesced("AT+SOH?\r\n")
+            if (best != null) {
+                best.lastSentMs = now
+                enqueueCoalesced(best.cmd)
             }
-            pollCycle++
-        }, 120, 500, TimeUnit.MILLISECONDS)
+        }, 2200, 180, TimeUnit.MILLISECONDS)
     }
 
     private fun stopPolling() {
         pollFuture?.cancel(false)
         pollFuture = null
+        timeFuture?.cancel(false)
+        timeFuture = null
     }
 
     private fun closeSocketOnly() {

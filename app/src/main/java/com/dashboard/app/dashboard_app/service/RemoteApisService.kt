@@ -27,7 +27,11 @@ data class ReverseGeocodeResult(val road: String, val area: String)
 object RemoteApisService {
     private const val USER_AGENT = "DashboardAppEV/1.0 (com.dashboard.app.dashboard_app)"
 
-    private fun httpGet(urlStr: String, timeoutMs: Int = 10_000): String? {
+    private fun httpGet(
+        urlStr: String,
+        timeoutMs: Int = 10_000,
+        extraHeaders: Map<String, String> = emptyMap()
+    ): String? {
         var conn: HttpURLConnection? = null
         return try {
             conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
@@ -35,6 +39,7 @@ object RemoteApisService {
                 connectTimeout = timeoutMs
                 readTimeout = timeoutMs
                 setRequestProperty("User-Agent", USER_AGENT)
+                extraHeaders.forEach { (k, v) -> setRequestProperty(k, v) }
             }
             if (conn.responseCode == HttpURLConnection.HTTP_OK) {
                 conn.inputStream.bufferedReader().use { it.readText() }
@@ -143,6 +148,69 @@ object RemoteApisService {
         }
     }
 
+    fun isMapsShortUrl(input: String): Boolean {
+        val low = input.lowercase(Locale.US)
+        return low.contains("maps.app.goo.gl") ||
+            low.contains("goo.gl/maps") ||
+            low.contains("g.co/") ||
+            low.contains("share.google")
+    }
+
+    suspend fun resolveGoogleMapsShortUrl(rawUrl: String): GeoPointX? = withContext(Dispatchers.IO) {
+        val urlMatch = Regex("""https?://\S+""").find(rawUrl.trim())?.value ?: return@withContext null
+        var current = urlMatch
+        try {
+            repeat(5) {
+                RoutePhysics.parseCoordinatesOrGoogleMapsUrl(current)?.let { return@withContext it }
+                var conn: HttpURLConnection? = null
+                try {
+                    conn = (URL(current).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        instanceFollowRedirects = false
+                        connectTimeout = 7_000
+                        readTimeout = 7_000
+                        setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
+                    }
+                    val code = conn.responseCode
+                    if (code in 300..399) {
+                        val loc = conn.getHeaderField("Location") ?: return@repeat
+                        current = if (loc.startsWith("/")) {
+                            val u = URL(current)
+                            "${u.protocol}://${u.host}$loc"
+                        } else loc
+                    } else if (code == HttpURLConnection.HTTP_OK) {
+                        val html = conn.inputStream.bufferedReader().use { it.readText() }.take(80_000)
+                        // Check !3dLAT!4dLNG, @LAT,LNG, center=LAT,LNG, or og:image coordinates
+                        val patterns = listOf(
+                            Regex("""!3d(-?\d{1,2}\.\d+)!4d(-?\d{1,3}\.\d+)"""),
+                            Regex("""center=(-?\d{1,2}\.\d+)(?:%2C|,)(-?\d{1,3}\.\d+)"""),
+                            Regex("""@(-?\d{1,2}\.\d+),(-?\d{1,3}\.\d+)"""),
+                            Regex(""""lat"\s*:\s*(-?\d{1,2}\.\d+)\s*,\s*"(?:lng|lon)"\s*:\s*(-?\d{1,3}\.\d+)""")
+                        )
+                        for (re in patterns) {
+                            val m = re.find(html)
+                            if (m != null) {
+                                val lat = m.groupValues[1].toDoubleOrNull()
+                                val lng = m.groupValues[2].toDoubleOrNull()
+                                if (lat != null && lng != null && lat in -90.0..90.0 && lng in -180.0..180.0) {
+                                    return@withContext GeoPointX(lat, lng)
+                                }
+                            }
+                        }
+                        return@withContext null
+                    } else {
+                        return@withContext null
+                    }
+                } finally {
+                    conn?.disconnect()
+                }
+            }
+            RoutePhysics.parseCoordinatesOrGoogleMapsUrl(current)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     suspend fun searchPlaces(query: String): List<SavedPlace> = withContext(Dispatchers.IO) {
         val trimmed = query.trim()
         if (trimmed.isEmpty()) return@withContext emptyList()
@@ -158,6 +226,21 @@ object RemoteApisService {
                     createdAtMs = System.currentTimeMillis()
                 )
             )
+        }
+        if (isMapsShortUrl(trimmed)) {
+            val resolved = resolveGoogleMapsShortUrl(trimmed)
+            if (resolved != null) {
+                return@withContext listOf(
+                    SavedPlace(
+                        id = "short_${resolved.lat}_${resolved.lng}",
+                        name = "Lokasi Link Maps (${String.format(Locale.US, "%.5f", resolved.lat)}, ${String.format(Locale.US, "%.5f", resolved.lng)})",
+                        category = "Pin Link",
+                        lat = resolved.lat,
+                        lng = resolved.lng,
+                        createdAtMs = System.currentTimeMillis()
+                    )
+                )
+            }
         }
 
         try {
@@ -376,18 +459,27 @@ object RemoteApisService {
 
         // 2. OpenChargeMap
         try {
-            val keyPart = if (ocmApiKey.trim().isNotEmpty()) "&key=${URLEncoder.encode(ocmApiKey.trim(), "UTF-8")}" else ""
-            val distKm = (radiusMeters / 1000.0).roundToInt()
-            val url = "https://api.openchargemap.io/v3/poi/?output=json&latitude=$lat&longitude=$lng&distance=$distKm&distanceunit=KM&maxresults=20$keyPart"
-            val body = httpGet(url, 9_000)
+            val cleanKey = ocmApiKey.trim()
+            val keyPart = if (cleanKey.isNotEmpty()) "&key=${URLEncoder.encode(cleanKey, "UTF-8")}" else ""
+            val headers = if (cleanKey.isNotEmpty()) mapOf("X-API-Key" to cleanKey) else emptyMap()
+            val distKm = (radiusMeters / 1000.0).roundToInt().coerceAtLeast(15)
+            val url = "https://api.openchargemap.io/v3/poi/?output=json&countrycode=ID&latitude=$lat&longitude=$lng&distance=$distKm&distanceunit=KM&maxresults=40$keyPart"
+            val body = httpGet(url, 10_000, headers)
             if (body != null) {
                 val arr = JSONArray(body)
                 for (i in 0 until arr.length()) {
                     val item = arr.optJSONObject(i) ?: continue
                     val addr = item.optJSONObject("AddressInfo") ?: continue
                     if (!addr.has("Latitude") || !addr.has("Longitude")) continue
-                    val sLat = addr.optDouble("Latitude")
-                    val sLng = addr.optDouble("Longitude")
+                    val sLat = addr.optDouble("Latitude", Double.NaN)
+                    val sLng = addr.optDouble("Longitude", Double.NaN)
+                    if (sLat.isNaN() || sLng.isNaN()) continue
+                    // Deduplicate against OSM stations within 80m
+                    val duplicate = results.values.any { existing ->
+                        RoutePhysics.haversineKm(GeoPointX(existing.lat, existing.lng), GeoPointX(sLat, sLng)) < 0.08
+                    }
+                    if (duplicate) continue
+
                     val opInfo = item.optJSONObject("OperatorInfo")
                     val conns = item.optJSONArray("Connections")
                     var kw: Double? = null

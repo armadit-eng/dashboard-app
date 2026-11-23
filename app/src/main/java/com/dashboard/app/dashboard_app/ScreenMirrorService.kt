@@ -591,7 +591,7 @@ class ScreenMirrorService : Service() {
     }
 
     private fun encodeUnderLimit(bmp: Bitmap): String? {
-        var q = max(jpegQuality, 76)
+        var q = jpegQuality.coerceIn(30, 95)
         while (q >= 6) {
             val bos = ByteArrayOutputStream()
             bmp.compress(Bitmap.CompressFormat.JPEG, q, bos)

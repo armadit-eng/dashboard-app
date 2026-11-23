@@ -45,6 +45,7 @@ import java.util.Locale
 fun OfflineMapSection(
     styleId: String,
     urlTemplate: String,
+    cartoApiKey: String = "",
     centerProvider: () -> GeoPointX,
     canBulkDownload: Boolean
 ) {
@@ -130,6 +131,7 @@ fun OfflineMapSection(
                                     lat = center.lat,
                                     lng = center.lng,
                                     radiusKm = radiusKm,
+                                    cartoApiKey = cartoApiKey,
                                     onProgress = { d, t ->
                                         done = d
                                         total = t
@@ -175,7 +177,7 @@ fun OfflineMapSection(
             }
         } else {
             Text(
-                "Unduh area hanya tersedia untuk gaya \"Cockpit Gelap\" (CARTO). Gaya lain tetap disimpan otomatis ke cache saat dilihat.",
+                "Unduh area tersedia untuk gaya Carto, Topo & Humanitarian. Gaya OSM Standard tetap disimpan otomatis ke cache saat dilihat.",
                 fontSize = 12.sp,
                 color = c.textMuted
             )

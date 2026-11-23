@@ -32,6 +32,9 @@ object BleConnectGate {
     fun waitingFor(): String = holder?.let { "menunggu $it" } ?: ""
 
     @Synchronized
+    fun isBusy(): Boolean = holder != null || queue.isNotEmpty()
+
+    @Synchronized
     fun acquire(who: String, onReady: () -> Unit) {
         if (holder == null && queue.isEmpty()) {
             holder = who

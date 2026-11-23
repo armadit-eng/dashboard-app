@@ -8,7 +8,9 @@ import com.dashboard.app.dashboard_app.model.Battery2Data
 import com.dashboard.app.dashboard_app.model.BatterySourcePriority
 import com.dashboard.app.dashboard_app.model.ChargingIndicatorState
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.DailyChallenge
 import com.dashboard.app.dashboard_app.model.EffectiveTelemetry
+import com.dashboard.app.dashboard_app.model.EfficiencyTrend
 import com.dashboard.app.dashboard_app.model.Esp32Data
 import com.dashboard.app.dashboard_app.model.FuelSavingsSummary
 import com.dashboard.app.dashboard_app.model.JkBmsData
@@ -16,8 +18,11 @@ import com.dashboard.app.dashboard_app.model.LiveTripMetrics
 import com.dashboard.app.dashboard_app.model.MaintHealthLevel
 import com.dashboard.app.dashboard_app.model.MaintenanceStatus
 import com.dashboard.app.dashboard_app.model.MotorData
+import com.dashboard.app.dashboard_app.model.PersonalRecords
 import com.dashboard.app.dashboard_app.model.RidingScoreState
+import com.dashboard.app.dashboard_app.model.TripRecord
 import com.dashboard.app.dashboard_app.model.kMotorErrorDefs
+import java.util.Calendar
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
@@ -34,6 +39,8 @@ object TelemetryEngine {
     const val STALE_MS = 10_000L
     const val INTEGRATE_MAX_GAP_MS = 4_500L
 
+    private val leadingNumberRegex = Regex("""[-+]?\d+(?:\.\d+)?""")
+
     fun parseMotorAtLine(
         rawLine: String,
         current: MotorData,
@@ -42,17 +49,33 @@ object TelemetryEngine {
         onCorruptOdo: ((String) -> Unit)? = null
     ): MotorData? {
         val line = rawLine.trim()
-        if (line.isEmpty() || line == "OK") return null
-        val eq = line.indexOf('=')
-        if (eq <= 0) return null
+        if (line.isEmpty() || line.equals("OK", ignoreCase = true)) return null
+        val eqIdx = line.indexOf('=')
+        val colIdx = line.indexOf(':')
+        val sep = when {
+            eqIdx > 0 && colIdx > 0 -> min(eqIdx, colIdx)
+            eqIdx > 0 -> eqIdx
+            colIdx > 0 -> colIdx
+            else -> -1
+        }
+        if (sep <= 0) return null
 
-        val key = line.substring(0, eq).trim().uppercase(Locale.US)
-        val valStr = line.substring(eq + 1).trim().replace("\"", "")
+        val key = line.substring(0, sep)
+            .trim()
+            .uppercase(Locale.US)
+            .removePrefix("AT+")
+            .removePrefix("+")
+        val valStr = line.substring(sep + 1).trim().replace("\"", "")
         val numVal = valStr.toDoubleOrNull()
+            ?: leadingNumberRegex.find(valStr)?.value?.toDoubleOrNull()
 
         return when {
             key.contains("SPD") && numVal != null ->
                 current.copy(speedKmh = max(0.0, numVal), lastUpdatedMs = nowMs)
+            key.contains("RPM") && numVal != null ->
+                current.copy(rpm = max(0, numVal.roundToInt()), lastUpdatedMs = nowMs)
+            key.contains("TIME") ->
+                current.copy(timeStr = valStr, lastUpdatedMs = nowMs)
             key.contains("VBAT") && numVal != null ->
                 current.copy(vbat = numVal, lastUpdatedMs = nowMs)
             key.contains("IBAT") && numVal != null ->
@@ -76,7 +99,7 @@ object TelemetryEngine {
             }
             key.contains("ERR") -> {
                 val cleaned = valStr.replaceFirst(Regex("^0x", RegexOption.IGNORE_CASE), "")
-                val parsedMask = valStr.toIntOrNull() ?: cleaned.toIntOrNull(16) ?: 0
+                val parsedMask = valStr.toIntOrNull() ?: cleaned.toIntOrNull(16) ?: (numVal?.toInt() ?: 0)
                 current.copy(errMask = parsedMask, lastUpdatedMs = nowMs)
             }
             key.contains("MODE") && numVal != null ->
@@ -361,7 +384,7 @@ object TelemetryEngine {
 
         return EffectiveTelemetry(
             speedKmh = speedKmh,
-            rpm = speedKmh?.let { (it * 51.45).roundToInt() },
+            rpm = motor.rpm?.takeIf { motorAlive } ?: speedKmh?.let { (it * 51.45).roundToInt() },
             throttlePct = throttlePct,
             b1SocPct = b1Soc,
             b1Vbat = b1Vbat,
@@ -455,6 +478,8 @@ object TelemetryEngine {
         val stopInc = if (wasMoving && !nowMoving && trip.distanceKm > 0.05) 1 else 0
         val moveIncSec = if (nowMoving) max(1, dtSec.roundToInt()) else 0
 
+        val vNow = eff.avgVoltageV
+        val tNow = eff.b1TempC ?: eff.b2TempC
         val nextTrip = trip.copy(
             distanceKm = trip.distanceKm + distDeltaKm,
             energyWh = trip.energyWh + energyAdd,
@@ -464,6 +489,10 @@ object TelemetryEngine {
             maxSpeedKmh = max(trip.maxSpeedKmh, spd),
             maxPowerW = max(trip.maxPowerW, if (totalP > 0) totalP else 0.0),
             maxRegenW = max(trip.maxRegenW, if (eff.isRegen) abs(totalP) else 0.0),
+            maxCurrentA = max(trip.maxCurrentA, abs(totalI)),
+            minVbat = vNow?.let { min(trip.minVbat ?: it, it) } ?: trip.minVbat,
+            maxVbat = vNow?.let { max(trip.maxVbat ?: it, it) } ?: trip.maxVbat,
+            maxTbatC = tNow?.let { max(trip.maxTbatC ?: it, it) } ?: trip.maxTbatC,
             movingSeconds = trip.movingSeconds + moveIncSec,
             stopCount = trip.stopCount + stopInc,
             lastSampleMs = nowMs,
@@ -651,5 +680,86 @@ object TelemetryEngine {
             out.add(if (weatherMood.length > 20) weatherMood.substring(0, 20) else weatherMood)
         }
         return out
+    }
+
+    fun computePersonalRecords(trips: List<TripRecord>): PersonalRecords {
+        if (trips.isEmpty()) return PersonalRecords()
+        val longest = trips.maxOf { it.distanceKm }
+        val topSpd = trips.maxOf { it.maxSpeedKmh }
+        val topRegen = trips.maxOf { it.regenWh }
+        val validEff = trips.filter { it.distanceKm >= 0.5 && it.energyWh > 5.0 && !it.isPartial }
+        val bestEff = validEff.minOfOrNull { it.whPerKm }
+        val bestScore = trips.mapNotNull { it.ridingScore }.maxOrNull()
+        return PersonalRecords(
+            longestTripKm = longest,
+            topSpeedKmh = topSpd,
+            highestRegenWh = topRegen,
+            bestWhPerKm = bestEff,
+            bestScore = bestScore
+        )
+    }
+
+    fun computeEfficiencyTrend(trips: List<TripRecord>): EfficiencyTrend? {
+        val valid = trips.filter { it.distanceKm >= 0.3 && it.energyWh > 2.0 && !it.isPartial }
+        if (valid.size < 4) return null
+        val recent = valid.take(3).map { it.whPerKm }.average()
+        val prev = valid.drop(3).take(3).map { it.whPerKm }.average()
+        if (prev <= 1.0) return null
+        val delta = ((recent - prev) / prev) * 100.0
+        return EfficiencyTrend(recentAvgWhKm = recent, prevAvgWhKm = prev, deltaPct = delta)
+    }
+
+    fun computeDailyChallenge(trips: List<TripRecord>, nowMs: Long = System.currentTimeMillis()): DailyChallenge {
+        val cal = Calendar.getInstance().apply { timeInMillis = nowMs }
+        val dayStart = (cal.clone() as Calendar).apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+        val todays = trips.filter { it.endTimeMs >= dayStart }
+        val daySeed = cal.get(Calendar.DAY_OF_YEAR) % 3
+        return when (daySeed) {
+            0 -> {
+                val km = todays.sumOf { it.distanceKm }
+                DailyChallenge(
+                    title = "Target Jarak Harian (10 km)",
+                    description = "${String.format(Locale.US, "%.1f", km)} / 10.0 km ditempuh hari ini",
+                    progress = (km / 10.0).coerceIn(0.0, 1.0),
+                    completed = km >= 10.0
+                )
+            }
+            1 -> {
+                val regen = todays.sumOf { it.regenWh }
+                DailyChallenge(
+                    title = "Pemburu Regen (+15 Wh)",
+                    description = "${regen.roundToInt()} / 15 Wh energi dipulihkan hari ini",
+                    progress = (regen / 15.0).coerceIn(0.0, 1.0),
+                    completed = regen >= 15.0
+                )
+            }
+            else -> {
+                val best = todays.mapNotNull { it.ridingScore }.maxOrNull() ?: 0
+                DailyChallenge(
+                    title = "Pengendara Eco (Skor >= 85)",
+                    description = if (best > 0) "Skor terbaik hari ini: $best / 85" else "Catat 1 trip dengan Skor >= 85",
+                    progress = (best / 85.0).coerceIn(0.0, 1.0),
+                    completed = best >= 85
+                )
+            }
+        }
+    }
+
+    fun computeIdleDrainPct(
+        lastParkSocPct: Double?,
+        lastParkTsMs: Long,
+        currentSocPct: Double?,
+        nowMs: Long = System.currentTimeMillis()
+    ): Double? {
+        if (lastParkSocPct == null || currentSocPct == null || lastParkTsMs <= 0L) return null
+        val elapsedMs = nowMs - lastParkTsMs
+        if (elapsedMs < 10 * 60_000L) return null
+        val drop = lastParkSocPct - currentSocPct
+        return if (drop in 0.8..35.0) drop else null
     }
 }

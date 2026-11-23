@@ -76,6 +76,7 @@ fun SlippyMapView(
     center: GeoPointX,
     zoom: Double,
     style: MapStyleOption,
+    cartoApiKey: String = "",
     dataSaverMap: Boolean,
     riderLocation: GeoPointX?,
     riderHeadingDeg: Double,
@@ -101,7 +102,7 @@ fun SlippyMapView(
     val scaleFactor = 2.0.pow(clampedZoom - tileIntZ)
     val tilePx = (256.0 * density.density * 0.72 * scaleFactor).coerceIn(180.0, 520.0)
 
-    val tileBitmaps = remember(style.id) { mutableStateMapOf<String, ImageBitmap?>() }
+    val tileBitmaps = remember(style.id, cartoApiKey) { mutableStateMapOf<String, ImageBitmap?>() }
     var tileTrigger by remember { mutableIntStateOf(0) }
 
     fun lngToTileX(lng: Double, z: Int): Double = ((lng + 180.0) / 360.0) * (1 shl z)
@@ -136,7 +137,7 @@ fun SlippyMapView(
         val maxY = ceil(centerTileY + halfScreenTilesY).toInt()
         val numTiles = 1 shl tileIntZ
 
-        LaunchedEffect(style.id, tileIntZ, minX, maxX, minY, maxY, TileCacheService.offlineOnly) {
+        LaunchedEffect(style.id, cartoApiKey, tileIntZ, minX, maxX, minY, maxY, TileCacheService.offlineOnly) {
             for (ty in minY..maxY) {
                 if (ty < 0 || ty >= numTiles) continue
                 for (tx in minX..maxX) {
@@ -151,7 +152,8 @@ fun SlippyMapView(
                                 urlTemplate = style.tileUrlTemplate,
                                 z = tileIntZ,
                                 x = wrappedX,
-                                y = ty
+                                y = ty,
+                                cartoApiKey = cartoApiKey
                             )
                             if (bmp != null) {
                                 tileBitmaps[key] = bmp

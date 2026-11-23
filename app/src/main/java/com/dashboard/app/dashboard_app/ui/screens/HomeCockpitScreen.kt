@@ -109,6 +109,7 @@ fun HomeCockpitScreen(
     onAddMaintenanceLog: (odoKm: Double, serviceType: String) -> Unit,
     onToggleDevSim: (Boolean) -> Unit,
     onSendMotorAt: (String) -> Unit,
+    onDismissIdleDrain: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val c = LocalCockpitColors.current
@@ -309,6 +310,32 @@ fun HomeCockpitScreen(
                 }
             }
 
+            // 3b. Phantom Idle Drain Warning
+            if (state.idleDrainWarningPct != null) {
+                item {
+                    CockpitCard(
+                        backgroundColor = c.warning.copy(alpha = 0.12f),
+                        borderColor = c.warning.copy(alpha = 0.55f),
+                        contentPadding = 12.dp
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.Warning, contentDescription = null, tint = c.warning)
+                            Spacer(Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Indikasi Idle Drain (-${String.format(Locale.US, "%.1f", state.idleDrainWarningPct)}%)", fontWeight = FontWeight.Bold, color = c.warning)
+                                Text("SOC turun sejak parkir terakhir. Periksa beban standby motor/BMS.", fontSize = 12.sp)
+                            }
+                            TextButton(
+                                onClick = onDismissIdleDrain,
+                                modifier = Modifier.testTag("dismiss_idle_drain_button")
+                            ) {
+                                Text("Tutup")
+                            }
+                        }
+                    }
+                }
+            }
+
             // 4. Hero Dual-Battery & Speed/Range Card
             item {
                 val chg = TelemetryEngine.chargingIndicator(eff)
@@ -493,6 +520,21 @@ fun HomeCockpitScreen(
                         Icon(Icons.Rounded.Route, contentDescription = null, tint = c.accent)
                         Spacer(Modifier.width(8.dp))
                         Text("PERJALANAN SAAT INI", style = MaterialTheme.typography.labelMedium, color = c.textMuted, modifier = Modifier.weight(1f))
+                        if (state.tripBaselineArmed) {
+                            Surface(
+                                shape = CircleShape,
+                                color = c.warning.copy(alpha = 0.16f),
+                                modifier = Modifier.padding(end = 6.dp)
+                            ) {
+                                Text(
+                                    text = "Siaga Start",
+                                    fontSize = 10.5.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = c.warning,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                )
+                            }
+                        }
                         Surface(
                             shape = CircleShape,
                             color = scoreCol.copy(alpha = 0.14f)
@@ -512,6 +554,15 @@ fun HomeCockpitScreen(
                         TripCol("Konsumsi", "${trip.energyWh.roundToInt()} Wh", Modifier.weight(1f))
                         TripCol("Regen", "+${trip.regenWh.roundToInt()} Wh", Modifier.weight(1f))
                         TripCol("Maks", "${trip.maxSpeedKmh.roundToInt()} km/h", Modifier.weight(1f))
+                    }
+                    if (trip.maxCurrentA > 0.5 || trip.minVbat != null) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "Puncak Arus: ${String.format(Locale.US, "%.1f", trip.maxCurrentA)} A" +
+                                (trip.minVbat?.let { " • Vbat Min ${String.format(Locale.US, "%.1f", it)} V" } ?: ""),
+                            fontSize = 11.5.sp,
+                            color = c.textMuted
+                        )
                     }
                     Spacer(Modifier.height(12.dp))
                     Row(

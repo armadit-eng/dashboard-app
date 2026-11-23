@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Sort
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -29,6 +30,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
@@ -52,14 +54,13 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.dashboard.app.dashboard_app.model.Battery2Data
-import com.dashboard.app.dashboard_app.model.EffectiveTelemetry
-import com.dashboard.app.dashboard_app.model.JkBmsData
 import com.dashboard.app.dashboard_app.ui.components.ChartSeries
 import com.dashboard.app.dashboard_app.ui.components.CockpitCard
 import com.dashboard.app.dashboard_app.ui.components.MultiSeriesChart
 import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
 import com.dashboard.app.dashboard_app.viewmodel.DashboardUiState
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -70,6 +71,7 @@ fun DiagnosisScreen(
     onRestoreOdo: (Double) -> Unit,
     onSetInvertB2Current: (Boolean) -> Unit,
     onSendEsp2Command: (String) -> Unit,
+    onLogChargeSession: (startSoc: Double, endSoc: Double, energyWh: Double, durationMin: Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val c = LocalCockpitColors.current
@@ -112,7 +114,8 @@ fun DiagnosisScreen(
                 sortLowFirst = sortLowFirst,
                 onToggleSort = { sortLowFirst = !sortLowFirst },
                 onSetInvertB2Current = onSetInvertB2Current,
-                onSendEsp2Command = onSendEsp2Command
+                onSendEsp2Command = onSendEsp2Command,
+                onLogChargeSession = onLogChargeSession
             )
             else -> LiveChartsTab(state)
         }
@@ -189,7 +192,22 @@ private fun MotorDiagnosisTab(
 
         item {
             CockpitCard {
-                Text("TEMPERATUR & ODOMETER", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "TEMPERATUR & ODOMETER",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = c.textMuted,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        "Jam MID: ${m.timeStr ?: "Sinkron Otomatis"}",
+                        fontSize = 11.5.sp,
+                        color = if (m.timeStr != null) c.accent else c.textMuted
+                    )
+                }
                 Spacer(Modifier.height(10.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -197,7 +215,7 @@ private fun MotorDiagnosisTab(
                 ) {
                     TempCard("Inverter", m.tempInverterC, Modifier.weight(1f))
                     TempCard("Motor BLDC", m.tempMotorC, Modifier.weight(1f))
-                    TempCard("Baterai 1", eff.b1TempC, Modifier.weight(1f))
+                    TempCard("TBAT (MID)", m.tempBatteryC ?: eff.b1TempC, Modifier.weight(1f))
                 }
                 Spacer(Modifier.height(12.dp))
                 Row(
@@ -271,12 +289,51 @@ private fun DualBatteryTab(
     sortLowFirst: Boolean,
     onToggleSort: () -> Unit,
     onSetInvertB2Current: (Boolean) -> Unit,
-    onSendEsp2Command: (String) -> Unit
+    onSendEsp2Command: (String) -> Unit,
+    onLogChargeSession: (startSoc: Double, endSoc: Double, energyWh: Double, durationMin: Int) -> Unit
 ) {
     val c = LocalCockpitColors.current
     val jk = state.jkData
     val b2 = state.battery2Data
     val eff = state.effective
+    var showChargeDialog by remember { mutableStateOf(false) }
+    val dateFmt = remember { SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()) }
+
+    if (showChargeDialog) {
+        var sSoc by remember { mutableStateOf("20") }
+        var eSoc by remember { mutableStateOf("90") }
+        var whStr by remember { mutableStateOf("1000") }
+        var durStr by remember { mutableStateOf("120") }
+        AlertDialog(
+            onDismissRequest = { showChargeDialog = false },
+            title = { Text("Catat Sesi Pengisian") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(value = sSoc, onValueChange = { sSoc = it }, label = { Text("SOC Awal (%)") }, singleLine = true)
+                    OutlinedTextField(value = eSoc, onValueChange = { eSoc = it }, label = { Text("SOC Akhir (%)") }, singleLine = true)
+                    OutlinedTextField(value = whStr, onValueChange = { whStr = it }, label = { Text("Energi Masuk (Wh)") }, singleLine = true)
+                    OutlinedTextField(value = durStr, onValueChange = { durStr = it }, label = { Text("Durasi (menit)") }, singleLine = true)
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onLogChargeSession(
+                            sSoc.toDoubleOrNull() ?: 20.0,
+                            eSoc.toDoubleOrNull() ?: 90.0,
+                            whStr.toDoubleOrNull() ?: 1000.0,
+                            durStr.toIntOrNull() ?: 120
+                        )
+                        showChargeDialog = false
+                    },
+                    modifier = Modifier.testTag("confirm_charge_log_button")
+                ) { Text("Simpan") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showChargeDialog = false }) { Text("Batal") }
+            }
+        )
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -388,6 +445,69 @@ private fun DualBatteryTab(
                         sortLowFirst = sortLowFirst,
                         onToggleSort = onToggleSort
                     )
+                }
+            }
+        }
+
+        // SOH History & Charging Logs Card
+        item {
+            CockpitCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("RIWAYAT SOH & LOG PENGISIAN", style = MaterialTheme.typography.labelMedium, color = c.textMuted, modifier = Modifier.weight(1f))
+                    TextButton(
+                        onClick = { showChargeDialog = true },
+                        modifier = Modifier.testTag("open_charge_log_dialog_button")
+                    ) {
+                        Text("+ Catat Cas")
+                    }
+                }
+                if (state.sohHistory.isNotEmpty()) {
+                    val lastSoh = state.sohHistory.last()
+                    Text(
+                        "Sampel SOH terakhir: ${lastSoh.sohPct.roundToInt()}% (${state.sohHistory.size} titik • Siklus ${lastSoh.cycles ?: "—"})",
+                        fontSize = 12.sp,
+                        color = c.accent
+                    )
+                    Spacer(Modifier.height(6.dp))
+                }
+                if (state.chargingLogs.isEmpty()) {
+                    Text(
+                        "Belum ada log sesi pengisian daya tercatat.",
+                        fontSize = 12.sp,
+                        color = c.textMuted
+                    )
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        state.chargingLogs.take(5).forEach { cl ->
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = c.surfaceElevated
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "${cl.startSocPct.roundToInt()}% → ${cl.endSocPct.roundToInt()}% (+${cl.energyAddedWh.roundToInt()} Wh)",
+                                            fontWeight = FontWeight.SemiBold,
+                                            fontSize = 13.sp
+                                        )
+                                        Text(
+                                            "${dateFmt.format(Date(cl.timestampMs))} • ${cl.durationMin} mnt • ~${cl.avgPowerW.roundToInt()} W",
+                                            fontSize = 11.5.sp,
+                                            color = c.textMuted
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

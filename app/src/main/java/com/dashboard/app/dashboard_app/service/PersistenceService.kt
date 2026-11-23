@@ -4,11 +4,14 @@ import android.content.Context
 import android.net.Uri
 import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.CalibrationEntry
+import com.dashboard.app.dashboard_app.model.ChargingLogEntry
 import com.dashboard.app.dashboard_app.model.FieldNotePin
 import com.dashboard.app.dashboard_app.model.MaintenanceLogEntry
 import com.dashboard.app.dashboard_app.model.MatrixQueueItem
+import com.dashboard.app.dashboard_app.model.NavRouteX
 import com.dashboard.app.dashboard_app.model.ParkedLocation
 import com.dashboard.app.dashboard_app.model.SavedPlace
+import com.dashboard.app.dashboard_app.model.SohSample
 import com.dashboard.app.dashboard_app.model.SpkluStation
 import com.dashboard.app.dashboard_app.model.TripRecord
 import kotlinx.coroutines.Dispatchers
@@ -28,6 +31,13 @@ data class CachedGeocode(
     val lng: Double
 )
 
+@Serializable
+data class CachedRouteEntry(
+    val key: String,
+    val savedAtMs: Long,
+    val route: NavRouteX
+)
+
 class PersistenceService(private val context: Context) {
     companion object {
         private const val PREFS_NAME = "dashboard_app_prefs"
@@ -41,6 +51,10 @@ class PersistenceService(private val context: Context) {
         private const val K_MAINT_FILE = "maint_logs.json"
         private const val K_CALIB_FILE = "calib_logs.json"
         private const val K_MATRIX_FILE = "matrix_queue.json"
+        private const val K_CHARGE_FILE = "charge_logs.json"
+        private const val K_SOH_FILE = "soh_history.json"
+        private const val K_ROUTE_CACHE_FILE = "route_cache.json"
+        private const val ROUTE_CACHE_TTL_MS = 7L * 24L * 3600L * 1000L
     }
 
     private val json = Json {
@@ -165,6 +179,26 @@ class PersistenceService(private val context: Context) {
     }
 
     suspend fun saveMatrixQueue(list: List<MatrixQueueItem>) = writeJsonList(K_MATRIX_FILE, MatrixQueueItem.serializer(), list)
+
+    suspend fun loadChargingLogs(): List<ChargingLogEntry> = readJsonList(K_CHARGE_FILE, ChargingLogEntry.serializer())
+    suspend fun saveChargingLogs(list: List<ChargingLogEntry>) = writeJsonList(K_CHARGE_FILE, ChargingLogEntry.serializer(), list.take(30))
+
+    suspend fun loadSohHistory(): List<SohSample> = readJsonList(K_SOH_FILE, SohSample.serializer())
+    suspend fun saveSohHistory(list: List<SohSample>) = writeJsonList(K_SOH_FILE, SohSample.serializer(), list.takeLast(30))
+
+    suspend fun loadCachedRoute(key: String): NavRouteX? {
+        val now = System.currentTimeMillis()
+        val list = readJsonList(K_ROUTE_CACHE_FILE, CachedRouteEntry.serializer())
+        return list.firstOrNull { it.key == key && (now - it.savedAtMs) < ROUTE_CACHE_TTL_MS }?.route
+    }
+
+    suspend fun saveCachedRoute(key: String, route: NavRouteX) {
+        val now = System.currentTimeMillis()
+        val prev = readJsonList(K_ROUTE_CACHE_FILE, CachedRouteEntry.serializer())
+            .filter { it.key != key && (now - it.savedAtMs) < ROUTE_CACHE_TTL_MS }
+        val next = (listOf(CachedRouteEntry(key = key, savedAtMs = now, route = route)) + prev).take(20)
+        writeJsonList(K_ROUTE_CACHE_FILE, CachedRouteEntry.serializer(), next)
+    }
 
     suspend fun copyPickedImage(uri: Uri): String? = withContext(Dispatchers.IO) {
         try {

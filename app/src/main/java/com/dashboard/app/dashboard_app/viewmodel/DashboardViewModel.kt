@@ -17,9 +17,12 @@ import com.dashboard.app.dashboard_app.model.AppAlert
 import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.Battery2Data
 import com.dashboard.app.dashboard_app.model.CalibrationEntry
+import com.dashboard.app.dashboard_app.model.ChargingLogEntry
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.DailyChallenge
 import com.dashboard.app.dashboard_app.model.DiscoveredDeviceX
 import com.dashboard.app.dashboard_app.model.EffectiveTelemetry
+import com.dashboard.app.dashboard_app.model.EfficiencyTrend
 import com.dashboard.app.dashboard_app.model.Esp32Data
 import com.dashboard.app.dashboard_app.model.FieldNotePin
 import com.dashboard.app.dashboard_app.model.GeoPointX
@@ -31,14 +34,17 @@ import com.dashboard.app.dashboard_app.model.MatrixQueueItem
 import com.dashboard.app.dashboard_app.model.MotorData
 import com.dashboard.app.dashboard_app.model.NavRouteX
 import com.dashboard.app.dashboard_app.model.ParkedLocation
+import com.dashboard.app.dashboard_app.model.PersonalRecords
 import com.dashboard.app.dashboard_app.model.PlannedStop
 import com.dashboard.app.dashboard_app.model.RiderBadge
 import com.dashboard.app.dashboard_app.model.RidingScoreState
 import com.dashboard.app.dashboard_app.model.SavedPlace
 import com.dashboard.app.dashboard_app.model.SerialLogEntry
+import com.dashboard.app.dashboard_app.model.SohSample
 import com.dashboard.app.dashboard_app.model.SpkluStation
 import com.dashboard.app.dashboard_app.model.TelemetryPoint
 import com.dashboard.app.dashboard_app.model.TripRecord
+import com.dashboard.app.dashboard_app.model.TripSummaryCardData
 import com.dashboard.app.dashboard_app.model.WeatherData
 import com.dashboard.app.dashboard_app.service.MidFrameRenderer
 import com.dashboard.app.dashboard_app.service.PersistenceService
@@ -54,6 +60,7 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 data class DashboardUiState(
@@ -109,7 +116,20 @@ data class DashboardUiState(
     val mapsStatus: String = "Belum ada frame",
     val effective: EffectiveTelemetry = EffectiveTelemetry(),
     val badges: List<RiderBadge> = emptyList(),
-    val wakelockActive: Boolean = false
+    val wakelockActive: Boolean = false,
+    val motorRssiDbm: Int? = null,
+    val jkRssiDbm: Int? = null,
+    val esp1RssiDbm: Int? = null,
+    val esp2RssiDbm: Int? = null,
+    val chargingLogs: List<ChargingLogEntry> = emptyList(),
+    val sohHistory: List<SohSample> = emptyList(),
+    val tripBaselineArmed: Boolean = false,
+    val idleDrainWarningPct: Double? = null,
+    val spkluAheadKm: Double? = null,
+    val tripSummaryCard: TripSummaryCardData? = null,
+    val personalRecords: PersonalRecords = PersonalRecords(),
+    val efficiencyTrend: EfficiencyTrend? = null,
+    val dailyChallenge: DailyChallenge = DailyChallenge("Target Jarak Harian (10 km)", "0.0 / 10.0 km", 0.0, false)
 )
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
@@ -134,6 +154,12 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private var lastOffRouteCheckMs = 0L
     private var tripStartArea = ""
     private var activeRouteInitialSoc: Double? = null
+    private var hillAlertSpokenForRoute = false
+    private var idleDrainCheckedOnConnect = false
+
+    private var chargeSessionStartMs = 0L
+    private var chargeSessionStartSoc: Double? = null
+    private var chargeSessionWh = 0.0
 
     private var tick1HzJob: Job? = null
     private var gpsWatchdogJob: Job? = null
@@ -157,8 +183,11 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             val calib = storage.loadCalibrationLogs()
             val matrix = storage.loadMatrixQueue()
             val cachedGeo = storage.loadCachedGeocode()
+            val chargeLogs = storage.loadChargingLogs()
+            val sohHist = storage.loadSohHistory()
 
             ble.invertB2Current = settings.invertB2Current
+            ScreenMirrorService.overlayStripEnabled = settings.mirrorOverlayStrip
 
             _uiState.update { cur ->
                 val gps = if (cachedGeo != null) {
@@ -179,6 +208,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     maintLogs = maint,
                     calibLogs = calib,
                     matrixQueue = matrix,
+                    chargingLogs = chargeLogs,
+                    sohHistory = sohHist,
                     gpsState = gps
                 ).recomputeDerived()
             }
@@ -240,11 +271,29 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 progress = (bestScore / 90.0).coerceIn(0.0, 1.0)
             )
         )
-        return copy(effective = eff, badges = computedBadges)
+        val pr = TelemetryEngine.computePersonalRecords(tripHistory)
+        val trend = TelemetryEngine.computeEfficiencyTrend(tripHistory)
+        val challenge = TelemetryEngine.computeDailyChallenge(tripHistory)
+        return copy(
+            effective = eff,
+            badges = computedBadges,
+            personalRecords = pr,
+            efficiencyTrend = trend,
+            dailyChallenge = challenge
+        )
+    }
+
+    private fun onMotorConnected() {
+        idleDrainCheckedOnConnect = false
+        val st = _uiState.value
+        if (st.settings.mapsAutoStream && !st.screenMirrorActive && !st.midStreaming) {
+            startMidStreaming()
+        }
     }
 
     private fun wireHardwareCallbacks() {
         btClassic.onLog = ::addLog
+        btClassic.isNavOrMapsBusy = { _uiState.value.isNavigating || _uiState.value.midStreaming }
         btClassic.onLineReceived = ::handleMotorLine
         btClassic.onStateChanged = { st, name, _ ->
             if (!_uiState.value.motorViaBle) {
@@ -252,10 +301,12 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 _uiState.update { cur ->
                     cur.copy(
                         motorConnState = st,
-                        motorConnName = name.ifEmpty { cur.motorConnName }
+                        motorConnName = name.ifEmpty { if (st == ConnectionStateX.DISCONNECTED) "" else cur.motorConnName }
                     ).recomputeDerived()
                 }
-                if (wasConnected && st == ConnectionStateX.DISCONNECTED) {
+                if (!wasConnected && st == ConnectionStateX.CONNECTED) {
+                    onMotorConnected()
+                } else if (wasConnected && st == ConnectionStateX.DISCONNECTED) {
                     onMotorDisconnected()
                 }
             }
@@ -316,11 +367,23 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         ble.onScanStateChanged = { scanning ->
             _uiState.update { it.copy(isScanningBle = scanning) }
         }
+        ble.onSlotRssi = { slot, rssi ->
+            _uiState.update { cur ->
+                when (slot) {
+                    "motor" -> cur.copy(motorRssiDbm = rssi)
+                    "jk" -> cur.copy(jkRssiDbm = rssi)
+                    "esp1" -> cur.copy(esp1RssiDbm = rssi)
+                    "esp2" -> cur.copy(esp2RssiDbm = rssi)
+                    else -> cur
+                }
+            }
+        }
         ble.onJkStateChanged = { st, name ->
             _uiState.update { cur ->
                 cur.copy(
                     jkConnState = st,
-                    jkConnName = name.ifEmpty { if (st == ConnectionStateX.DISCONNECTED) "" else cur.jkConnName }
+                    jkConnName = name.ifEmpty { if (st == ConnectionStateX.DISCONNECTED) "" else cur.jkConnName },
+                    jkRssiDbm = if (st == ConnectionStateX.DISCONNECTED) null else cur.jkRssiDbm
                 ).recomputeDerived()
             }
         }
@@ -331,7 +394,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             _uiState.update { cur ->
                 cur.copy(
                     esp1ConnState = st,
-                    esp1ConnName = name.ifEmpty { if (st == ConnectionStateX.DISCONNECTED) "" else cur.esp1ConnName }
+                    esp1ConnName = name.ifEmpty { if (st == ConnectionStateX.DISCONNECTED) "" else cur.esp1ConnName },
+                    esp1RssiDbm = if (st == ConnectionStateX.DISCONNECTED) null else cur.esp1RssiDbm
                 ).recomputeDerived()
             }
         }
@@ -347,7 +411,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             _uiState.update { cur ->
                 cur.copy(
                     esp2ConnState = st,
-                    esp2ConnName = name.ifEmpty { if (st == ConnectionStateX.DISCONNECTED) "" else cur.esp2ConnName }
+                    esp2ConnName = name.ifEmpty { if (st == ConnectionStateX.DISCONNECTED) "" else cur.esp2ConnName },
+                    esp2RssiDbm = if (st == ConnectionStateX.DISCONNECTED) null else cur.esp2RssiDbm
                 ).recomputeDerived()
             }
         }
@@ -360,10 +425,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 _uiState.update { cur ->
                     cur.copy(
                         motorConnState = st,
-                        motorConnName = name.ifEmpty { if (st == ConnectionStateX.DISCONNECTED) "" else cur.motorConnName }
+                        motorConnName = name.ifEmpty { if (st == ConnectionStateX.DISCONNECTED) "" else cur.motorConnName },
+                        motorRssiDbm = if (st == ConnectionStateX.DISCONNECTED) null else cur.motorRssiDbm
                     ).recomputeDerived()
                 }
-                if (wasConnected && st == ConnectionStateX.DISCONNECTED) {
+                if (!wasConnected && st == ConnectionStateX.CONNECTED) {
+                    onMotorConnected()
+                } else if (wasConnected && st == ConnectionStateX.DISCONNECTED) {
                     onMotorDisconnected()
                 }
             }
@@ -392,6 +460,11 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun onMotorDisconnected() {
         val st = _uiState.value
+        val now = System.currentTimeMillis()
+        val socNow = st.effective.combinedSocPct
+        if (socNow != null && socNow in 1.0..100.0) {
+            updateSettings(st.settings.copy(lastParkSocPct = socNow, lastParkTsMs = now))
+        }
         val loc = st.gpsState.location
         if (loc != null) {
             val label = listOf(st.gpsState.roadName, st.gpsState.areaName)
@@ -402,13 +475,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 lat = loc.lat,
                 lng = loc.lng,
                 label = label,
-                timestampMs = System.currentTimeMillis()
+                timestampMs = now
             )
             _uiState.update { it.copy(parkedLocation = parked) }
             viewModelScope.launch { storage.saveParkedLocation(parked) }
         }
         if (st.settings.autoSaveTrip && st.liveTrip.distanceKm >= 0.2) {
-            saveCurrentTripAndReset()
+            saveCurrentTripAndReset(isPartial = false)
         }
     }
 
@@ -450,15 +523,51 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 var nextTrip = cur.liveTrip
                 var nextScore = cur.ridingScore
                 var nextChart = cur.liveChartPoints
+                var nextArmed = cur.tripBaselineArmed
+                var nextIdleWarn = cur.idleDrainWarningPct
+                var nextSummaryCard = cur.tripSummaryCard
 
-                if (cur.motorConnState == ConnectionStateX.CONNECTED ||
+                // Auto-dismiss trip summary MID overlay once rider moves again
+                if (nextSummaryCard != null && ((eff.speedKmh ?: 0.0) > 8.0 || now > nextSummaryCard.expiresAtMs)) {
+                    nextSummaryCard = null
+                }
+
+                // Check phantom idle drain once on connect when SOC is valid
+                if (!idleDrainCheckedOnConnect &&
+                    cur.motorConnState == ConnectionStateX.CONNECTED &&
+                    eff.combinedSocPct != null
+                ) {
+                    idleDrainCheckedOnConnect = true
+                    val drain = TelemetryEngine.computeIdleDrainPct(
+                        lastParkSocPct = cur.settings.lastParkSocPct,
+                        lastParkTsMs = cur.settings.lastParkTsMs,
+                        currentSocPct = eff.combinedSocPct,
+                        nowMs = now
+                    )
+                    if (drain != null) {
+                        nextIdleWarn = drain
+                    }
+                }
+
+                // Park-to-Drive trip baseline arming
+                if (nextArmed && (eff.isPark == false || (eff.speedKmh ?: 0.0) > 2.0)) {
+                    nextArmed = false
+                    nextTrip = nextTrip.copy(
+                        startTimeMs = now,
+                        startSocPct = eff.combinedSocPct,
+                        lastSampleMs = now
+                    )
+                }
+
+                val hasLiveSource = cur.motorConnState == ConnectionStateX.CONNECTED ||
                     cur.jkConnState == ConnectionStateX.CONNECTED ||
                     cur.esp2ConnState == ConnectionStateX.CONNECTED ||
                     cur.devSimActive ||
                     (cur.gpsState.speedKmh ?: 0.0) > 2.0
-                ) {
+
+                if (hasLiveSource && !nextArmed) {
                     val res = TelemetryEngine.integrateSample(
-                        prevTrip = cur.liveTrip,
+                        prevTrip = nextTrip,
                         prevScore = cur.ridingScore,
                         eff = eff,
                         nowMs = now,
@@ -487,6 +596,66 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                     nextChart = (cur.liveChartPoints + pt).takeLast(240)
                 }
+
+                // Charging session tracker (stationary + positive current)
+                val chgCur = eff.combinedCurrentA ?: 0.0
+                val isStationaryCharging = eff.isCharging && (eff.speedKmh ?: 0.0) <= 1.5
+                if (isStationaryCharging) {
+                    if (chargeSessionStartMs == 0L) {
+                        chargeSessionStartMs = now
+                        chargeSessionStartSoc = eff.combinedSocPct
+                        chargeSessionWh = 0.0
+                    } else {
+                        val pW = abs((eff.avgVoltageV ?: 72.0) * chgCur)
+                        chargeSessionWh += pW / 3600.0
+                    }
+                } else if (chargeSessionStartMs > 0L) {
+                    val durMin = ((now - chargeSessionStartMs) / 60_000L).toInt()
+                    val endSoc = eff.combinedSocPct ?: chargeSessionStartSoc ?: 0.0
+                    val startSoc = chargeSessionStartSoc ?: endSoc
+                    if (durMin >= 2 || (endSoc - startSoc) >= 1.0) {
+                        val locLbl = listOf(cur.gpsState.roadName, cur.gpsState.areaName)
+                            .filter { it.isNotBlank() }
+                            .joinToString(", ")
+                        logManualChargeSession(
+                            startSocPct = startSoc,
+                            endSocPct = endSoc,
+                            energyAddedWh = chargeSessionWh,
+                            durationMin = max(1, durMin),
+                            locationLabel = locLbl
+                        )
+                    }
+                    chargeSessionStartMs = 0L
+                    chargeSessionStartSoc = null
+                    chargeSessionWh = 0.0
+                }
+
+                // Periodic SOH history sampling
+                val curSoh = eff.combinedSohPct
+                if (curSoh != null && curSoh in 20.0..100.0) {
+                    val lastSohSample = cur.sohHistory.lastOrNull()
+                    val sohChanged = lastSohSample == null ||
+                        abs(lastSohSample.sohPct - curSoh) >= 0.5 ||
+                        (now - lastSohSample.timestampMs) > 24 * 3600_000L
+                    if (sohChanged) {
+                        val sample = SohSample(
+                            timestampMs = now,
+                            sohPct = curSoh,
+                            odoKm = eff.odoKm,
+                            cycles = cur.jkData.cycles ?: cur.motorData.cbatCycles
+                        )
+                        val nextSohList = (cur.sohHistory + sample).takeLast(30)
+                        _uiState.update { it.copy(sohHistory = nextSohList) }
+                        viewModelScope.launch { storage.saveSohHistory(nextSohList) }
+                    }
+                }
+
+                // Compute nearest SPKLU ahead when route arrival SOC < 20%
+                val route = cur.activeRoute
+                val arrSoc = route?.energyEstimate?.socAtArrivalPct
+                val spkluAhead = if (route != null && arrSoc != null && arrSoc < 20.0 && cur.nearbySpklu.isNotEmpty()) {
+                    cur.nearbySpklu.mapNotNull { it.distanceKm }.minOrNull()
+                } else null
 
                 val alerts = TelemetryEngine.evaluateAlarms(
                     eff = eff,
@@ -534,7 +703,11 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                         liveTrip = nextTrip,
                         ridingScore = nextScore,
                         liveChartPoints = nextChart,
-                        activeAlerts = alerts
+                        activeAlerts = alerts,
+                        tripBaselineArmed = nextArmed,
+                        idleDrainWarningPct = nextIdleWarn,
+                        tripSummaryCard = nextSummaryCard,
+                        spkluAheadKm = spkluAhead
                     ).recomputeDerived()
                 }
             }
@@ -770,14 +943,15 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         sendMatrixItemNow(item)
     }
 
-    fun addMatrixItem(text: String, speedMs: Int = 45) {
+    fun addMatrixItem(text: String, speedMs: Int = 45, effectId: Int = 0) {
         val trimmed = text.trim().uppercase(Locale.US)
         if (trimmed.isEmpty()) return
         val item = MatrixQueueItem(
             id = "mx_${System.currentTimeMillis()}",
             text = trimmed,
             enabled = true,
-            speedMs = speedMs
+            speedMs = speedMs,
+            effectId = effectId.coerceIn(0, 2)
         )
         val next = _uiState.value.matrixQueue + item
         _uiState.update { it.copy(matrixQueue = next) }
@@ -788,6 +962,34 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         val next = _uiState.value.matrixQueue.filterNot { it.id == id }
         _uiState.update { it.copy(matrixQueue = next) }
         viewModelScope.launch { storage.saveMatrixQueue(next) }
+    }
+
+    fun dismissIdleDrainWarning() {
+        _uiState.update { it.copy(idleDrainWarningPct = null) }
+    }
+
+    fun logManualChargeSession(
+        startSocPct: Double,
+        endSocPct: Double,
+        energyAddedWh: Double,
+        durationMin: Int,
+        locationLabel: String = ""
+    ) {
+        val dur = durationMin.coerceAtLeast(1)
+        val avgPower = if (dur > 0) energyAddedWh / (dur / 60.0) else 0.0
+        val entry = ChargingLogEntry(
+            id = "chg_${System.currentTimeMillis()}",
+            timestampMs = System.currentTimeMillis(),
+            startSocPct = startSocPct.coerceIn(0.0, 100.0),
+            endSocPct = endSocPct.coerceIn(0.0, 100.0),
+            energyAddedWh = energyAddedWh.coerceAtLeast(0.0),
+            durationMin = dur,
+            avgPowerW = avgPower,
+            locationLabel = locationLabel
+        )
+        val next = (listOf(entry) + _uiState.value.chargingLogs).take(30)
+        _uiState.update { it.copy(chargingLogs = next) }
+        viewModelScope.launch { storage.saveChargingLogs(next) }
     }
 
     // Navigation & Route Planning
@@ -802,13 +1004,15 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun clearRoute() {
+        hillAlertSpokenForRoute = false
         _uiState.update {
             it.copy(
                 plannedStops = emptyList(),
                 activeRoute = null,
                 isNavigating = false,
                 isRideLocked = false,
-                wakelockActive = false
+                wakelockActive = false,
+                spkluAheadKm = null
             )
         }
     }
@@ -829,14 +1033,29 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         val cur = _uiState.value
         if (cur.plannedStops.isEmpty()) return
         val origin = cur.gpsState.location ?: GeoPointX(-6.1754, 106.8272)
+        val cacheKey = buildString {
+            append(String.format(Locale.US, "%.3f,%.3f", origin.lat, origin.lng))
+            cur.plannedStops.forEach {
+                append("|${String.format(Locale.US, "%.3f,%.3f", it.lat, it.lng)}")
+            }
+        }
         viewModelScope.launch {
             _uiState.update { it.copy(isLoadingRoute = true) }
-            val route = RemoteApisService.fetchOsrmRoute(
+            hillAlertSpokenForRoute = false
+            var route = RemoteApisService.fetchOsrmRoute(
                 origin = origin,
                 stops = _uiState.value.plannedStops,
                 settings = _uiState.value.settings,
                 currentSocPct = _uiState.value.effective.combinedSocPct
             )
+            if (route != null && _uiState.value.settings.routeCacheEnabled) {
+                storage.saveCachedRoute(cacheKey, route)
+            } else if (route == null && _uiState.value.settings.routeCacheEnabled) {
+                route = storage.loadCachedRoute(cacheKey)
+                if (route != null) {
+                    addLog("NAV", "Memuat rute dari cache offline.", false)
+                }
+            }
             _uiState.update { state ->
                 if (route != null) {
                     state.copy(
@@ -865,7 +1084,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             )
         }
         val st = _uiState.value
-        if (st.settings.voiceNavEnabled && route.steps.isNotEmpty()) {
+        val est = route.energyEstimate
+        if (st.settings.hillAlertVoice && !hillAlertSpokenForRoute && est != null && est.maxClimbPct >= 6.0) {
+            hillAlertSpokenForRoute = true
+            locationTts.speak(
+                "Perhatian rute menanjak hingga ${est.maxClimbPct.roundToInt()} persen, kelola tenaga motor.",
+                force = true
+            )
+        } else if (st.settings.voiceNavEnabled && route.steps.isNotEmpty()) {
             val s0 = route.steps.first()
             locationTts.speak("Navigasi dimulai. ${s0.instruction}", force = true)
             val code = LocationAndTtsManager.navVoiceCodeForManeuver(s0.maneuverType, s0.modifier)
@@ -961,9 +1187,24 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             )
             val nextCalib = (listOf(entry) + cur.calibLogs).take(30)
             activeRouteInitialSoc = null
-            _uiState.update { it.copy(calibLogs = nextCalib) }
-            viewModelScope.launch { storage.saveCalibrationLogs(nextCalib) }
+            if (cur.settings.physAutoCal) {
+                val blended = String.format(
+                    Locale.US,
+                    "%.3f",
+                    (cur.settings.routeCalFactor * 0.65 + suggested * 0.35).coerceIn(0.6, 1.5)
+                ).toDouble()
+                val nextSettings = cur.settings.copy(routeCalFactor = blended)
+                _uiState.update { it.copy(calibLogs = nextCalib, settings = nextSettings).recomputeDerived() }
+                viewModelScope.launch {
+                    storage.saveCalibrationLogs(nextCalib)
+                    storage.saveSettings(nextSettings)
+                }
+            } else {
+                _uiState.update { it.copy(calibLogs = nextCalib) }
+                viewModelScope.launch { storage.saveCalibrationLogs(nextCalib) }
+            }
         }
+        saveCurrentTripAndReset(isPartial = false)
     }
 
     fun refreshNearbySpklu(onDone: (() -> Unit)? = null) {
@@ -1064,7 +1305,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             }
             return
         }
-        if (btClassic.isMapsSending) return
+        if (!st.motorViaBle && btClassic.isMapsSending) return
+        if (st.motorViaBle && ble.isMotorBleMapsSending) return
 
         val b64 = try {
             MidFrameRenderer.renderFrameBase64(
@@ -1076,7 +1318,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 isNavigating = st.isNavigating,
                 activeStepIndex = st.activeStepIndex,
                 distToNextStepM = st.distToNextStepM,
-                etaMin = st.etaMin
+                etaMin = st.etaMin,
+                spkluAheadKm = st.spkluAheadKm,
+                tripSummary = st.tripSummaryCard
             )
         } catch (e: Exception) {
             _uiState.update { it.copy(mapsStatus = "Gagal membuat frame: ${e.message}") }
@@ -1141,6 +1385,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             dataIntent = dataIntent,
             width = s.mapsSnapWidth.coerceIn(160, 480),
             height = s.mapsSnapHeight.coerceIn(120, 360),
+            quality = s.mapsQualityPct.coerceIn(30, 95),
             intervalMs = max(450L, s.mapsIntervalMs.toLong()),
             overlayStrip = s.mirrorOverlayStrip
         )
@@ -1152,7 +1397,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(screenMirrorActive = false) }
     }
 
-    fun saveCurrentTripAndReset() {
+    fun saveCurrentTripAndReset(isPartial: Boolean = false) {
         val st = _uiState.value
         val trip = st.liveTrip
         if (trip.distanceKm < 0.05 && trip.energyWh < 1.0) {
@@ -1160,9 +1405,10 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             return
         }
         val now = System.currentTimeMillis()
+        val startMs = if (trip.startTimeMs > 0L) trip.startTimeMs else now - 60_000L
         val rec = TripRecord(
             id = "trp_$now",
-            startTimeMs = if (trip.startTimeMs > 0L) trip.startTimeMs else now - 60_000L,
+            startTimeMs = startMs,
             endTimeMs = now,
             distanceKm = trip.distanceKm,
             energyWh = trip.energyWh,
@@ -1170,14 +1416,35 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             maxSpeedKmh = trip.maxSpeedKmh,
             avgSpeedKmh = trip.avgSpeedKmh,
             maxPowerW = trip.maxPowerW,
+            maxCurrentA = trip.maxCurrentA,
+            minVbat = trip.minVbat,
+            maxVbat = trip.maxVbat,
+            maxTbatC = trip.maxTbatC,
+            isPartial = isPartial,
             ridingScore = st.ridingScore.score,
             startArea = tripStartArea.ifEmpty { st.gpsState.areaName },
             endArea = st.gpsState.areaName,
             pathPoints = livePathPoints.toList(),
             samples = st.liveChartPoints.toList()
         )
+        val durMin = ((now - startMs) / 60_000L).toInt().coerceAtLeast(1)
+        val summaryCard = TripSummaryCardData(
+            title = if (isPartial) "RINGKASAN TRIP (JEDA)" else "RINGKASAN PERJALANAN",
+            distanceKm = rec.distanceKm,
+            durationMin = durMin,
+            energyWh = rec.energyWh,
+            whPerKm = rec.whPerKm,
+            maxSpeedKmh = rec.maxSpeedKmh,
+            ridingScore = rec.ridingScore,
+            expiresAtMs = now + 22_000L
+        )
         val nextHistory = listOf(rec) + st.tripHistory
-        _uiState.update { it.copy(tripHistory = nextHistory).recomputeDerived() }
+        _uiState.update {
+            it.copy(
+                tripHistory = nextHistory,
+                tripSummaryCard = summaryCard
+            ).recomputeDerived()
+        }
         viewModelScope.launch { storage.saveTrips(nextHistory) }
         resetLiveTrip()
     }
@@ -1186,11 +1453,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         wasMoving = false
         tripStartArea = ""
         livePathPoints.clear()
+        val parked = _uiState.value.effective.isPark == true
         _uiState.update {
             it.copy(
                 liveTrip = LiveTripMetrics(),
                 ridingScore = RidingScoreState(),
-                liveChartPoints = emptyList()
+                liveChartPoints = emptyList(),
+                tripBaselineArmed = parked
             ).recomputeDerived()
         }
     }
@@ -1251,6 +1520,21 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             return
         }
         viewModelScope.launch {
+            if (RemoteApisService.isMapsShortUrl(text)) {
+                val resolved = RemoteApisService.resolveGoogleMapsShortUrl(text)
+                if (resolved != null) {
+                    setSingleDestination(
+                        PlannedStop(
+                            id = "shared_${System.currentTimeMillis()}",
+                            label = "Tujuan Link Maps",
+                            lat = resolved.lat,
+                            lng = resolved.lng
+                        )
+                    )
+                    onMessage("Koordinat dari short-link Maps dimuat.")
+                    return@launch
+                }
+            }
             val cleaned = text.replace(Regex("https?://\\S+"), "").trim().ifEmpty { text }
             val places = RemoteApisService.searchPlaces(cleaned)
             val first = places.firstOrNull()

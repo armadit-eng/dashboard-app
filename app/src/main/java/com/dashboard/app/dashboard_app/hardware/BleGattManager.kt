@@ -22,6 +22,7 @@ import com.dashboard.app.dashboard_app.model.DiscoveredDeviceX
 import com.dashboard.app.dashboard_app.model.Esp32Data
 import com.dashboard.app.dashboard_app.model.JkBmsData
 import kotlinx.coroutines.delay
+import java.util.Calendar
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -60,9 +61,14 @@ class BleGattManager(private val context: Context) {
 
     var onMotorBleStateChanged: ((ConnectionStateX, String) -> Unit)? = null
     var onMotorBleLine: ((String) -> Unit)? = null
+    var onSlotRssi: ((String, Int) -> Unit)? = null
 
     @Volatile
     var invertB2Current: Boolean = false
+
+    @Volatile
+    var isMotorBleMapsSending: Boolean = false
+        private set
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -88,9 +94,29 @@ class BleGattManager(private val context: Context) {
     private val esp2Rx = StringBuilder()
     private var b2Cur = Battery2Data()
 
+    private data class PollEntry(val cmd: String, val intervalMs: Long, var lastSentMs: Long = 0L)
+
+    private val motorBleSchedule = listOf(
+        PollEntry("AT+SPD?\r\n", 500L),
+        PollEntry("AT+IBAT?\r\n", 500L),
+        PollEntry("AT+VBAT?\r\n", 1000L),
+        PollEntry("AT+TRT?\r\n", 2000L),
+        PollEntry("AT+ODO?\r\n", 2000L),
+        PollEntry("AT+SOC?\r\n", 4000L),
+        PollEntry("AT+ERR?\r\n", 8000L),
+        PollEntry("AT+MODE?\r\n", 8000L),
+        PollEntry("AT+PARK?\r\n", 8000L),
+        PollEntry("AT+CBAT?\r\n", 8000L),
+        PollEntry("AT+TINV?\r\n", 15_000L),
+        PollEntry("AT+TMOT?\r\n", 15_000L),
+        PollEntry("AT+TBAT?\r\n", 15_000L),
+        PollEntry("AT+SOH?\r\n", 30_000L)
+    )
+
     private val motorBleRx = StringBuilder()
     private var motorBlePollFuture: ScheduledFuture<*>? = null
-    private var motorBleCycle = 0
+    private var motorBleTimeFuture: ScheduledFuture<*>? = null
+    private var rssiPollFuture: ScheduledFuture<*>? = null
 
     private val adapter: BluetoothAdapter?
         get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -347,6 +373,12 @@ class BleGattManager(private val context: Context) {
                 ) {
                     handleData(slot, value)
                 }
+
+                override fun onReadRemoteRssi(g: BluetoothGatt, rssi: Int, status: Int) {
+                    if (slotGenerations[slot] == gen && status == BluetoothGatt.GATT_SUCCESS) {
+                        mainHandler.post { onSlotRssi?.invoke(slot, rssi) }
+                    }
+                }
             }, BluetoothDevice.TRANSPORT_LE)
 
             if (gatt != null) {
@@ -372,6 +404,7 @@ class BleGattManager(private val context: Context) {
         } else if (slot == "motor") {
             startMotorBlePolling()
         }
+        startRssiPolling()
     }
 
     private fun clearConnectTimeout(slot: String) {
@@ -410,22 +443,55 @@ class BleGattManager(private val context: Context) {
         }, 650, 2500, TimeUnit.MILLISECONDS)
     }
 
-    private fun startMotorBlePolling() {
-        motorBlePollFuture?.cancel(false)
-        motorBleCycle = 0
-        motorBlePollFuture = scheduler.scheduleAtFixedRate({
-            val cmds = mutableListOf("AT+SPD?\r\n", "AT+VBAT?\r\n", "AT+IBAT?\r\n")
-            if (motorBleCycle % 2 == 0) cmds.add("AT+SOC?\r\n")
-            if (motorBleCycle % 4 == 0) cmds.add("AT+ODO?\r\n")
-            motorBleCycle++
-            cmds.forEach { cmd ->
-                writeMotorBle(cmd)
+    private fun startRssiPolling() {
+        if (rssiPollFuture != null) return
+        rssiPollFuture = scheduler.scheduleAtFixedRate({
+            gatts.values.forEach { g ->
                 try {
-                    Thread.sleep(45)
-                } catch (_: InterruptedException) {
+                    @Suppress("MissingPermission")
+                    g.readRemoteRssi()
+                } catch (_: Exception) {
                 }
             }
-        }, 250, 550, TimeUnit.MILLISECONDS)
+        }, 2500, 3500, TimeUnit.MILLISECONDS)
+    }
+
+    private fun sendMotorBleTimeNow() {
+        val cal = Calendar.getInstance()
+        val hh = cal.get(Calendar.HOUR_OF_DAY).toString().padStart(2, '0')
+        val mm = cal.get(Calendar.MINUTE).toString().padStart(2, '0')
+        writeMotorBle("AT+TIME=\"$hh$mm\"\r\n")
+    }
+
+    private fun startMotorBlePolling() {
+        motorBlePollFuture?.cancel(false)
+        motorBleTimeFuture?.cancel(false)
+        motorBleSchedule.forEach { it.lastSentMs = 0L }
+
+        motorBleTimeFuture = scheduler.scheduleAtFixedRate({
+            if (gatts["motor"] != null) sendMotorBleTimeNow()
+        }, 1600, 60_000, TimeUnit.MILLISECONDS)
+
+        motorBlePollFuture = scheduler.scheduleAtFixedRate({
+            if (gatts["motor"] == null || isMotorBleMapsSending) return@scheduleAtFixedRate
+            val now = System.currentTimeMillis()
+            val bleBusy = BleConnectGate.isBusy()
+            var best: PollEntry? = null
+            var bestScore = 1.0
+            for (entry in motorBleSchedule) {
+                if (bleBusy && entry.intervalMs > 1000L) continue
+                val interval = entry.intervalMs * if (bleBusy) 2L else 1L
+                val score = (now - entry.lastSentMs).toDouble() / interval.toDouble()
+                if (score >= bestScore) {
+                    best = entry
+                    bestScore = score
+                }
+            }
+            if (best != null) {
+                best.lastSentMs = now
+                writeMotorBle(best.cmd)
+            }
+        }, 2200, 220, TimeUnit.MILLISECONDS)
     }
 
     private fun handleData(slot: String, bytes: ByteArray) {
@@ -579,17 +645,23 @@ class BleGattManager(private val context: Context) {
         chunkSize: Int = 100,
         delayMs: Int = 30
     ) {
-        val cs = chunkSize.coerceIn(20, 400)
-        writeSlot("motor", "AT+MAPS=\"".toByteArray(Charsets.UTF_8), noResponse = true)
-        delay(45)
-        var i = 0
-        while (i < b64.length) {
-            val end = (i + cs).coerceAtMost(b64.length)
-            writeSlot("motor", b64.substring(i, end).toByteArray(Charsets.UTF_8), noResponse = true)
-            if (delayMs > 0) delay(delayMs.toLong())
-            i = end
+        if (isMotorBleMapsSending) return
+        isMotorBleMapsSending = true
+        try {
+            val cs = chunkSize.coerceIn(20, 400)
+            writeSlot("motor", "AT+MAPS=\"".toByteArray(Charsets.UTF_8), noResponse = true)
+            delay(45)
+            var i = 0
+            while (i < b64.length) {
+                val end = (i + cs).coerceAtMost(b64.length)
+                writeSlot("motor", b64.substring(i, end).toByteArray(Charsets.UTF_8), noResponse = true)
+                if (delayMs > 0) delay(delayMs.toLong())
+                i = end
+            }
+            writeSlot("motor", "\"\r\n".toByteArray(Charsets.UTF_8), noResponse = true)
+        } finally {
+            isMotorBleMapsSending = false
         }
-        writeSlot("motor", "\"\r\n".toByteArray(Charsets.UTF_8), noResponse = true)
     }
 
     @SuppressLint("MissingPermission")
@@ -635,6 +707,9 @@ class BleGattManager(private val context: Context) {
         } else if (slot == "motor") {
             motorBlePollFuture?.cancel(false)
             motorBlePollFuture = null
+            motorBleTimeFuture?.cancel(false)
+            motorBleTimeFuture = null
+            isMotorBleMapsSending = false
             synchronized(motorBleRx) { motorBleRx.clear() }
         } else if (slot == "esp1") {
             synchronized(esp1Rx) { esp1Rx.clear() }
@@ -673,6 +748,8 @@ class BleGattManager(private val context: Context) {
 
     fun dispose() {
         stopScan()
+        rssiPollFuture?.cancel(false)
+        rssiPollFuture = null
         disconnectSlot("jk")
         disconnectSlot("esp1")
         disconnectSlot("esp2")

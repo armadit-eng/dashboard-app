@@ -50,6 +50,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -68,6 +69,7 @@ import coil.compose.rememberAsyncImagePainter
 import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
 import com.dashboard.app.dashboard_app.model.MatrixQueueItem
+import com.dashboard.app.dashboard_app.service.TileCacheService
 import com.dashboard.app.dashboard_app.ui.components.CockpitCard
 import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
 import com.dashboard.app.dashboard_app.ui.theme.kAccentPalettes
@@ -88,7 +90,7 @@ fun GarageAccountScreen(
     onShowMessage: (String) -> Unit,
     onSetMatrixPower: (Boolean) -> Unit,
     onToggleMatrixAutoRotate: (Boolean) -> Unit,
-    onAddMatrixItem: (String) -> Unit,
+    onAddMatrixItem: (String, Int) -> Unit,
     onSendMatrixItemNow: (MatrixQueueItem) -> Unit,
     onDeleteMatrixItem: (String) -> Unit,
     onSendEsp1Command: (String) -> Unit,
@@ -100,9 +102,37 @@ fun GarageAccountScreen(
     val esp1Ok = state.esp1ConnState == ConnectionStateX.CONNECTED
 
     var matrixText by remember { mutableStateOf("") }
+    var matrixEffectId by remember { mutableIntStateOf(0) }
     var showProfileDialog by remember { mutableStateOf(false) }
+    var pendingRelayTarget by remember { mutableStateOf<Boolean?>(null) }
 
     val activeLivery = kGarageLiveries.firstOrNull { it.id == s.garageStyleId } ?: kGarageLiveries.first()
+
+    pendingRelayTarget?.let { targetOn ->
+        AlertDialog(
+            onDismissRequest = { pendingRelayTarget = null },
+            title = { Text(if (targetOn) "Nyalakan Kontak Motor?" else "Matikan Kontak Motor?") },
+            text = {
+                Text(
+                    if (targetOn) "Relay kontak motor akan diaktifkan. Pastikan posisi aman dan standar siap."
+                    else "Relay kontak motor akan diputus. Jangan lakukan saat melaju."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        pendingRelayTarget = null
+                        val err = onSetContactRelay(targetOn)
+                        if (err != null) onShowMessage(err)
+                    },
+                    modifier = Modifier.testTag("confirm_contact_relay_button")
+                ) { Text("Konfirmasi") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRelayTarget = null }) { Text("Batal") }
+            }
+        )
+    }
 
     if (showProfileDialog) {
         var rName by remember(s.riderName) { mutableStateOf(s.riderName) }
@@ -296,8 +326,7 @@ fun GarageAccountScreen(
                     FilledTonalButton(
                         enabled = esp1Ok,
                         onClick = {
-                            val err = onSetContactRelay(!(esp1.contactOn ?: false))
-                            if (err != null) onShowMessage(err)
+                            pendingRelayTarget = !(esp1.contactOn ?: false)
                         },
                         modifier = Modifier
                             .height(48.dp)
@@ -328,6 +357,20 @@ fun GarageAccountScreen(
                     )
                 }
                 Spacer(Modifier.height(8.dp))
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    listOf(0 to "Scroll", 1 to "Kedip", 2 to "Cepat").forEach { (eid, lbl) ->
+                        FilterChip(
+                            selected = matrixEffectId == eid,
+                            onClick = { matrixEffectId = eid },
+                            label = { Text(lbl) },
+                            modifier = Modifier.testTag("matrix_effect_chip_$eid")
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -343,7 +386,7 @@ fun GarageAccountScreen(
                     IconButton(
                         onClick = {
                             if (matrixText.isNotBlank()) {
-                                onAddMatrixItem(matrixText)
+                                onAddMatrixItem(matrixText, matrixEffectId)
                                 matrixText = ""
                             }
                         },
@@ -508,6 +551,54 @@ fun GarageAccountScreen(
                     FilterChip(sl.showCo2, { onUpdateSettings(s.copy(atNavSlots = sl.copy(showCo2 = !sl.showCo2))) }, { Text("CO₂") })
                     FilterChip(sl.showLocation, { onUpdateSettings(s.copy(atNavSlots = sl.copy(showLocation = !sl.showLocation))) }, { Text("Lokasi") })
                     FilterChip(sl.showWeather, { onUpdateSettings(s.copy(atNavSlots = sl.copy(showWeather = !sl.showWeather))) }, { Text("Cuaca") })
+                }
+            }
+        }
+
+        // API Keys (Carto Maps & OpenChargeMap SPKLU)
+        item {
+            var cartoKeyDraft by remember(s.cartoApiKey) { mutableStateOf(s.cartoApiKey) }
+            var ocmKeyDraft by remember(s.ocmApiKey) { mutableStateOf(s.ocmApiKey) }
+            CockpitCard {
+                Text("KUNCI API PETA & SPKLU", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = cartoKeyDraft,
+                    onValueChange = { cartoKeyDraft = it },
+                    label = { Text("Carto Maps API Key") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("garage_carto_key_input")
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = ocmKeyDraft,
+                    onValueChange = { ocmKeyDraft = it },
+                    label = { Text("OpenChargeMap API Key (SPKLU)") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("garage_ocm_key_input")
+                )
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        TileCacheService.evictMemoryCache()
+                        onUpdateSettings(
+                            s.copy(
+                                cartoApiKey = cartoKeyDraft.trim(),
+                                ocmApiKey = ocmKeyDraft.trim()
+                            )
+                        )
+                        onShowMessage("API key peta & SPKLU tersimpan.")
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("garage_save_api_keys_button")
+                ) {
+                    Text("Simpan API Key")
                 }
             }
         }

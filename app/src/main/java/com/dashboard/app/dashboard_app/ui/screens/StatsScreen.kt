@@ -33,6 +33,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -67,6 +68,7 @@ import kotlin.math.roundToInt
 fun StatsScreen(
     state: DashboardUiState,
     onApplyCalFactor: (Double) -> Unit,
+    onTogglePhysAutoCal: (Boolean) -> Unit,
     onDeleteTrip: (String) -> Unit,
     onShareText: (text: String, subject: String) -> Unit,
     modifier: Modifier = Modifier
@@ -269,11 +271,69 @@ fun StatsScreen(
             }
         }
 
-        // Calibration suggestions
-        if (state.calibLogs.isNotEmpty()) {
-            item {
-                CockpitCard {
-                    Text("KALIBRASI RUTE OTOMATIS", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+        // Daily Challenge & Personal Records & Efficiency Trend
+        item {
+            val ch = state.dailyChallenge
+            val pr = state.personalRecords
+            val trend = state.efficiencyTrend
+            CockpitCard {
+                Text("TANTANGAN HARIAN & REKOR PRIBADI", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = if (ch.completed) "${ch.title} (Selesai)" else ch.title,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (ch.completed) c.accent else Color.Unspecified
+                )
+                Text(ch.description, fontSize = 12.sp, color = c.textMuted)
+                Spacer(Modifier.height(6.dp))
+                LinearProgressIndicator(
+                    progress = { ch.progress.toFloat().coerceIn(0f, 1f) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(8.dp)
+                        .clip(RoundedCornerShape(6.dp)),
+                    color = if (ch.completed) c.accent else c.accentSecondary,
+                    trackColor = c.surfaceElevated
+                )
+                if (trips.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        KpiCol("Rekor Jarak", "${String.format(Locale.US, "%.1f", pr.longestTripKm)} km", c.accent, Modifier.weight(1f))
+                        KpiCol("Top Speed", "${pr.topSpeedKmh.roundToInt()} km/h", c.warning, Modifier.weight(1f))
+                        KpiCol("Best Wh/km", pr.bestWhPerKm?.let { String.format(Locale.US, "%.1f", it) } ?: "—", c.regen, Modifier.weight(1f))
+                    }
+                }
+                if (trend != null) {
+                    Spacer(Modifier.height(10.dp))
+                    val improved = trend.deltaPct <= 0.0
+                    val arrow = if (improved) "Lebih hemat" else "Lebih boros"
+                    Text(
+                        text = "Tren Efisiensi: ${String.format(Locale.US, "%.1f", trend.recentAvgWhKm)} Wh/km ($arrow ${String.format(Locale.US, "%.1f", kotlin.math.abs(trend.deltaPct))}% vs 3 trip sebelumnya)",
+                        fontSize = 12.sp,
+                        color = if (improved) c.accent else c.warning
+                    )
+                }
+            }
+        }
+
+        // Calibration suggestions & Auto-Cal toggle
+        item {
+            CockpitCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("KALIBRASI RUTE OTOMATIS", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                        Text("Auto-Cal Fisika saat tiba di tujuan (${String.format(Locale.US, "%.2f", state.settings.routeCalFactor)}x)", fontSize = 12.sp)
+                    }
+                    Switch(
+                        checked = state.settings.physAutoCal,
+                        onCheckedChange = onTogglePhysAutoCal,
+                        modifier = Modifier.testTag("phys_autocal_switch")
+                    )
+                }
+                if (state.calibLogs.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
                     state.calibLogs.take(3).forEach { cal ->
                         Row(

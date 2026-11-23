@@ -564,6 +564,7 @@ private fun MainTabContent(
                 },
                 onToggleDevSim = { viewModel.toggleDevTelemetrySimulation(it) },
                 onSendMotorAt = { viewModel.sendMotorCommand(it) },
+                onDismissIdleDrain = { viewModel.dismissIdleDrainWarning() },
                 modifier = boundedMod
             )
             1 -> DiagnosisScreen(
@@ -573,6 +574,10 @@ private fun MainTabContent(
                     viewModel.updateSettings(state.settings.copy(invertB2Current = it))
                 },
                 onSendEsp2Command = { viewModel.sendEspCommand(2, it) },
+                onLogChargeSession = { sSoc, eSoc, wh, dur ->
+                    viewModel.logManualChargeSession(sSoc, eSoc, wh, dur)
+                    onShowSnackbar("Sesi pengisian dicatat.")
+                },
                 modifier = boundedMod
             )
             2 -> NavigationScreen(
@@ -612,6 +617,9 @@ private fun MainTabContent(
                     viewModel.updateSettings(state.settings.copy(routeCalFactor = factor))
                     onShowSnackbar("Faktor kalibrasi diterapkan ($factor)")
                 },
+                onTogglePhysAutoCal = { enabled ->
+                    viewModel.updateSettings(state.settings.copy(physAutoCal = enabled))
+                },
                 onDeleteTrip = { viewModel.deleteTrip(it) },
                 onShareText = onShareText,
                 modifier = boundedMod
@@ -625,7 +633,7 @@ private fun MainTabContent(
                 onShowMessage = onShowSnackbar,
                 onSetMatrixPower = { viewModel.setMatrixPower(it) },
                 onToggleMatrixAutoRotate = { viewModel.toggleMatrixAutoRotate(it) },
-                onAddMatrixItem = { viewModel.addMatrixItem(it) },
+                onAddMatrixItem = { text, effectId -> viewModel.addMatrixItem(text, 45, effectId) },
                 onSendMatrixItemNow = { viewModel.sendMatrixItemNow(it) },
                 onDeleteMatrixItem = { viewModel.deleteMatrixItem(it) },
                 onSendEsp1Command = { viewModel.sendEspCommand(1, it) },

@@ -62,6 +62,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -99,6 +100,7 @@ import com.dashboard.app.dashboard_app.model.PlannedStop
 import com.dashboard.app.dashboard_app.model.SavedPlace
 import com.dashboard.app.dashboard_app.model.SpkluStation
 import com.dashboard.app.dashboard_app.service.RemoteApisService
+import com.dashboard.app.dashboard_app.service.TileCacheService
 import com.dashboard.app.dashboard_app.ui.components.CockpitCard
 import com.dashboard.app.dashboard_app.ui.components.ElevationProfileChart
 import com.dashboard.app.dashboard_app.ui.components.OfflineMapSection
@@ -185,6 +187,24 @@ fun NavigationScreen(
         }
         scope.launch {
             searching = true
+            if (RemoteApisService.isMapsShortUrl(q)) {
+                val resolved = RemoteApisService.resolveGoogleMapsShortUrl(q)
+                if (resolved != null) {
+                    searching = false
+                    searchResults = emptyList()
+                    onSetSingleDestination(
+                        PlannedStop(
+                            id = "dst_${System.currentTimeMillis()}",
+                            label = "Pin Link Maps",
+                            lat = resolved.lat,
+                            lng = resolved.lng
+                        )
+                    )
+                    followRider = false
+                    mapCenter = resolved
+                    return@launch
+                }
+            }
             val found = RemoteApisService.searchPlaces(q)
             searchResults = found
             searching = false
@@ -309,6 +329,9 @@ fun NavigationScreen(
     }
 
     if (showStyleSheet) {
+        var cartoKeyDraft by remember(state.settings.cartoApiKey) {
+            mutableStateOf(state.settings.cartoApiKey)
+        }
         ModalBottomSheet(
             onDismissRequest = { showStyleSheet = false },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -334,9 +357,49 @@ fun NavigationScreen(
                             },
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(opt.label, modifier = Modifier.weight(1f))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(opt.label)
+                            if (opt.usesCartoKey) {
+                                Text(
+                                    if (state.settings.cartoApiKey.isNotBlank()) "CARTO • API Key aktif" else "CARTO Basemaps",
+                                    fontSize = 11.sp,
+                                    color = c.textMuted
+                                )
+                            }
+                        }
                         if (opt == style) {
                             Icon(Icons.Rounded.GpsFixed, contentDescription = "Terpilih", tint = c.accent)
+                        }
+                    }
+                }
+                item {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = c.borderSubtle)
+                    Text("Carto API Key (Opsional untuk kuota tinggi)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = cartoKeyDraft,
+                            onValueChange = { cartoKeyDraft = it },
+                            label = { Text("Carto API Key") },
+                            singleLine = true,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("carto_api_key_input")
+                        )
+                        Button(
+                            onClick = {
+                                TileCacheService.evictMemoryCache()
+                                onUpdateSettings(state.settings.copy(cartoApiKey = cartoKeyDraft.trim()))
+                            },
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("save_carto_key_button")
+                        ) {
+                            Text("Simpan")
                         }
                     }
                 }
@@ -361,8 +424,11 @@ fun NavigationScreen(
                     OfflineMapSection(
                         styleId = style.id,
                         urlTemplate = style.tileUrlTemplate,
+                        cartoApiKey = state.settings.cartoApiKey,
                         centerProvider = { mapCenter },
-                        canBulkDownload = style == MapStyleOption.DARK_CARTO
+                        canBulkDownload = style.usesCartoKey ||
+                            style == MapStyleOption.OSM_HOT ||
+                            style == MapStyleOption.TOPO
                     )
                 }
             }
@@ -404,6 +470,9 @@ fun NavigationScreen(
                 dismissButton = { TextButton(onClick = { showAddSpklu = false }) { Text("Batal") } }
             )
         }
+        var ocmKeyDraft by remember(state.settings.ocmApiKey) {
+            mutableStateOf(state.settings.ocmApiKey)
+        }
         ModalBottomSheet(
             onDismissRequest = { showSpkluSheet = false },
             containerColor = c.surfaceCard
@@ -426,6 +495,35 @@ fun NavigationScreen(
                         onRefreshSpklu { loadingSpklu = false }
                     }) {
                         Icon(Icons.Rounded.Refresh, contentDescription = "Muat ulang SPKLU")
+                    }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = ocmKeyDraft,
+                        onValueChange = { ocmKeyDraft = it },
+                        label = { Text("OpenChargeMap API Key") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("ocm_api_key_input")
+                    )
+                    Button(
+                        onClick = {
+                            onUpdateSettings(state.settings.copy(ocmApiKey = ocmKeyDraft.trim()))
+                            loadingSpklu = true
+                            onRefreshSpklu { loadingSpklu = false }
+                        },
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("save_ocm_key_button")
+                    ) {
+                        Text("Muat")
                     }
                 }
                 if (loadingSpklu) {
@@ -616,6 +714,30 @@ fun NavigationScreen(
                         label = { Text("Full Peta") }
                     )
                     FilterChip(
+                        selected = state.settings.mapsAutoStream,
+                        onClick = {
+                            onUpdateSettings(state.settings.copy(mapsAutoStream = !state.settings.mapsAutoStream))
+                        },
+                        label = { Text("Auto-Stream") },
+                        modifier = Modifier.testTag("mid_autostream_chip")
+                    )
+                    FilterChip(
+                        selected = state.settings.mapsCompassOn,
+                        onClick = {
+                            onUpdateSettings(state.settings.copy(mapsCompassOn = !state.settings.mapsCompassOn))
+                        },
+                        label = { Text("Kompas") },
+                        modifier = Modifier.testTag("mid_compass_chip")
+                    )
+                    FilterChip(
+                        selected = state.settings.routeCacheEnabled,
+                        onClick = {
+                            onUpdateSettings(state.settings.copy(routeCacheEnabled = !state.settings.routeCacheEnabled))
+                        },
+                        label = { Text("Cache Rute") },
+                        modifier = Modifier.testTag("mid_route_cache_chip")
+                    )
+                    FilterChip(
                         selected = state.settings.customWallpaperEnabled,
                         onClick = {
                             onUpdateSettings(state.settings.copy(customWallpaperEnabled = !state.settings.customWallpaperEnabled))
@@ -630,6 +752,19 @@ fun NavigationScreen(
                         label = { Text("Strip Info Maps") }
                     )
                 }
+                Text(
+                    "Kualitas JPEG MID: ${state.settings.mapsQualityPct}%",
+                    fontSize = 12.sp,
+                    color = c.textMuted
+                )
+                Slider(
+                    value = state.settings.mapsQualityPct.coerceIn(30, 95).toFloat(),
+                    onValueChange = {
+                        onUpdateSettings(state.settings.copy(mapsQualityPct = it.roundToInt()))
+                    },
+                    valueRange = 30f..95f,
+                    modifier = Modifier.testTag("mid_quality_slider")
+                )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         modifier = Modifier
@@ -768,6 +903,7 @@ fun NavigationScreen(
             center = mapCenter,
             zoom = mapZoom,
             style = style,
+            cartoApiKey = state.settings.cartoApiKey,
             dataSaverMap = state.settings.dataSaverMap,
             riderLocation = state.gpsState.location,
             riderHeadingDeg = state.gpsState.headingDeg ?: 0.0,

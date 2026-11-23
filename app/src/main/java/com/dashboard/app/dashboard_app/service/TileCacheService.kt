@@ -15,6 +15,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -40,11 +41,19 @@ object TileCacheService {
     private fun tileFile(context: Context, styleId: String, z: Int, x: Int, y: Int): File =
         File(rootDir(context), "$styleId/$z/$x/$y.tile")
 
-    fun resolveTileUrl(urlTemplate: String, z: Int, x: Int, y: Int): String =
-        urlTemplate
+    fun resolveTileUrl(urlTemplate: String, z: Int, x: Int, y: Int, cartoApiKey: String = ""): String {
+        val cleanKey = cartoApiKey.trim()
+        val keyQs = if (cleanKey.isNotEmpty()) "?key=${URLEncoder.encode(cleanKey, "UTF-8")}" else ""
+        return urlTemplate
             .replace("{z}", z.toString())
             .replace("{x}", x.toString())
             .replace("{y}", y.toString())
+            .replace("{keyQs}", keyQs)
+    }
+
+    fun evictMemoryCache() {
+        memCache.evictAll()
+    }
 
     fun getCachedMemBitmap(styleId: String, z: Int, x: Int, y: Int): Bitmap? {
         val key = "$styleId/$z/$x/$y"
@@ -57,7 +66,8 @@ object TileCacheService {
         urlTemplate: String,
         z: Int,
         x: Int,
-        y: Int
+        y: Int,
+        cartoApiKey: String = ""
     ): Bitmap? {
         val key = "$styleId/$z/$x/$y"
         memCache.get(key)?.takeIf { !it.isRecycled }?.let { return it }
@@ -71,7 +81,7 @@ object TileCacheService {
                 }
             }
             if (offlineOnly) return@withContext null
-            val url = resolveTileUrl(urlTemplate, z, x, y)
+            val url = resolveTileUrl(urlTemplate, z, x, y, cartoApiKey)
             val fetched = fetchBytes(url) ?: return@withContext null
             saveBytes(f, fetched)
             fetched
@@ -94,8 +104,9 @@ object TileCacheService {
         urlTemplate: String,
         z: Int,
         x: Int,
-        y: Int
-    ): ImageBitmap? = getTileAndroidBitmap(context, styleId, urlTemplate, z, x, y)?.asImageBitmap()
+        y: Int,
+        cartoApiKey: String = ""
+    ): ImageBitmap? = getTileAndroidBitmap(context, styleId, urlTemplate, z, x, y, cartoApiKey)?.asImageBitmap()
 
     private fun fetchBytes(urlStr: String): ByteArray? {
         var conn: HttpURLConnection? = null
@@ -165,6 +176,7 @@ object TileCacheService {
         radiusKm: Double,
         minZoom: Int = 10,
         maxZoom: Int = 16,
+        cartoApiKey: String = "",
         onProgress: (done: Int, total: Int) -> Unit,
         isCancelled: () -> Boolean
     ): Int = withContext(Dispatchers.IO) {
@@ -186,7 +198,7 @@ object TileCacheService {
                     async(Dispatchers.IO) {
                         val f = tileFile(context, styleId, t.z, t.x, t.y)
                         if (f.exists() && f.length() > 0L) return@async true
-                        val url = resolveTileUrl(urlTemplate, t.z, t.x, t.y)
+                        val url = resolveTileUrl(urlTemplate, t.z, t.x, t.y, cartoApiKey)
                         val bytes = fetchBytes(url) ?: return@async false
                         saveBytes(f, bytes)
                         true
