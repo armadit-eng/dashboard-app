@@ -13,21 +13,26 @@ import com.dashboard.app.dashboard_app.model.DiscoveredDeviceX
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStream
+import java.text.Normalizer
 import java.util.Calendar
 import java.util.Locale
 import java.util.UUID
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 class BtClassicManager(private val context: Context) {
     companion object {
         private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+        private const val WRITE_MIN_GAP_MS = 30L
+        private const val NAV_SAME_RESEND_MS = 15_000L
     }
 
     var onLineReceived: ((String) -> Unit)? = null
@@ -38,13 +43,19 @@ class BtClassicManager(private val context: Context) {
     var isMapsSending: Boolean = false
         private set
 
+    @Volatile
+    var lastMapsWriteMs: Long = 0L
+        private set
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val ioExecutor = Executors.newSingleThreadExecutor()
-    private val writeExecutor = Executors.newSingleThreadExecutor()
     private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
 
-    private val txQueue = ConcurrentLinkedQueue<String>()
-    private var txFuture: ScheduledFuture<*>? = null
+    private val writeQueue = LinkedBlockingQueue<String>()
+    private var writerThread: Thread? = null
+    @Volatile
+    private var writerRunning = false
+
     private var pollFuture: ScheduledFuture<*>? = null
     private var pollCycle = 0
 
@@ -53,9 +64,16 @@ class BtClassicManager(private val context: Context) {
 
     @Volatile
     private var reading = false
-
     @Volatile
     private var connected = false
+    @Volatile
+    private var shouldReconnect = false
+    @Volatile
+    private var lastMac: String? = null
+    private var reconnectThread: Thread? = null
+
+    private var lastNavSentText: String = ""
+    private var lastNavSentAt: Long = 0L
 
     private val adapter: BluetoothAdapter?
         get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -81,28 +99,50 @@ class BtClassicManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     suspend fun connect(address: String): Boolean = withContext(Dispatchers.IO) {
-        disconnectInternal("reconnect")
+        shouldReconnect = true
+        lastMac = address
+        stopReconnectLoop()
+        connectInternal(address, isReconnect = false)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectInternal(address: String, isReconnect: Boolean): Boolean {
+        closeSocketOnly()
         val bt = adapter
         if (bt == null || !bt.isEnabled) {
             mainHandler.post {
                 onLog?.invoke("MOTOR", "Bluetooth tidak aktif", true)
                 onStateChanged?.invoke(ConnectionStateX.DISCONNECTED, "", "BT_DISABLED")
             }
-            return@withContext false
+            return false
         }
 
-        mainHandler.post {
-            onStateChanged?.invoke(ConnectionStateX.CONNECTING, address, null)
+        if (!isReconnect) {
+            mainHandler.post {
+                onStateChanged?.invoke(ConnectionStateX.CONNECTING, address, null)
+            }
         }
 
-        try {
+        return try {
             val device = bt.getRemoteDevice(address)
-            val sock = device.createRfcommSocketToServiceRecord(SPP_UUID)
             try {
                 bt.cancelDiscovery()
             } catch (_: SecurityException) {
             }
-            sock.connect()
+
+            // Primary: standard SPP UUID; fallback: reflection channel 1 (bypasses SDP/BLE routing quirks)
+            val sock = try {
+                device.createRfcommSocketToServiceRecord(SPP_UUID).also { it.connect() }
+            } catch (e1: IOException) {
+                mainHandler.post {
+                    onLog?.invoke("MOTOR", "SPP UUID gagal (${e1.message}), mencoba channel 1…", false)
+                }
+                val m = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                val fallback = m.invoke(device, 1) as BluetoothSocket
+                fallback.connect()
+                fallback
+            }
+
             socket = sock
             outputStream = sock.outputStream
             reading = true
@@ -114,17 +154,22 @@ class BtClassicManager(private val context: Context) {
                 address
             }
 
+            startWriter()
             mainHandler.post {
                 onStateChanged?.invoke(ConnectionStateX.CONNECTED, devName, null)
-                startTxAndPolling()
+                startPolling()
             }
             ioExecutor.execute { readLoop(sock) }
             true
         } catch (e: Exception) {
-            disconnectInternal("error: ${e.message}")
-            mainHandler.post {
-                onLog?.invoke("MOTOR", "Gagal koneksi SPP ke $address: ${e.message}", true)
+            closeSocketOnly()
+            if (!isReconnect) {
+                mainHandler.post {
+                    onLog?.invoke("MOTOR", "Gagal koneksi SPP ke $address: ${e.message}", true)
+                    onStateChanged?.invoke(ConnectionStateX.DISCONNECTED, "", "error: ${e.message}")
+                }
             }
+            if (shouldReconnect) startReconnectLoop()
             false
         }
     }
@@ -146,20 +191,92 @@ class BtClassicManager(private val context: Context) {
                 }
             }
         } finally {
-            disconnectInternal("eof")
+            val dropWasUnexpected = reading && shouldReconnect
+            closeSocketOnly()
+            mainHandler.post {
+                onStateChanged?.invoke(ConnectionStateX.DISCONNECTED, "", "eof")
+            }
+            if (dropWasUnexpected) {
+                startReconnectLoop()
+            }
         }
+    }
+
+    private fun startReconnectLoop() {
+        val mac = lastMac ?: return
+        if (!shouldReconnect || reconnectThread?.isAlive == true) return
+        val t = Thread {
+            var delayMs = 4_000L
+            var attempt = 0
+            while (shouldReconnect && !connected) {
+                try {
+                    Thread.sleep(delayMs)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!shouldReconnect || connected) break
+                attempt++
+                delayMs = min((delayMs * 1.5).toLong(), 30_000L)
+                mainHandler.post {
+                    onLog?.invoke("MOTOR", "Mencoba sambung ulang MID (#$attempt)…", false)
+                }
+                if (connectInternal(mac, isReconnect = true)) break
+            }
+        }.apply {
+            isDaemon = true
+            name = "MidSppReconnect"
+            start()
+        }
+        reconnectThread = t
+    }
+
+    private fun stopReconnectLoop() {
+        reconnectThread?.interrupt()
+        reconnectThread = null
     }
 
     fun disconnect() {
-        disconnectInternal("manual")
+        shouldReconnect = false
+        lastMac = null
+        stopReconnectLoop()
+        val wasActive = socket != null || reading || connected
+        closeSocketOnly()
+        if (wasActive) {
+            mainHandler.post {
+                onStateChanged?.invoke(ConnectionStateX.DISCONNECTED, "", "manual")
+            }
+        }
     }
 
+    /** Latest-wins enqueue onto the single serialized BT Classic writer thread. */
     fun sendCommand(cmd: String) {
         if (!connected) return
         val norm = if (cmd.endsWith("\r\n")) cmd else "$cmd\r\n"
-        if (txQueue.size < 40) {
-            txQueue.add(norm)
+        enqueueCoalesced(norm)
+    }
+
+    private fun enqueueCoalesced(fullCmd: String) {
+        val eqPrefix = when {
+            fullCmd.startsWith("AT+MAPS=") -> "AT+MAPS="
+            fullCmd.startsWith("AT+NAV=") -> "AT+NAV="
+            fullCmd.startsWith("AT+TRIP=") -> "AT+TRIP="
+            fullCmd.indexOf('?') > 0 && fullCmd.length < 24 -> fullCmd
+            else -> null
         }
+        if (eqPrefix != null) {
+            writeQueue.removeIf { it.startsWith(eqPrefix) }
+        }
+        if (writeQueue.size < 48) {
+            writeQueue.offer(fullCmd)
+        }
+    }
+
+    fun mapsQueueDepth(): Int {
+        var count = if (isMapsSending) 1 else 0
+        for (item in writeQueue) {
+            if (item.startsWith("AT+MAPS=")) count++
+        }
+        return count
     }
 
     fun sendTripRange(rangeKm: Double) {
@@ -167,9 +284,19 @@ class BtClassicManager(private val context: Context) {
     }
 
     fun sendNavText(rawText: String) {
-        val ascii = rawText.replace(Regex("[^\\x20-\\x7E]"), " ").trim()
-        val clipped = if (ascii.length > 20) ascii.substring(0, 20) else ascii
+        val ascii = Normalizer.normalize(rawText, Normalizer.Form.NFD)
+            .replace(Regex("\\p{M}+"), "")
+            .replace(Regex("[^\\x20-\\x7E]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        val clipped = if (ascii.length > 20) ascii.substring(0, 20).trim() else ascii
         val padded = clipped.padEnd(20, ' ')
+        val now = System.currentTimeMillis()
+        if (padded == lastNavSentText && now - lastNavSentAt < NAV_SAME_RESEND_MS) {
+            return
+        }
+        lastNavSentText = padded
+        lastNavSentAt = now
         sendCommand("AT+NAV=\"$padded\"")
     }
 
@@ -178,109 +305,124 @@ class BtClassicManager(private val context: Context) {
     }
 
     suspend fun sendMapsFrame(base64Jpeg: String): Int? = withContext(Dispatchers.IO) {
-        if (!connected || isMapsSending || base64Jpeg.isEmpty()) return@withContext null
-        val out = outputStream ?: return@withContext null
-        isMapsSending = true
-        try {
-            val payload = "AT+MAPS=\"$base64Jpeg\"\r\n".toByteArray(Charsets.UTF_8)
-            val t0 = System.currentTimeMillis()
-            synchronized(out) {
-                out.write(payload)
-                out.flush()
+        if (!connected || base64Jpeg.isEmpty() || mapsQueueDepth() > 0) return@withContext null
+        enqueueCoalesced("AT+MAPS=\"$base64Jpeg\"\r\n")
+        val waitStart = System.currentTimeMillis()
+        while (connected && mapsQueueDepth() > 0 && System.currentTimeMillis() - waitStart < 4_000L) {
+            Thread.sleep(25L)
+        }
+        lastMapsWriteMs.toInt().coerceAtLeast(1)
+    }
+
+    private fun startWriter() {
+        stopWriter()
+        writerRunning = true
+        writeQueue.clear()
+        writerThread = Thread {
+            var lastWriteAt = 0L
+            while (writerRunning) {
+                val cmd = try {
+                    writeQueue.take()
+                } catch (_: InterruptedException) {
+                    break
+                }
+                val out = outputStream ?: continue
+                val wait = WRITE_MIN_GAP_MS - (System.currentTimeMillis() - lastWriteAt)
+                if (wait > 0) {
+                    try {
+                        Thread.sleep(wait)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+                val isMaps = cmd.startsWith("AT+MAPS=")
+                val t0 = System.currentTimeMillis()
+                if (isMaps) isMapsSending = true
+                try {
+                    out.write(cmd.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                } catch (e: IOException) {
+                    if (isMaps) {
+                        mainHandler.post {
+                            onLog?.invoke("MOTOR", "Gagal kirim AT+MAPS: ${e.message}", true)
+                        }
+                    }
+                } finally {
+                    if (isMaps) {
+                        lastMapsWriteMs = System.currentTimeMillis() - t0
+                        isMapsSending = false
+                    }
+                }
+                lastWriteAt = System.currentTimeMillis()
+                BleCoex.markClassicWrite()
             }
-            (System.currentTimeMillis() - t0).toInt()
-        } catch (e: Exception) {
-            mainHandler.post {
-                onLog?.invoke("MOTOR", "Gagal kirim AT+MAPS: ${e.message}", true)
-            }
-            null
-        } finally {
-            isMapsSending = false
+        }.apply {
+            isDaemon = true
+            name = "MidSppWriter"
+            start()
         }
     }
 
-    private fun startTxAndPolling() {
-        stopLoops()
+    private fun stopWriter() {
+        writerRunning = false
+        writerThread?.interrupt()
+        writerThread = null
+        writeQueue.clear()
+        isMapsSending = false
+    }
+
+    private fun startPolling() {
+        stopPolling()
         val cal = Calendar.getInstance()
         val hh = cal.get(Calendar.HOUR_OF_DAY).toString().padStart(2, '0')
         val mm = cal.get(Calendar.MINUTE).toString().padStart(2, '0')
         sendCommand("AT+TIME=\"$hh$mm\"")
 
-        txFuture = scheduler.scheduleAtFixedRate({
-            if (!connected) return@scheduleAtFixedRate
-            val cmd = txQueue.poll() ?: return@scheduleAtFixedRate
-            val out = outputStream ?: return@scheduleAtFixedRate
-            writeExecutor.execute {
-                try {
-                    synchronized(out) {
-                        out.write(cmd.toByteArray(Charsets.UTF_8))
-                        out.flush()
-                    }
-                } catch (_: Exception) {
-                }
-            }
-        }, 65, 65, TimeUnit.MILLISECONDS)
-
         pollFuture = scheduler.scheduleAtFixedRate({
             if (!connected) return@scheduleAtFixedRate
-            enqueueIfMissing("AT+SPD?\r\n")
-            enqueueIfMissing("AT+IBAT?\r\n")
-            enqueueIfMissing("AT+VBAT?\r\n")
-            enqueueIfMissing("AT+TRT?\r\n")
+            enqueueCoalesced("AT+SPD?\r\n")
+            enqueueCoalesced("AT+IBAT?\r\n")
+            enqueueCoalesced("AT+VBAT?\r\n")
+            enqueueCoalesced("AT+TRT?\r\n")
             if (pollCycle % 2 == 0) {
-                enqueueIfMissing("AT+SOC?\r\n")
-                enqueueIfMissing("AT+ERR?\r\n")
-                enqueueIfMissing("AT+MODE?\r\n")
-                enqueueIfMissing("AT+PARK?\r\n")
+                enqueueCoalesced("AT+SOC?\r\n")
+                enqueueCoalesced("AT+ERR?\r\n")
+                enqueueCoalesced("AT+MODE?\r\n")
+                enqueueCoalesced("AT+PARK?\r\n")
             }
             if (pollCycle % 6 == 0) {
-                enqueueIfMissing("AT+CBAT?\r\n")
-                enqueueIfMissing("AT+ODO?\r\n")
-                enqueueIfMissing("AT+TINV?\r\n")
-                enqueueIfMissing("AT+TMOT?\r\n")
-                enqueueIfMissing("AT+TBAT?\r\n")
-                enqueueIfMissing("AT+SOH?\r\n")
+                enqueueCoalesced("AT+CBAT?\r\n")
+                enqueueCoalesced("AT+ODO?\r\n")
+                enqueueCoalesced("AT+TINV?\r\n")
+                enqueueCoalesced("AT+TMOT?\r\n")
+                enqueueCoalesced("AT+TBAT?\r\n")
+                enqueueCoalesced("AT+SOH?\r\n")
             }
             pollCycle++
-        }, 100, 500, TimeUnit.MILLISECONDS)
+        }, 120, 500, TimeUnit.MILLISECONDS)
     }
 
-    private fun enqueueIfMissing(cmd: String) {
-        if (txQueue.size < 32 && !txQueue.contains(cmd)) {
-            txQueue.add(cmd)
-        }
-    }
-
-    private fun stopLoops() {
-        txFuture?.cancel(false)
+    private fun stopPolling() {
         pollFuture?.cancel(false)
-        txFuture = null
         pollFuture = null
-        txQueue.clear()
     }
 
-    private fun disconnectInternal(reason: String) {
-        val wasActive = socket != null || reading || connected
+    private fun closeSocketOnly() {
         reading = false
         connected = false
-        stopLoops()
+        stopPolling()
+        stopWriter()
         try {
             socket?.close()
         } catch (_: Exception) {
         }
         socket = null
         outputStream = null
-        if (wasActive) {
-            mainHandler.post {
-                onStateChanged?.invoke(ConnectionStateX.DISCONNECTED, "", reason)
-            }
-        }
     }
 
     fun dispose() {
-        disconnectInternal("dispose")
+        disconnect()
         scheduler.shutdownNow()
         ioExecutor.shutdownNow()
-        writeExecutor.shutdownNow()
     }
 }

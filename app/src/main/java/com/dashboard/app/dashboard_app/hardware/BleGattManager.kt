@@ -39,6 +39,9 @@ class BleGattManager(private val context: Context) {
         private val NUS_SVC_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
         private val NUS_WRITE_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
         private val NUS_NOTIFY_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+
+        private const val CONNECT_TIMEOUT_MS = 15_000L
+        private val RECONNECT_DELAYS_MS = longArrayOf(3_000L, 5_000L, 8_000L, 12_000L, 20_000L)
     }
 
     var onLog: ((String, String, Boolean) -> Unit)? = null
@@ -69,6 +72,12 @@ class BleGattManager(private val context: Context) {
 
     private val gatts = ConcurrentHashMap<String, BluetoothGatt>()
     private val writeChars = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
+    private val slotGenerations = ConcurrentHashMap<String, Int>()
+    private val slotManualStop = ConcurrentHashMap<String, Boolean>()
+    private val slotLastMac = ConcurrentHashMap<String, String>()
+    private val slotReconnectAttempts = ConcurrentHashMap<String, Int>()
+    private val slotTimeoutRunnables = ConcurrentHashMap<String, Runnable>()
+    private val slotReconnectRunnables = ConcurrentHashMap<String, Runnable>()
 
     private var jkPollFuture: ScheduledFuture<*>? = null
     private val jkFrameBuf = mutableListOf<Byte>()
@@ -159,10 +168,21 @@ class BleGattManager(private val context: Context) {
     fun connectMotorBle(address: String) = connectSlot("motor", address)
     fun disconnectMotorBle() = disconnectSlot("motor")
 
-    @SuppressLint("MissingPermission")
     private fun connectSlot(slot: String, address: String) {
-        disconnectSlot(slot)
+        slotManualStop[slot] = false
+        slotLastMac[slot] = address
+        slotReconnectAttempts[slot] = 0
+        cancelReconnect(slot)
+        openSlotGatt(slot, address)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openSlotGatt(slot: String, address: String) {
+        val gen = (slotGenerations[slot] ?: 0) + 1
+        slotGenerations[slot] = gen
+        closeSlotOnly(slot, emitDisconnect = false)
         stopScan()
+
         val dev = try {
             adapter?.getRemoteDevice(address)
         } catch (_: Exception) {
@@ -174,100 +194,210 @@ class BleGattManager(private val context: Context) {
         } catch (_: SecurityException) {
             address
         }
+        val gateKey = slotLabel(slot)
+        val waitMsg = BleConnectGate.waitingFor()
         emitSlotState(slot, ConnectionStateX.CONNECTING, devName)
         mainHandler.post {
-            onLog?.invoke(slotLabel(slot), "Menghubungkan $address…", false)
+            val suffix = if (waitMsg.isEmpty()) "" else " ($waitMsg)"
+            onLog?.invoke(gateKey, "Menghubungkan $address$suffix…", false)
         }
 
-        val gatt = dev.connectGatt(context, false, object : BluetoothGattCallback() {
-            override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    g.discoverServices()
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    disconnectSlot(slot)
-                    mainHandler.post {
-                        onLog?.invoke(slotLabel(slot), "${slotLabel(slot)} terputus.", true)
-                    }
-                }
+        BleConnectGate.setAbortHook(gateKey) {
+            if (slotGenerations[slot] == gen) {
+                closeSlotOnly(slot, emitDisconnect = true)
+                scheduleReconnect(slot)
+            }
+        }
+
+        BleConnectGate.acquire(gateKey) {
+            if (slotGenerations[slot] != gen || slotManualStop[slot] == true) {
+                BleConnectGate.release(gateKey)
+                return@acquire
             }
 
-            override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-                val isNus = slot == "esp1" || slot == "esp2"
-                val svc = if (isNus) {
-                    g.getService(NUS_SVC_UUID)
-                } else {
-                    g.getService(JK_SVC_UUID) ?: g.services.firstOrNull { s ->
-                        s.characteristics.any { (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 }
-                    }
+            val timeoutTask = Runnable {
+                if (slotGenerations[slot] != gen) return@Runnable
+                mainHandler.post {
+                    onLog?.invoke(gateKey, "Timeout setup BLE > 15 detik, reset GATT", true)
                 }
-                if (svc == null) {
-                    mainHandler.post {
-                        onLog?.invoke(slotLabel(slot), "Layanan GATT tidak ditemukan.", true)
-                    }
-                    disconnectSlot(slot)
-                    return
-                }
+                closeSlotOnly(slot, emitDisconnect = true)
+                BleConnectGate.release(gateKey)
+                scheduleReconnect(slot)
+            }
+            slotTimeoutRunnables[slot] = timeoutTask
+            mainHandler.postDelayed(timeoutTask, CONNECT_TIMEOUT_MS)
 
-                val notifyCh = if (isNus) {
-                    svc.getCharacteristic(NUS_NOTIFY_UUID)
-                } else {
-                    svc.getCharacteristic(JK_NOTIFY_UUID) ?: svc.characteristics.firstOrNull {
-                        (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
-                    }
-                }
-                val writeCh = if (isNus) {
-                    svc.getCharacteristic(NUS_WRITE_UUID)
-                } else {
-                    svc.getCharacteristic(JK_WRITE_UUID) ?: notifyCh ?: svc.characteristics.firstOrNull {
-                        (it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
-                    }
-                }
-                if (writeCh != null) writeChars[slot] = writeCh
+            val gatt = dev.connectGatt(context, false, object : BluetoothGattCallback() {
+                private var discovered = false
 
-                if (notifyCh != null) {
-                    g.setCharacteristicNotification(notifyCh, true)
-                    val cccd = notifyCh.getDescriptor(CCCD_UUID)
-                    if (cccd != null) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                            @Suppress("DEPRECATION")
-                            g.writeDescriptor(cccd)
+                override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+                    if (slotGenerations[slot] != gen) {
+                        try { g.close() } catch (_: Exception) {}
+                        return
+                    }
+                    if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+                        val mtuRequested = try {
+                            g.requestMtu(247)
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!mtuRequested) {
+                            discovered = true
+                            g.discoverServices()
+                        }
+                    } else if (newState == BluetoothProfile.STATE_DISCONNECTED || status != BluetoothGatt.GATT_SUCCESS) {
+                        clearConnectTimeout(slot)
+                        BleConnectGate.release(gateKey)
+                        closeSlotOnly(slot, emitDisconnect = true)
+                        mainHandler.post {
+                            onLog?.invoke(gateKey, "$gateKey terputus (status=$status).", true)
+                        }
+                        if (slotManualStop[slot] != true) {
+                            scheduleReconnect(slot)
                         }
                     }
                 }
 
-                emitSlotState(slot, ConnectionStateX.CONNECTED, devName)
-                mainHandler.post {
-                    onLog?.invoke(slotLabel(slot), "Terhubung ke $devName", false)
+                override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+                    if (slotGenerations[slot] != gen) return
+                    if (!discovered) {
+                        discovered = true
+                        g.discoverServices()
+                    }
                 }
 
-                if (slot == "jk") {
-                    startJkPolling()
-                } else if (slot == "motor") {
-                    startMotorBlePolling()
+                override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+                    if (slotGenerations[slot] != gen) return
+                    val isNus = slot == "esp1" || slot == "esp2"
+                    val svc = if (isNus) {
+                        g.getService(NUS_SVC_UUID)
+                    } else {
+                        g.getService(JK_SVC_UUID) ?: g.services.firstOrNull { s ->
+                            s.characteristics.any { (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 }
+                        }
+                    }
+                    if (svc == null) {
+                        clearConnectTimeout(slot)
+                        BleConnectGate.release(gateKey)
+                        mainHandler.post {
+                            onLog?.invoke(gateKey, "Layanan GATT tidak ditemukan.", true)
+                        }
+                        closeSlotOnly(slot, emitDisconnect = true)
+                        return
+                    }
+
+                    val notifyCh = if (isNus) {
+                        svc.getCharacteristic(NUS_NOTIFY_UUID)
+                    } else {
+                        svc.getCharacteristic(JK_NOTIFY_UUID) ?: svc.characteristics.firstOrNull {
+                            (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
+                        }
+                    }
+                    val writeCh = if (isNus) {
+                        svc.getCharacteristic(NUS_WRITE_UUID)
+                    } else {
+                        svc.getCharacteristic(JK_WRITE_UUID) ?: notifyCh ?: svc.characteristics.firstOrNull {
+                            (it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
+                        }
+                    }
+                    if (writeCh != null) writeChars[slot] = writeCh
+
+                    var waitingCccd = false
+                    if (notifyCh != null) {
+                        g.setCharacteristicNotification(notifyCh, true)
+                        val cccd = notifyCh.getDescriptor(CCCD_UUID)
+                        if (cccd != null) {
+                            waitingCccd = true
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                                @Suppress("DEPRECATION")
+                                g.writeDescriptor(cccd)
+                            }
+                        }
+                    }
+
+                    if (!waitingCccd) {
+                        finishSetup(slot, gateKey, devName)
+                    }
                 }
-            }
 
-            @Deprecated("Deprecated in API 33")
-            override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-                @Suppress("DEPRECATION")
-                val data = ch.value ?: return
-                handleData(slot, data)
-            }
+                override fun onDescriptorWrite(
+                    g: BluetoothGatt,
+                    descriptor: BluetoothGattDescriptor,
+                    status: Int
+                ) {
+                    if (slotGenerations[slot] != gen) return
+                    finishSetup(slot, gateKey, devName)
+                }
 
-            override fun onCharacteristicChanged(
-                g: BluetoothGatt,
-                ch: BluetoothGattCharacteristic,
-                value: ByteArray
-            ) {
-                handleData(slot, value)
-            }
-        }, BluetoothDevice.TRANSPORT_LE)
+                @Deprecated("Deprecated in API 33")
+                override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+                    @Suppress("DEPRECATION")
+                    val data = ch.value ?: return
+                    handleData(slot, data)
+                }
 
-        if (gatt != null) gatts[slot] = gatt
+                override fun onCharacteristicChanged(
+                    g: BluetoothGatt,
+                    ch: BluetoothGattCharacteristic,
+                    value: ByteArray
+                ) {
+                    handleData(slot, value)
+                }
+            }, BluetoothDevice.TRANSPORT_LE)
+
+            if (gatt != null) {
+                gatts[slot] = gatt
+            } else {
+                clearConnectTimeout(slot)
+                BleConnectGate.release(gateKey)
+                emitSlotState(slot, ConnectionStateX.DISCONNECTED, "")
+            }
+        }
+    }
+
+    private fun finishSetup(slot: String, gateKey: String, devName: String) {
+        clearConnectTimeout(slot)
+        slotReconnectAttempts[slot] = 0
+        BleConnectGate.release(gateKey)
+        emitSlotState(slot, ConnectionStateX.CONNECTED, devName)
+        mainHandler.post {
+            onLog?.invoke(gateKey, "Terhubung ke $devName", false)
+        }
+        if (slot == "jk") {
+            startJkPolling()
+        } else if (slot == "motor") {
+            startMotorBlePolling()
+        }
+    }
+
+    private fun clearConnectTimeout(slot: String) {
+        slotTimeoutRunnables.remove(slot)?.let { mainHandler.removeCallbacks(it) }
+    }
+
+    private fun cancelReconnect(slot: String) {
+        slotReconnectRunnables.remove(slot)?.let { mainHandler.removeCallbacks(it) }
+    }
+
+    private fun scheduleReconnect(slot: String) {
+        val mac = slotLastMac[slot] ?: return
+        if (slotManualStop[slot] == true) return
+        val attempt = slotReconnectAttempts[slot] ?: 0
+        if (attempt >= 8) return
+        slotReconnectAttempts[slot] = attempt + 1
+        val baseDelay = RECONNECT_DELAYS_MS[attempt.coerceAtMost(RECONNECT_DELAYS_MS.lastIndex)]
+        val delayMs = BleCoex.stretch(baseDelay)
+        cancelReconnect(slot)
+        val task = Runnable {
+            if (slotManualStop[slot] != true && gatts[slot] == null) {
+                openSlotGatt(slot, mac)
+            }
+        }
+        slotReconnectRunnables[slot] = task
+        mainHandler.postDelayed(task, delayMs)
     }
 
     private fun startJkPolling() {
@@ -487,8 +617,17 @@ class BleGattManager(private val context: Context) {
         }
     }
 
-    @SuppressLint("MissingPermission")
     fun disconnectSlot(slot: String) {
+        slotManualStop[slot] = true
+        slotLastMac.remove(slot)
+        cancelReconnect(slot)
+        clearConnectTimeout(slot)
+        BleConnectGate.release(slotLabel(slot))
+        closeSlotOnly(slot, emitDisconnect = true)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun closeSlotOnly(slot: String, emitDisconnect: Boolean) {
         if (slot == "jk") {
             jkPollFuture?.cancel(false)
             jkPollFuture = null
@@ -509,7 +648,9 @@ class BleGattManager(private val context: Context) {
             g?.close()
         } catch (_: Exception) {
         }
-        emitSlotState(slot, ConnectionStateX.DISCONNECTED, "")
+        if (emitDisconnect) {
+            emitSlotState(slot, ConnectionStateX.DISCONNECTED, "")
+        }
     }
 
     private fun slotLabel(slot: String): String = when (slot) {

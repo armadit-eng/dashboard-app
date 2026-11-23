@@ -118,8 +118,11 @@ private val MAIN_TABS = listOf(
 private enum class PhotoPickTarget { AVATAR, WALLPAPER }
 
 class MainActivity : ComponentActivity() {
+    private var pendingSharedNavText by mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        extractSharedNavText(intent)?.let { pendingSharedNavText = it }
         enableEdgeToEdge()
         setContent {
             val vm: DashboardViewModel = viewModel()
@@ -137,8 +140,28 @@ class MainActivity : ComponentActivity() {
                 isDark = state.settings.isDarkTheme,
                 accentId = state.settings.accentId
             ) {
-                DashboardRootApp(viewModel = vm, state = state)
+                DashboardRootApp(
+                    viewModel = vm,
+                    state = state,
+                    sharedNavText = pendingSharedNavText,
+                    onConsumeSharedNavText = { pendingSharedNavText = null }
+                )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        extractSharedNavText(intent)?.let { pendingSharedNavText = it }
+    }
+
+    private fun extractSharedNavText(intent: Intent?): String? {
+        if (intent == null) return null
+        return when (intent.action) {
+            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }
+            Intent.ACTION_VIEW -> intent.dataString?.trim()?.takeIf { it.isNotEmpty() }
+            else -> null
         }
     }
 }
@@ -146,7 +169,9 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun DashboardRootApp(
     viewModel: DashboardViewModel,
-    state: DashboardUiState
+    state: DashboardUiState,
+    sharedNavText: String?,
+    onConsumeSharedNavText: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -156,6 +181,15 @@ private fun DashboardRootApp(
     var currentTab by rememberSaveable { mutableIntStateOf(0) }
     var showDeviceSheet by remember { mutableStateOf(false) }
     var pickTarget by remember { mutableStateOf(PhotoPickTarget.AVATAR) }
+
+    LaunchedEffect(sharedNavText) {
+        val txt = sharedNavText ?: return@LaunchedEffect
+        currentTab = 2
+        viewModel.handleSharedNavigationText(txt) { msg ->
+            scope.launch { snackbarHostState.showSnackbar(msg) }
+        }
+        onConsumeSharedNavText()
+    }
 
     fun isGranted(perm: String): Boolean =
         ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED

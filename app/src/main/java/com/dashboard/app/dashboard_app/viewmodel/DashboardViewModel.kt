@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.dashboard.app.dashboard_app.GesitsWidgetProvider
 import com.dashboard.app.dashboard_app.ScreenMirrorService
 import com.dashboard.app.dashboard_app.engine.RoutePhysics
 import com.dashboard.app.dashboard_app.engine.TelemetryEngine
@@ -127,6 +128,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private var atNavCursor = 0
     private var atNavLastSentSec = 0L
     private var lastGpsFixMs = 0L
+    private var lastWidgetUpdateMs = 0L
     private var lastWeatherFetchMs = 0L
     private var lastGeoFetchMs = 0L
     private var lastOffRouteCheckMs = 0L
@@ -261,6 +263,17 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
         ScreenMirrorService.onMirrorStateChanged = { running ->
             _uiState.update { it.copy(screenMirrorActive = running) }
+        }
+        ScreenMirrorService.onExternalNavLine = { line ->
+            val st = _uiState.value
+            if (st.motorConnState == ConnectionStateX.CONNECTED) {
+                if (st.motorViaBle) {
+                    val ascii = line.padEnd(20, ' ').take(20)
+                    ble.writeMotorBle("AT+NAV=\"$ascii\"\r\n")
+                } else {
+                    btClassic.sendNavText(line)
+                }
+            }
         }
         ScreenMirrorService.onFrameReady = { b64 ->
             viewModelScope.launch {
@@ -503,6 +516,17 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                             sendMotorNavText(msg)
                         }
                     }
+                }
+
+                if (now - lastWidgetUpdateMs >= 8_000L) {
+                    lastWidgetUpdateMs = now
+                    GesitsWidgetProvider.updateSnapshot(
+                        context = getApplication(),
+                        socPct = eff.combinedSocPct,
+                        rangeKm = eff.rangeKm,
+                        bikeName = cur.settings.bikeName,
+                        connected = cur.motorConnState == ConnectionStateX.CONNECTED
+                    )
                 }
 
                 _uiState.update { s ->
@@ -1117,7 +1141,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             dataIntent = dataIntent,
             width = s.mapsSnapWidth.coerceIn(160, 480),
             height = s.mapsSnapHeight.coerceIn(120, 360),
-            intervalMs = max(350L, (s.mapsIntervalMs / 2).toLong())
+            intervalMs = max(450L, s.mapsIntervalMs.toLong()),
+            overlayStrip = s.mirrorOverlayStrip
         )
         _uiState.update { it.copy(screenMirrorActive = true) }
     }
@@ -1196,6 +1221,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun updateSettings(updated: AppSettings) {
         ble.invertB2Current = updated.invertB2Current
+        ScreenMirrorService.overlayStripEnabled = updated.mirrorOverlayStrip
         _uiState.update { it.copy(settings = updated).recomputeDerived() }
         viewModelScope.launch { storage.saveSettings(updated) }
     }
@@ -1206,6 +1232,42 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun setWakelock(enabled: Boolean) {
         _uiState.update { it.copy(wakelockActive = enabled) }
+    }
+
+    fun handleSharedNavigationText(rawText: String, onMessage: (String) -> Unit = {}) {
+        val text = rawText.trim()
+        if (text.isEmpty()) return
+        val direct = RoutePhysics.parseCoordinatesOrGoogleMapsUrl(text)
+        if (direct != null) {
+            setSingleDestination(
+                PlannedStop(
+                    id = "shared_${System.currentTimeMillis()}",
+                    label = "Tujuan Link Maps",
+                    lat = direct.lat,
+                    lng = direct.lng
+                )
+            )
+            onMessage("Koordinat tujuan dimuat dari tautan.")
+            return
+        }
+        viewModelScope.launch {
+            val cleaned = text.replace(Regex("https?://\\S+"), "").trim().ifEmpty { text }
+            val places = RemoteApisService.searchPlaces(cleaned)
+            val first = places.firstOrNull()
+            if (first != null) {
+                setSingleDestination(
+                    PlannedStop(
+                        id = "shared_${System.currentTimeMillis()}",
+                        label = first.name,
+                        lat = first.lat,
+                        lng = first.lng
+                    )
+                )
+                onMessage("Tujuan ditemukan: ${first.name}")
+            } else {
+                onMessage("Koordinat/lokasi dari tautan tidak dapat diparse.")
+            }
+        }
     }
 
     suspend fun copyPickedImage(uri: Uri): String? = storage.copyPickedImage(uri)

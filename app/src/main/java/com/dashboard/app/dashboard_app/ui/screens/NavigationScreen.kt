@@ -89,6 +89,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.dashboard.app.dashboard_app.MapsNotifListener
+import com.dashboard.app.dashboard_app.MirrorRegionOverlay
 import com.dashboard.app.dashboard_app.engine.RoutePhysics
 import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.GeoPointX
@@ -599,7 +601,10 @@ fun NavigationScreen(
                     fontSize = 12.5.sp,
                     color = c.textMuted
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
                     FilterChip(
                         selected = state.settings.mapsLayout == "split",
                         onClick = { onUpdateSettings(state.settings.copy(mapsLayout = "split")) },
@@ -616,6 +621,13 @@ fun NavigationScreen(
                             onUpdateSettings(state.settings.copy(customWallpaperEnabled = !state.settings.customWallpaperEnabled))
                         },
                         label = { Text("Wallpaper") }
+                    )
+                    FilterChip(
+                        selected = state.settings.mirrorOverlayStrip,
+                        onClick = {
+                            onUpdateSettings(state.settings.copy(mirrorOverlayStrip = !state.settings.mirrorOverlayStrip))
+                        },
+                        label = { Text("Strip Info Maps") }
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -644,6 +656,41 @@ fun NavigationScreen(
                         }
                     ) {
                         Text(if (state.screenMirrorActive) "Stop Mirror" else "Mirror Layar")
+                    }
+                }
+                val notifGranted = MapsNotifListener.isPermissionGranted(context)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("preview_mirror_region_button"),
+                        onClick = {
+                            if (MirrorRegionOverlay.canDraw(context)) {
+                                showMidSheet = false
+                                MirrorRegionOverlay.show(context)
+                            } else {
+                                context.startActivity(
+                                    Intent(
+                                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        Uri.parse("package:${context.packageName}")
+                                    )
+                                )
+                            }
+                        }
+                    ) {
+                        Text("Area Mirror")
+                    }
+                    OutlinedButton(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("maps_notif_access_button"),
+                        onClick = {
+                            context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                        }
+                    ) {
+                        Text(if (notifGranted) "Notif Maps: Aktif" else "Izin Notif Maps")
                     }
                 }
                 OutlinedButton(

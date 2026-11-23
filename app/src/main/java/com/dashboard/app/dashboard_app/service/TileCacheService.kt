@@ -46,6 +46,11 @@ object TileCacheService {
             .replace("{x}", x.toString())
             .replace("{y}", y.toString())
 
+    fun getCachedMemBitmap(styleId: String, z: Int, x: Int, y: Int): Bitmap? {
+        val key = "$styleId/$z/$x/$y"
+        return memCache.get(key)?.takeIf { !it.isRecycled }
+    }
+
     suspend fun getTileAndroidBitmap(
         context: Context,
         styleId: String,

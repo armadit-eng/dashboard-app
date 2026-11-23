@@ -74,6 +74,7 @@ data class AppSettings(
     val customWallpaperEnabled: Boolean = false,
     val customWallpaperPath: String = "",
     val customMarkerPath: String = "",
+    val mirrorOverlayStrip: Boolean = true,
     val atNavSlots: AtNavSlotConfig = AtNavSlotConfig(),
     val savedMotorAddress: String? = null,
     val savedMotorName: String? = null,
