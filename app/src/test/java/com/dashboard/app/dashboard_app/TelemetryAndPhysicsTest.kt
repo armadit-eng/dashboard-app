@@ -14,6 +14,7 @@ import com.dashboard.app.dashboard_app.model.MotorData
 import com.dashboard.app.dashboard_app.model.RidingScoreState
 import com.dashboard.app.dashboard_app.model.TripRecord
 import com.dashboard.app.dashboard_app.service.RemoteApisService
+import com.dashboard.app.dashboard_app.service.SpkluImportParser
 import com.dashboard.app.dashboard_app.service.TileCacheService
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -278,5 +279,57 @@ class TelemetryAndPhysicsTest {
         assertTrue(climb.gainM > 20.0)
         val descent = hills.first { !it.isUphill && it.notable }
         assertTrue(descent.dWh < 0.0)
+    }
+
+    @Test
+    fun parsesSpkluImportsAcrossKmlGpxGeoJsonAndCsv() {
+        val kml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <kml><Document><name>Charger Molis Jateng</name>
+              <Placemark>
+                <name>SPLU Balai Kota</name>
+                <description><![CDATA[Colokan Schuko 16A<br/>Gratis parkir]]></description>
+                <Point><coordinates>111.01234,-7.34567,0</coordinates></Point>
+              </Placemark>
+            </Document></kml>
+        """.trimIndent()
+        val kmlRes = SpkluImportParser.parseKml(kml)
+        assertEquals(1, kmlRes.size)
+        assertEquals("SPLU Balai Kota", kmlRes.first().name)
+        assertEquals(-7.34567, kmlRes.first().lat, 0.0001)
+        assertEquals(111.01234, kmlRes.first().lng, 0.0001)
+        assertTrue(kmlRes.first().isMolisFriendly)
+
+        val gpx = """
+            <gpx><wpt lat="-6.917" lon="107.619"><name>Swap Oyika Bandung</name><desc>24 jam</desc></wpt></gpx>
+        """.trimIndent()
+        val gpxRes = SpkluImportParser.parseGpx(gpx)
+        assertEquals(1, gpxRes.size)
+        assertTrue(gpxRes.first().isMolisFriendly)
+        assertEquals("Swap Baterai / SPBKLU", gpxRes.first().socketType)
+
+        val geoJson = """
+            {"type":"FeatureCollection","features":[
+              {"type":"Feature","geometry":{"type":"Point","coordinates":[106.827,-6.175]},
+               "properties":{"name":"SPKLU Monas","powerKw":22,"socket":"Type 2 AC"}}
+            ]}
+        """.trimIndent()
+        val jsonRes = SpkluImportParser.parseJsonOrGeoJson(geoJson)
+        assertEquals(1, jsonRes.size)
+        assertEquals(22.0, jsonRes.first().powerKw!!, 0.01)
+        assertFalse(jsonRes.first().isMolisFriendly)
+
+        val csv = """
+            Title,URL,Note
+            Warung Molis Solo,"https://www.google.com/maps?q=-7.56,110.82",Colokan Schuko aman
+            SPLU Stasiun,https://maps.google.com/?q=-7.57,110.83,24 jam
+        """.trimIndent()
+        val csvRes = SpkluImportParser.parseCsv(csv)
+        assertEquals(2, csvRes.size)
+        assertEquals("Warung Molis Solo", csvRes.first().name)
+        assertEquals(-7.56, csvRes.first().lat, 0.001)
+        assertTrue(csvRes.first().isMolisFriendly)
+        assertEquals("SPLU Stasiun", csvRes[1].name)
+        assertEquals(-7.57, csvRes[1].lat, 0.001)
     }
 }

@@ -508,18 +508,25 @@ object RemoteApisService {
         lat: Double,
         lng: Double,
         radiusMeters: Int = 15000,
-        ocmApiKey: String = ""
+        ocmApiKey: String = "",
+        customFeedUrl: String = ""
     ): List<SpkluStation> = withContext(Dispatchers.IO) {
         val results = LinkedHashMap<String, SpkluStation>()
         val origin = GeoPointX(lat, lng)
 
-        // 1. Overpass OSM Query
+        // 1. Overpass OSM Query (SPKLU + SPLU + SPBKLU/Swap Baterai + Schuko Molis)
         try {
-            val query = "[out:json][timeout:12];(node[\"amenity\"=\"charging_station\"](around:$radiusMeters,$lat,$lng);way[\"amenity\"=\"charging_station\"](around:$radiusMeters,$lat,$lng););out center 30;"
+            val query = "[out:json][timeout:14];(" +
+                "node[\"amenity\"=\"charging_station\"](around:$radiusMeters,$lat,$lng);" +
+                "way[\"amenity\"=\"charging_station\"](around:$radiusMeters,$lat,$lng);" +
+                "node[\"amenity\"=\"vending_machine\"][\"vending\"=\"batteries\"](around:$radiusMeters,$lat,$lng);" +
+                "node[\"socket:schuko\"](around:$radiusMeters,$lat,$lng);" +
+                "node[\"name\"~\"SPLU|SPKLU|SPBKLU|molis\",i](around:$radiusMeters,$lat,$lng);" +
+                ");out center 60;"
             val body = httpPostForm(
                 "https://overpass-api.de/api/interpreter",
                 "data=${URLEncoder.encode(query, "UTF-8")}",
-                12_000
+                14_000
             )
             if (body != null) {
                 val j = JSONObject(body)
@@ -539,10 +546,48 @@ object RemoteApisService {
                     }
                     if (sLat.isNaN() || sLng.isNaN()) continue
                     val tags = el.optJSONObject("tags") ?: JSONObject()
-                    val name = tags.optString("name").ifBlank { "SPKLU Umum" }
+                    val isSwap = tags.optString("vending").equals("batteries", ignoreCase = true)
+                    val hasSchuko = tags.has("socket:schuko")
+                    val hasType2 = tags.has("socket:type2")
+                    val hasCcs = tags.has("socket:type2_combo") || tags.has("socket:chademo")
+                    val defaultName = when {
+                        isSwap -> "SPBKLU / Swap Baterai"
+                        hasSchuko -> "SPLU / Colokan Molis"
+                        else -> "SPKLU Umum"
+                    }
+                    val name = tags.optString("name").ifBlank { defaultName }
                     val op = tags.optString("operator")
                         .ifBlank { tags.optString("brand") }
-                        .ifBlank { "PLN / OSM" }
+                        .ifBlank { if (isSwap) "Swap Komunitas" else "PLN / OSM" }
+                    val socket = buildList {
+                        if (hasSchuko) add("Schuko Molis")
+                        if (isSwap) add("Swap Baterai")
+                        if (hasType2) add("Type 2 AC")
+                        if (hasCcs) add("DC Fast")
+                    }.joinToString(" / ").ifBlank {
+                        if (name.contains("splu", true)) "SPLU / Schuko" else "SPKLU Universal"
+                    }
+                    val kwStr = tags.optString("socket:type2:output")
+                        .ifBlank { tags.optString("socket:schuko:output") }
+                        .ifBlank { tags.optString("max_power") }
+                    val parsedKw = Regex("""(\d+(?:\.\d+)?)""").find(kwStr)?.groupValues?.getOrNull(1)?.toDoubleOrNull()?.let { v ->
+                        if (kwStr.contains("w", true) && !kwStr.contains("kw", true) && v >= 100.0) v / 1000.0 else v
+                    }
+                    val noteParts = buildList {
+                        tags.optString("opening_hours").takeIf { it.isNotBlank() }?.let { add("Jam: $it") }
+                        tags.optString("fee").takeIf { it.isNotBlank() }?.let {
+                            add(if (it.equals("no", true)) "Gratis" else if (it.equals("yes", true)) "Berbayar" else "Biaya: $it")
+                        }
+                        tags.optString("description").ifBlank { tags.optString("note") }
+                            .takeIf { it.isNotBlank() }?.let { add(it) }
+                    }
+                    val notes = noteParts.joinToString(" • ").take(160)
+                    val isMolis = isSwap ||
+                        hasSchuko ||
+                        tags.optString("motorcycle").equals("yes", true) ||
+                        tags.optString("scooter").equals("yes", true) ||
+                        SpkluImportParser.inferMolisFriendly(name, socket, notes, parsedKw)
+
                     val dist = RoutePhysics.haversineKm(origin, GeoPointX(sLat, sLng))
                     val id = "osm_${el.opt("id")}"
                     results[id] = SpkluStation(
@@ -551,8 +596,12 @@ object RemoteApisService {
                         operatorName = op,
                         lat = sLat,
                         lng = sLng,
-                        socketType = if (tags.has("socket:type2")) "Type 2 / AC" else "SPKLU Universal",
-                        distanceKm = dist
+                        socketType = socket,
+                        powerKw = parsedKw,
+                        distanceKm = dist,
+                        notes = notes,
+                        sourceLabel = "OSM",
+                        isMolisFriendly = isMolis
                     )
                 }
             }
@@ -576,7 +625,6 @@ object RemoteApisService {
                     val sLat = addr.optDouble("Latitude", Double.NaN)
                     val sLng = addr.optDouble("Longitude", Double.NaN)
                     if (sLat.isNaN() || sLng.isNaN()) continue
-                    // Deduplicate against OSM stations within 80m
                     val duplicate = results.values.any { existing ->
                         RoutePhysics.haversineKm(GeoPointX(existing.lat, existing.lng), GeoPointX(sLat, sLng)) < 0.08
                     }
@@ -598,21 +646,52 @@ object RemoteApisService {
                             }
                         }
                     }
+                    val ocmNotes = listOf(
+                        addr.optString("AccessComments"),
+                        item.optString("GeneralComments"),
+                        item.optString("UsageCost")
+                    ).filter { it.isNotBlank() && it != "null" }.joinToString(" • ").take(160)
+                    val title = addr.optString("Title").ifBlank { "Stasiun SPKLU" }
                     val dist = RoutePhysics.haversineKm(origin, GeoPointX(sLat, sLng))
                     val id = "ocm_${item.opt("ID")}"
                     results[id] = SpkluStation(
                         id = id,
-                        name = addr.optString("Title").ifBlank { "Stasiun SPKLU" },
+                        name = title,
                         operatorName = opInfo?.optString("Title")?.ifBlank { "OpenChargeMap" } ?: "OpenChargeMap",
                         lat = sLat,
                         lng = sLng,
                         socketType = socket,
                         powerKw = kw,
-                        distanceKm = dist
+                        distanceKm = dist,
+                        notes = ocmNotes,
+                        sourceLabel = "OCM",
+                        isMolisFriendly = SpkluImportParser.inferMolisFriendly(title, socket, ocmNotes, kw)
                     )
                 }
             }
         } catch (_: Exception) {
+        }
+
+        // 3. Optional Custom Community JSON / GeoJSON Feed (e.g. GitHub Raw URL)
+        val cleanFeed = customFeedUrl.trim()
+        if (cleanFeed.startsWith("https://")) {
+            try {
+                val body = httpGet(cleanFeed, 10_000)
+                if (body != null) {
+                    val feedStations = SpkluImportParser.parseJsonOrGeoJson(body, sourceLabel = "Feed JSON")
+                    for (fs in feedStations) {
+                        val d = RoutePhysics.haversineKm(origin, GeoPointX(fs.lat, fs.lng))
+                        if (d > (radiusMeters / 1000.0) * 2.0) continue
+                        val dup = results.values.any { existing ->
+                            RoutePhysics.haversineKm(GeoPointX(existing.lat, existing.lng), GeoPointX(fs.lat, fs.lng)) < 0.06
+                        }
+                        if (!dup) {
+                            results[fs.id] = fs.copy(distanceKm = d)
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
         }
 
         results.values.sortedBy { it.distanceKm ?: 999.0 }

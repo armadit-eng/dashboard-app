@@ -2,7 +2,10 @@ package com.dashboard.app.dashboard_app.ui.screens
 
 import android.content.Intent
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -110,6 +113,7 @@ import com.dashboard.app.dashboard_app.model.SavedPlace
 import com.dashboard.app.dashboard_app.model.SpkluStation
 import com.dashboard.app.dashboard_app.service.RemoteApisService
 import com.dashboard.app.dashboard_app.service.TileCacheService
+import com.dashboard.app.dashboard_app.ui.components.AddSpkluDialog
 import com.dashboard.app.dashboard_app.ui.components.CatatNamaDialog
 import com.dashboard.app.dashboard_app.ui.components.FavoritesBottomSheet
 import com.dashboard.app.dashboard_app.ui.components.MapPlacePopupCard
@@ -117,6 +121,8 @@ import com.dashboard.app.dashboard_app.ui.components.MultiStopPlannerSheet
 import com.dashboard.app.dashboard_app.ui.components.OfflineMapSection
 import com.dashboard.app.dashboard_app.ui.components.RoutePreviewSheetCard
 import com.dashboard.app.dashboard_app.ui.components.SlippyMapView
+import com.dashboard.app.dashboard_app.ui.components.SpkluBottomSheet
+import com.dashboard.app.dashboard_app.ui.components.SpkluDetailDialog
 import com.dashboard.app.dashboard_app.ui.components.TappedMapPlace
 import com.dashboard.app.dashboard_app.ui.components.TripPrepDialog
 import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
@@ -143,7 +149,9 @@ fun NavigationScreen(
     onStartNavigation: () -> Unit,
     onStopNavigation: () -> Unit,
     onRefreshSpklu: ((() -> Unit)?) -> Unit,
-    onAddUserSpklu: (name: String, socket: String, lat: Double, lng: Double) -> Unit,
+    onAddUserSpklu: (name: String, socket: String, lat: Double, lng: Double, powerKw: Double?, notes: String, isMolis: Boolean) -> Unit,
+    onRemoveUserSpklu: (String) -> Unit,
+    onImportSpkluUri: (Uri, String?, (Int, String) -> Unit) -> Unit,
     onAddFieldNoteAt: (name: String, category: String, note: String, lat: Double, lng: Double) -> Unit,
     onSavePlace: (SavedPlace) -> Unit,
     onRemoveSavedPlace: (String) -> Unit,
@@ -186,6 +194,24 @@ fun NavigationScreen(
     var showFavoritesSheet by remember { mutableStateOf(false) }
     var showGpsDiag by remember { mutableStateOf(false) }
     var spkluDialogItem by remember { mutableStateOf<SpkluStation?>(null) }
+    var addSpkluTarget by remember { mutableStateOf<Pair<String, GeoPointX>?>(null) }
+    var spkluImportFeedback by remember { mutableStateOf<String?>(null) }
+
+    val spkluImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            val fileName = runCatching {
+                context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    }
+            }.getOrNull() ?: uri.lastPathSegment
+            onImportSpkluUri(uri, fileName) { _, msg ->
+                spkluImportFeedback = msg
+            }
+        }
+    }
 
     var showRoutePreview by remember { mutableStateOf(false) }
     var previewDetailsExpanded by remember { mutableStateOf(true) }
@@ -361,29 +387,55 @@ fun NavigationScreen(
     }
 
     spkluDialogItem?.let { sp ->
-        AlertDialog(
-            onDismissRequest = { spkluDialogItem = null },
-            title = { Text(sp.name) },
-            text = { Text("${sp.operatorName}\nSoket: ${sp.socketType}") },
-            confirmButton = {
-                Button(onClick = {
-                    spkluDialogItem = null
-                    onAddStop(
-                        PlannedStop(
-                            id = "sp_${sp.id}",
-                            label = sp.name,
-                            lat = sp.lat,
-                            lng = sp.lng,
-                            isSpklu = true
-                        )
+        SpkluDetailDialog(
+            station = sp,
+            hasActiveRoute = state.plannedStops.isNotEmpty(),
+            onRouteDirect = {
+                spkluDialogItem = null
+                onSetSingleDestination(
+                    PlannedStop(
+                        id = "sp_${sp.id}",
+                        label = sp.name,
+                        lat = sp.lat,
+                        lng = sp.lng,
+                        isSpklu = true
                     )
-                }) {
-                    Text("Tambahkan ke Rute")
-                }
+                )
             },
-            dismissButton = {
-                TextButton(onClick = { spkluDialogItem = null }) { Text("Tutup") }
-            }
+            onAddAsStop = {
+                spkluDialogItem = null
+                onAddStop(
+                    PlannedStop(
+                        id = "sp_${sp.id}",
+                        label = sp.name,
+                        lat = sp.lat,
+                        lng = sp.lng,
+                        isSpklu = true
+                    )
+                )
+            },
+            onOpenExternalMaps = {
+                val uri = Uri.parse(
+                    "geo:${sp.lat},${sp.lng}?q=${sp.lat},${sp.lng}(${Uri.encode(sp.name)})"
+                )
+                runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                    .onFailure {
+                        onShareText("https://www.google.com/maps?q=${sp.lat},${sp.lng}", sp.name)
+                    }
+            },
+            onDismiss = { spkluDialogItem = null }
+        )
+    }
+
+    addSpkluTarget?.let { (initialName, targetPt) ->
+        AddSpkluDialog(
+            initialName = initialName,
+            targetPoint = targetPt,
+            onSave = { n, sock, lat, lng, kw, notes, isMolis ->
+                onAddUserSpklu(n, sock, lat, lng, kw, notes, isMolis)
+                spkluImportFeedback = "Tersimpan: $n"
+            },
+            onDismiss = { addSpkluTarget = null }
         )
     }
 
@@ -547,149 +599,55 @@ fun NavigationScreen(
 
     if (showSpkluSheet) {
         var loadingSpklu by remember { mutableStateOf(false) }
-        var showAddSpklu by remember { mutableStateOf(false) }
         LaunchedEffect(Unit) {
-            if (state.nearbySpklu.isEmpty()) {
+            if (state.nearbySpklu.none { !it.isUserAdded }) {
                 loadingSpklu = true
                 onRefreshSpklu { loadingSpklu = false }
             }
         }
-        if (showAddSpklu) {
-            var name by remember { mutableStateOf("") }
-            var socket by remember { mutableStateOf("Type 2 / Colokan Rumah 16A") }
-            AlertDialog(
-                onDismissRequest = { showAddSpklu = false },
-                title = { Text("Tandai Titik Charger / SPKLU") },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Nama Lokasi") })
-                        OutlinedTextField(value = socket, onValueChange = { socket = it }, label = { Text("Jenis Soket") })
-                    }
-                },
-                confirmButton = {
-                    Button(onClick = {
-                        val loc = state.gpsState.location ?: mapCenter
-                        if (name.isNotBlank()) {
-                            onAddUserSpklu(name.trim(), socket.trim(), loc.lat, loc.lng)
-                        }
-                        showAddSpklu = false
-                    }) {
-                        Text("Simpan")
-                    }
-                },
-                dismissButton = { TextButton(onClick = { showAddSpklu = false }) { Text("Batal") } }
-            )
-        }
-        var ocmKeyDraft by remember(state.settings.ocmApiKey) {
-            mutableStateOf(state.settings.ocmApiKey)
-        }
-        ModalBottomSheet(
-            onDismissRequest = { showSpkluSheet = false },
-            containerColor = c.surfaceCard
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("SPKLU & Charger Terdekat", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
-                    TextButton(onClick = { showAddSpklu = true }) {
-                        Text("+ Tambah")
-                    }
-                    IconButton(onClick = {
-                        loadingSpklu = true
-                        onRefreshSpklu { loadingSpklu = false }
-                    }) {
-                        Icon(Icons.Rounded.Refresh, contentDescription = "Muat ulang SPKLU")
-                    }
-                }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedTextField(
-                        value = ocmKeyDraft,
-                        onValueChange = { ocmKeyDraft = it },
-                        label = { Text("OpenChargeMap API Key") },
-                        singleLine = true,
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("ocm_api_key_input")
+        SpkluBottomSheet(
+            stations = state.nearbySpklu,
+            settings = state.settings,
+            loading = loadingSpklu,
+            importFeedback = spkluImportFeedback,
+            onDismissImportFeedback = { spkluImportFeedback = null },
+            onRefresh = {
+                loadingSpklu = true
+                onRefreshSpklu { loadingSpklu = false }
+            },
+            onOpenAddDialog = {
+                addSpkluTarget = "" to (state.gpsState.location ?: mapCenter)
+            },
+            onOpenImportPicker = {
+                spkluImportLauncher.launch(arrayOf("*/*"))
+            },
+            onSearchInGoogleMaps = {
+                val center = state.gpsState.location ?: mapCenter
+                val uri = Uri.parse(
+                    String.format(
+                        Locale.US,
+                        "geo:%.5f,%.5f?q=%s",
+                        center.lat,
+                        center.lng,
+                        Uri.encode("charger molis OR SPLU OR SPKLU")
                     )
-                    Button(
-                        onClick = {
-                            onUpdateSettings(state.settings.copy(ocmApiKey = ocmKeyDraft.trim()))
-                            loadingSpklu = true
-                            onRefreshSpklu { loadingSpklu = false }
-                        },
-                        modifier = Modifier
-                            .height(48.dp)
-                            .testTag("save_ocm_key_button")
-                    ) {
-                        Text("Muat")
+                )
+                runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                    .onFailure {
+                        val web = Uri.parse("https://www.google.com/maps/search/?api=1&query=charger+molis+SPKLU")
+                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, web)) }
                     }
-                }
-                if (loadingSpklu) {
-                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                }
-                if (state.nearbySpklu.isEmpty()) {
-                    Text(
-                        "Belum ada titik ditemukan dalam radius 20 km.",
-                        color = c.textMuted,
-                        modifier = Modifier.padding(vertical = 20.dp)
-                    )
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.heightIn(max = 380.dp),
-                        contentPadding = PaddingValues(bottom = 24.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(state.nearbySpklu.take(15)) { s ->
-                            Surface(
-                                shape = RoundedCornerShape(14.dp),
-                                color = c.surfaceElevated,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        showSpkluSheet = false
-                                        onAddStop(
-                                            PlannedStop(
-                                                id = "sp_${s.id}",
-                                                label = s.name,
-                                                lat = s.lat,
-                                                lng = s.lng,
-                                                isSpklu = true
-                                            )
-                                        )
-                                    }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Rounded.EvStation, contentDescription = null, tint = c.regen)
-                                    Spacer(Modifier.width(10.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(s.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        Text("${s.operatorName} • ${s.socketType}", fontSize = 12.sp, color = c.textMuted)
-                                    }
-                                    if (s.distanceKm != null) {
-                                        Text(String.format(Locale.US, "%.1f km", s.distanceKm), fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+            },
+            onUpdateSettings = onUpdateSettings,
+            onSelectStation = { s ->
+                showSpkluSheet = false
+                spkluDialogItem = s
+                followRider = false
+                mapCenter = GeoPointX(s.lat, s.lng)
+            },
+            onDeleteUserStation = onRemoveUserSpklu,
+            onDismiss = { showSpkluSheet = false }
+        )
     }
 
     if (showNotesSheet) {
@@ -1495,6 +1453,10 @@ fun NavigationScreen(
                         context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(osmUrl)))
                     }
                 },
+                onSaveAsSpklu = {
+                    addSpkluTarget = tp.name to tp.point
+                    tappedPlace = null
+                },
                 onDismiss = { tappedPlace = null },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -1569,6 +1531,11 @@ fun NavigationScreen(
                     onStopNavigation()
                 },
                 onOpenMultiStop = { showMultiStopSheet = true },
+                onSaveDestAsSpklu = {
+                    if (destStop != null) {
+                        addSpkluTarget = destLabel to GeoPointX(destStop.lat, destStop.lng)
+                    }
+                },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(start = 12.dp, end = 12.dp, bottom = 92.dp)

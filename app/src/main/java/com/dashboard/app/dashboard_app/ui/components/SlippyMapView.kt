@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bookmark
+import androidx.compose.material.icons.rounded.ElectricMoped
 import androidx.compose.material.icons.rounded.EvStation
 import androidx.compose.material.icons.rounded.Navigation
 import androidx.compose.material3.Icon
@@ -311,28 +312,35 @@ fun SlippyMapView(
             }
         }
 
-        // 3. SPKLU Pins
-        nearbySpklu.take(20).forEach { s ->
+        // 3. SPKLU & Charger Molis Pins
+        nearbySpklu.take(45).forEach { s ->
             val pos = geoToScreen(GeoPointX(s.lat, s.lng))
-            if (pos.x in -40f..(widthPx + 40f) && pos.y in -40f..(heightPx + 40f)) {
-                val dpX = with(density) { pos.x.toDp() - 18.dp }
-                val dpY = with(density) { pos.y.toDp() - 18.dp }
-                Surface(
+            if (pos.x in -48f..(widthPx + 48f) && pos.y in -48f..(heightPx + 48f)) {
+                val dpX = with(density) { pos.x.toDp() - 24.dp }
+                val dpY = with(density) { pos.y.toDp() - 24.dp }
+                val pinTint = if (s.isMolisFriendly) c.accent else c.regen
+                Box(
                     modifier = Modifier
                         .offset(x = dpX, y = dpY)
-                        .size(36.dp)
+                        .size(48.dp)
                         .clickable { onSpkluClick(s) },
-                    shape = CircleShape,
-                    color = c.surfaceCard,
-                    border = BorderStroke(2.dp, c.regen)
+                    contentAlignment = Alignment.Center
                 ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            Icons.Rounded.EvStation,
-                            contentDescription = s.name,
-                            tint = c.regen,
-                            modifier = Modifier.size(18.dp)
-                        )
+                    Surface(
+                        modifier = Modifier.size(34.dp),
+                        shape = CircleShape,
+                        color = c.surfaceCard,
+                        border = BorderStroke(2.dp, pinTint),
+                        shadowElevation = 3.dp
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                if (s.isMolisFriendly) Icons.Rounded.ElectricMoped else Icons.Rounded.EvStation,
+                                contentDescription = s.name,
+                                tint = pinTint,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
                 }
             }

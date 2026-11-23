@@ -199,7 +199,10 @@ data class SpkluStation(
     val socketType: String = "Type 2 / CCS2",
     val powerKw: Double? = null,
     val isUserAdded: Boolean = false,
-    val distanceKm: Double? = null
+    val distanceKm: Double? = null,
+    val notes: String = "",
+    val sourceLabel: String = "",
+    val isMolisFriendly: Boolean = false
 )
 
 @Serializable

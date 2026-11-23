@@ -49,6 +49,8 @@ import com.dashboard.app.dashboard_app.model.WeatherData
 import com.dashboard.app.dashboard_app.service.MidFrameRenderer
 import com.dashboard.app.dashboard_app.service.PersistenceService
 import com.dashboard.app.dashboard_app.service.RemoteApisService
+import com.dashboard.app.dashboard_app.service.SpkluImportParser
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -57,6 +59,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
@@ -204,6 +207,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     tripHistory = trips,
                     savedPlaces = places,
                     userSpklu = uSpklu,
+                    nearbySpklu = if (cur.nearbySpklu.isEmpty()) uSpklu else cur.nearbySpklu,
                     fieldNotes = notes,
                     maintLogs = maint,
                     calibLogs = calib,
@@ -1248,11 +1252,16 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             val apiFound = RemoteApisService.fetchNearbySpklu(
                 lat = origin.lat,
                 lng = origin.lng,
-                ocmApiKey = cur.settings.ocmApiKey
+                ocmApiKey = cur.settings.ocmApiKey,
+                customFeedUrl = cur.settings.customSpkluFeedUrl
             )
             val updatedUser = cur.userSpklu.map { u ->
                 val d = RoutePhysics.haversineKm(origin, GeoPointX(u.lat, u.lng))
-                u.copy(distanceKm = d)
+                u.copy(
+                    distanceKm = d,
+                    sourceLabel = u.sourceLabel.ifBlank { "Pribadi" },
+                    isMolisFriendly = u.isMolisFriendly || SpkluImportParser.inferMolisFriendly(u.name, u.socketType, u.notes, u.powerKw)
+                )
             }
             val merged = (updatedUser + apiFound).sortedBy { it.distanceKm ?: 999.0 }
             _uiState.update { it.copy(nearbySpklu = merged) }
@@ -1260,20 +1269,91 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun addUserSpklu(name: String, socket: String, lat: Double, lng: Double) {
+    fun addUserSpklu(
+        name: String,
+        socket: String,
+        lat: Double,
+        lng: Double,
+        powerKw: Double? = null,
+        notes: String = "",
+        isMolisFriendly: Boolean = true
+    ) {
+        val origin = _uiState.value.gpsState.location
+        val dist = origin?.let { RoutePhysics.haversineKm(it, GeoPointX(lat, lng)) }
         val s = SpkluStation(
             id = "usr_${System.currentTimeMillis()}",
             name = name,
-            operatorName = "Catatan Pengguna",
+            operatorName = if (isMolisFriendly) "Komunitas / Pribadi" else "Catatan Pengguna",
             lat = lat,
             lng = lng,
             socketType = socket,
-            isUserAdded = true
+            powerKw = powerKw,
+            isUserAdded = true,
+            distanceKm = dist,
+            notes = notes,
+            sourceLabel = "Pribadi",
+            isMolisFriendly = isMolisFriendly
         )
         val next = listOf(s) + _uiState.value.userSpklu
-        _uiState.update { it.copy(userSpklu = next) }
+        _uiState.update { cur ->
+            val merged = (listOf(s) + cur.nearbySpklu.filterNot { it.id == s.id })
+                .sortedBy { it.distanceKm ?: 999.0 }
+            cur.copy(userSpklu = next, nearbySpklu = merged)
+        }
         viewModelScope.launch { storage.saveUserSpklu(next) }
-        refreshNearbySpklu()
+    }
+
+    fun removeUserSpklu(id: String) {
+        val next = _uiState.value.userSpklu.filterNot { it.id == id }
+        _uiState.update { cur ->
+            cur.copy(
+                userSpklu = next,
+                nearbySpklu = cur.nearbySpklu.filterNot { it.id == id }
+            )
+        }
+        viewModelScope.launch { storage.saveUserSpklu(next) }
+    }
+
+    fun importSpkluFromUri(uri: Uri, fileName: String?, onResult: (Int, String) -> Unit) {
+        viewModelScope.launch {
+            val parsed = withContext(Dispatchers.IO) {
+                runCatching {
+                    val bytes = getApplication<Application>().contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    if (bytes != null) SpkluImportParser.parseBytes(bytes, fileName) else emptyList()
+                }.getOrDefault(emptyList())
+            }
+            if (parsed.isEmpty()) {
+                onResult(0, "Tidak ada titik SPKLU/charger valid ditemukan di file tersebut.")
+                return@launch
+            }
+            val cur = _uiState.value
+            val existing = cur.userSpklu.toMutableList()
+            var addedCount = 0
+            for (item in parsed) {
+                val dup = existing.any { e ->
+                    RoutePhysics.haversineKm(GeoPointX(e.lat, e.lng), GeoPointX(item.lat, item.lng)) < 0.03
+                }
+                if (!dup) {
+                    existing.add(0, item)
+                    addedCount++
+                }
+            }
+            val origin = cur.gpsState.location
+            val updatedUser = existing.map { u ->
+                val d = origin?.let { RoutePhysics.haversineKm(it, GeoPointX(u.lat, u.lng)) } ?: u.distanceKm
+                u.copy(distanceKm = d)
+            }
+            val apiOnly = cur.nearbySpklu.filterNot { it.isUserAdded }
+            val merged = (updatedUser + apiOnly).sortedBy { it.distanceKm ?: 999.0 }
+            _uiState.update { it.copy(userSpklu = updatedUser, nearbySpklu = merged) }
+            storage.saveUserSpklu(updatedUser)
+            val msg = if (addedCount > 0) {
+                "$addedCount titik charger berhasil diimpor (${parsed.size - addedCount} duplikat dilewati)."
+            } else {
+                "Semua ${parsed.size} titik sudah tersimpan sebelumnya."
+            }
+            onResult(addedCount, msg)
+        }
     }
 
     fun addFieldNote(name: String, category: String, note: String) {

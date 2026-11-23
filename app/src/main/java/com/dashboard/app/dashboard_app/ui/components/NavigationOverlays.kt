@@ -36,6 +36,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Directions
 import androidx.compose.material.icons.rounded.EditNote
+import androidx.compose.material.icons.rounded.EvStation
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.LocationOn
@@ -115,6 +116,7 @@ fun MapPlacePopupCard(
     onOpenInExternalMaps: () -> Unit,
     onOpenCatatNama: () -> Unit,
     onReportToOsm: () -> Unit,
+    onSaveAsSpklu: () -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -292,6 +294,18 @@ fun MapPlacePopupCard(
                 Text("Lapor OSM", fontSize = 12.5.sp, maxLines = 1)
             }
         }
+        Spacer(Modifier.height(6.dp))
+        OutlinedButton(
+            onClick = onSaveAsSpklu,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp)
+                .testTag("place_save_spklu_button")
+        ) {
+            Icon(Icons.Rounded.EvStation, contentDescription = null, tint = c.regen, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Simpan sebagai SPKLU / Charger Molis", fontSize = 12.5.sp, maxLines = 1)
+        }
     }
 }
 
@@ -316,6 +330,7 @@ fun RoutePreviewSheetCard(
     onStartOrPrepareNav: () -> Unit,
     onStopNavigation: () -> Unit,
     onOpenMultiStop: () -> Unit,
+    onSaveDestAsSpklu: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val c = LocalCockpitColors.current
@@ -361,6 +376,18 @@ fun RoutePreviewSheetCard(
                     "${String.format(Locale.US, "%.1f", state.remainingDistKm)} km • ${state.etaMin.roundToInt()} mnt",
                     fontSize = 12.5.sp,
                     color = c.textMuted
+                )
+            }
+            IconButton(
+                onClick = onSaveDestAsSpklu,
+                modifier = Modifier
+                    .size(48.dp)
+                    .testTag("route_preview_save_spklu_button")
+            ) {
+                Icon(
+                    Icons.Rounded.EvStation,
+                    contentDescription = "Simpan tujuan sebagai SPKLU / Charger Molis",
+                    tint = c.regen
                 )
             }
             IconButton(

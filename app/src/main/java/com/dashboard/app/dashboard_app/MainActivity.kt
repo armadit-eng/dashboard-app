@@ -606,8 +606,19 @@ private fun MainTabContent(
                 onStartNavigation = { viewModel.startNavigation() },
                 onStopNavigation = { viewModel.stopNavigation() },
                 onRefreshSpklu = { done -> viewModel.refreshNearbySpklu(done) },
-                onAddUserSpklu = { n, sock, lat, lng ->
-                    viewModel.addUserSpklu(n, sock, lat, lng)
+                onAddUserSpklu = { n, sock, lat, lng, kw, notes, isMolis ->
+                    viewModel.addUserSpklu(n, sock, lat, lng, kw, notes, isMolis)
+                    onShowSnackbar("Titik charger disimpan: $n")
+                },
+                onRemoveUserSpklu = { id ->
+                    viewModel.removeUserSpklu(id)
+                    onShowSnackbar("Titik charger dihapus.")
+                },
+                onImportSpkluUri = { uri, fileName, cb ->
+                    viewModel.importSpkluFromUri(uri, fileName) { count, msg ->
+                        onShowSnackbar(msg)
+                        cb(count, msg)
+                    }
                 },
                 onAddFieldNoteAt = { n, cat, note, lat, lng ->
                     viewModel.addFieldNoteAt(n, cat, note, lat, lng)
