@@ -23,6 +23,7 @@ import androidx.compose.material.icons.automirrored.rounded.Sort
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -62,6 +63,7 @@ import com.dashboard.app.dashboard_app.viewmodel.DashboardUiState
 import java.util.Locale
 import kotlin.math.roundToInt
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DiagnosisScreen(
     state: DashboardUiState,
@@ -260,7 +262,7 @@ private fun MotorDiagnosisTab(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 private fun DualBatteryTab(
     state: DashboardUiState,

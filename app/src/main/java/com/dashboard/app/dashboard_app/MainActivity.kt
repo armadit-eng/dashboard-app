@@ -1,6 +1,7 @@
 package com.dashboard.app.dashboard_app
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -251,7 +252,7 @@ private fun DashboardRootApp(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { res ->
         val data = res.data
-        if (res.resultCode == ComponentActivity.RESULT_OK && data != null) {
+        if (res.resultCode == Activity.RESULT_OK && data != null) {
             viewModel.startScreenMirrorWithGrant(res.resultCode, data)
             scope.launch { snackbarHostState.showSnackbar("Screen mirror ke MID dimulai.") }
         } else {
@@ -289,135 +290,6 @@ private fun DashboardRootApp(
                         .fillMaxSize()
                         .windowInsetsPadding(WindowInsets.statusBars)
 
-                    @Composable
-                    fun TabContent() {
-                        Box(
-                            modifier = Modifier.fillMaxSize(),
-                            contentAlignment = Alignment.TopCenter
-                        ) {
-                            val boundedMod = if (currentTab == 2) {
-                                screenMod
-                            } else {
-                                screenMod.widthIn(max = 760.dp)
-                            }
-                            when (currentTab) {
-                                0 -> HomeCockpitScreen(
-                                    state = state,
-                                    onOpenDeviceSheet = {
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                                            val missingBt = arrayOf(
-                                                Manifest.permission.BLUETOOTH_SCAN,
-                                                Manifest.permission.BLUETOOTH_CONNECT
-                                            ).filterNot(::isGranted).toTypedArray()
-                                            if (missingBt.isNotEmpty()) {
-                                                singleGroupPermLauncher.launch(missingBt)
-                                            }
-                                        }
-                                        showDeviceSheet = true
-                                    },
-                                    onRefreshWeather = { viewModel.refreshWeatherAndLocation() },
-                                    onOpenTab = { tab -> currentTab = tab },
-                                    onOpenRidingCockpit = { navController.navigate(RouteRidingCockpit) },
-                                    onOpenMotovlogCam = { navController.navigate(RouteMotovlogCam) },
-                                    onSaveTrip = {
-                                        viewModel.saveCurrentTripAndReset()
-                                        scope.launch { snackbarHostState.showSnackbar("Trip disimpan ke riwayat.") }
-                                    },
-                                    onResetTrip = { viewModel.resetLiveTrip() },
-                                    onRouteToParked = { stop ->
-                                        viewModel.setSingleDestination(stop)
-                                        currentTab = 2
-                                    },
-                                    onAddMaintenanceLog = { odo, type ->
-                                        viewModel.addMaintenanceLog(odo, type)
-                                        scope.launch { snackbarHostState.showSnackbar("Catatan servis tersimpan.") }
-                                    },
-                                    onToggleDevSim = { viewModel.toggleDevTelemetrySimulation(it) },
-                                    onSendMotorAt = { viewModel.sendMotorCommand(it) },
-                                    modifier = boundedMod
-                                )
-                                1 -> DiagnosisScreen(
-                                    state = state,
-                                    onRestoreOdo = { viewModel.restoreMotorOdo(it) },
-                                    onSetInvertB2Current = {
-                                        viewModel.updateSettings(state.settings.copy(invertB2Current = it))
-                                    },
-                                    onSendEsp2Command = { viewModel.sendEspCommand(2, it) },
-                                    modifier = boundedMod
-                                )
-                                2 -> NavigationScreen(
-                                    state = state,
-                                    onSetSingleDestination = { viewModel.setSingleDestination(it) },
-                                    onAddStop = { viewModel.addStopAndRoute(it) },
-                                    onRemoveStopAt = { viewModel.removeStopAt(it) },
-                                    onClearRoute = { viewModel.clearRoute() },
-                                    onStartNavigation = { viewModel.startNavigation() },
-                                    onStopNavigation = { viewModel.stopNavigation() },
-                                    onRefreshSpklu = { done -> viewModel.refreshNearbySpklu(done) },
-                                    onAddUserSpklu = { n, sock, lat, lng ->
-                                        viewModel.addUserSpklu(n, sock, lat, lng)
-                                    },
-                                    onAddFieldNote = { n, cat, note ->
-                                        viewModel.addFieldNote(n, cat, note)
-                                    },
-                                    onSavePlace = {
-                                        viewModel.savePlace(it)
-                                        scope.launch { snackbarHostState.showSnackbar("Tempat disimpan: ${it.name}") }
-                                    },
-                                    onStartMidStreaming = { viewModel.startMidStreaming() },
-                                    onStopMidStreaming = { viewModel.stopMidStreaming() },
-                                    onRequestScreenMirror = {
-                                        val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                                        projectionLauncher.launch(mpm.createScreenCaptureIntent())
-                                    },
-                                    onStopScreenMirror = { viewModel.stopScreenMirror() },
-                                    onPickWallpaperImage = {
-                                        pickTarget = PhotoPickTarget.WALLPAPER
-                                        photoPickerLauncher.launch(
-                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                        )
-                                    },
-                                    onUpdateSettings = { viewModel.updateSettings(it) },
-                                    onSetRideLocked = { viewModel.setRideLocked(it) },
-                                    onRetryGps = { requestLocationOrRetryGps() },
-                                    gpsDiagTextProvider = { viewModel.gpsDiagText() },
-                                    onShareText = ::launchShare,
-                                    modifier = screenMod
-                                )
-                                3 -> StatsScreen(
-                                    state = state,
-                                    onApplyCalFactor = { factor ->
-                                        viewModel.updateSettings(state.settings.copy(routeCalFactor = factor))
-                                        scope.launch { snackbarHostState.showSnackbar("Faktor kalibrasi diterapkan ($factor)") }
-                                    },
-                                    onDeleteTrip = { viewModel.deleteTrip(it) },
-                                    onShareText = ::launchShare,
-                                    modifier = boundedMod
-                                )
-                                else -> GarageAccountScreen(
-                                    state = state,
-                                    onUpdateSettings = { viewModel.updateSettings(it) },
-                                    onOpenMotovlogCam = { navController.navigate(RouteMotovlogCam) },
-                                    onPickAvatarImage = {
-                                        pickTarget = PhotoPickTarget.AVATAR
-                                        photoPickerLauncher.launch(
-                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                        )
-                                    },
-                                    onSetContactRelay = { viewModel.setContactRelay(it) },
-                                    onShowMessage = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
-                                    onSetMatrixPower = { viewModel.setMatrixPower(it) },
-                                    onToggleMatrixAutoRotate = { viewModel.toggleMatrixAutoRotate(it) },
-                                    onAddMatrixItem = { viewModel.addMatrixItem(it) },
-                                    onSendMatrixItemNow = { viewModel.sendMatrixItemNow(it) },
-                                    onDeleteMatrixItem = { viewModel.deleteMatrixItem(it) },
-                                    onSendEsp1Command = { viewModel.sendEspCommand(1, it) },
-                                    modifier = boundedMod
-                                )
-                            }
-                        }
-                    }
-
                     if (useRail) {
                         Row(modifier = Modifier.fillMaxSize()) {
                             NavigationRail(
@@ -442,12 +314,72 @@ private fun DashboardRootApp(
                                 }
                             }
                             Box(modifier = Modifier.weight(1f)) {
-                                TabContent()
+                                MainTabContent(
+                                    currentTab = currentTab,
+                                    screenMod = screenMod,
+                                    state = state,
+                                    viewModel = viewModel,
+                                    isGranted = ::isGranted,
+                                    onLaunchPerms = { singleGroupPermLauncher.launch(it) },
+                                    onShowDeviceSheet = { showDeviceSheet = true },
+                                    onChangeTab = { currentTab = it },
+                                    onOpenRidingCockpit = { navController.navigate(RouteRidingCockpit) },
+                                    onOpenMotovlogCam = { navController.navigate(RouteMotovlogCam) },
+                                    onShowSnackbar = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
+                                    onRequestScreenMirror = {
+                                        val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                                        projectionLauncher.launch(mpm.createScreenCaptureIntent())
+                                    },
+                                    onPickWallpaperImage = {
+                                        pickTarget = PhotoPickTarget.WALLPAPER
+                                        photoPickerLauncher.launch(
+                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                        )
+                                    },
+                                    onPickAvatarImage = {
+                                        pickTarget = PhotoPickTarget.AVATAR
+                                        photoPickerLauncher.launch(
+                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                        )
+                                    },
+                                    onRetryGps = { requestLocationOrRetryGps() },
+                                    onShareText = ::launchShare
+                                )
                             }
                         }
                     } else {
                         Box(modifier = Modifier.fillMaxSize()) {
-                            TabContent()
+                            MainTabContent(
+                                currentTab = currentTab,
+                                screenMod = screenMod,
+                                state = state,
+                                viewModel = viewModel,
+                                isGranted = ::isGranted,
+                                onLaunchPerms = { singleGroupPermLauncher.launch(it) },
+                                onShowDeviceSheet = { showDeviceSheet = true },
+                                onChangeTab = { currentTab = it },
+                                onOpenRidingCockpit = { navController.navigate(RouteRidingCockpit) },
+                                onOpenMotovlogCam = { navController.navigate(RouteMotovlogCam) },
+                                onShowSnackbar = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
+                                onRequestScreenMirror = {
+                                    val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                                    projectionLauncher.launch(mpm.createScreenCaptureIntent())
+                                },
+                                onPickWallpaperImage = {
+                                    pickTarget = PhotoPickTarget.WALLPAPER
+                                    photoPickerLauncher.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                    )
+                                },
+                                onPickAvatarImage = {
+                                    pickTarget = PhotoPickTarget.AVATAR
+                                    photoPickerLauncher.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                    )
+                                },
+                                onRetryGps = { requestLocationOrRetryGps() },
+                                onShareText = ::launchShare
+                            )
 
                             // Floating Bottom Navigation Pill
                             Surface(
@@ -531,6 +463,139 @@ private fun DashboardRootApp(
             MotovlogCamScreen(
                 state = state,
                 onClose = { navController.popBackStack() }
+            )
+        }
+    }
+}
+
+@Composable
+private fun MainTabContent(
+    currentTab: Int,
+    screenMod: Modifier,
+    state: DashboardUiState,
+    viewModel: DashboardViewModel,
+    isGranted: (String) -> Boolean,
+    onLaunchPerms: (Array<String>) -> Unit,
+    onShowDeviceSheet: () -> Unit,
+    onChangeTab: (Int) -> Unit,
+    onOpenRidingCockpit: () -> Unit,
+    onOpenMotovlogCam: () -> Unit,
+    onShowSnackbar: (String) -> Unit,
+    onRequestScreenMirror: () -> Unit,
+    onPickWallpaperImage: () -> Unit,
+    onPickAvatarImage: () -> Unit,
+    onRetryGps: () -> Unit,
+    onShareText: (String, String) -> Unit
+) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        val boundedMod = if (currentTab == 2) {
+            screenMod
+        } else {
+            screenMod.widthIn(max = 760.dp)
+        }
+        when (currentTab) {
+            0 -> HomeCockpitScreen(
+                state = state,
+                onOpenDeviceSheet = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val missingBt = arrayOf(
+                            Manifest.permission.BLUETOOTH_SCAN,
+                            Manifest.permission.BLUETOOTH_CONNECT
+                        ).filterNot(isGranted).toTypedArray()
+                        if (missingBt.isNotEmpty()) {
+                            onLaunchPerms(missingBt)
+                        }
+                    }
+                    onShowDeviceSheet()
+                },
+                onRefreshWeather = { viewModel.refreshWeatherAndLocation() },
+                onOpenTab = onChangeTab,
+                onOpenRidingCockpit = onOpenRidingCockpit,
+                onOpenMotovlogCam = onOpenMotovlogCam,
+                onSaveTrip = {
+                    viewModel.saveCurrentTripAndReset()
+                    onShowSnackbar("Trip disimpan ke riwayat.")
+                },
+                onResetTrip = { viewModel.resetLiveTrip() },
+                onRouteToParked = { stop ->
+                    viewModel.setSingleDestination(stop)
+                    onChangeTab(2)
+                },
+                onAddMaintenanceLog = { odo, type ->
+                    viewModel.addMaintenanceLog(odo, type)
+                    onShowSnackbar("Catatan servis tersimpan.")
+                },
+                onToggleDevSim = { viewModel.toggleDevTelemetrySimulation(it) },
+                onSendMotorAt = { viewModel.sendMotorCommand(it) },
+                modifier = boundedMod
+            )
+            1 -> DiagnosisScreen(
+                state = state,
+                onRestoreOdo = { viewModel.restoreMotorOdo(it) },
+                onSetInvertB2Current = {
+                    viewModel.updateSettings(state.settings.copy(invertB2Current = it))
+                },
+                onSendEsp2Command = { viewModel.sendEspCommand(2, it) },
+                modifier = boundedMod
+            )
+            2 -> NavigationScreen(
+                state = state,
+                onSetSingleDestination = { viewModel.setSingleDestination(it) },
+                onAddStop = { viewModel.addStopAndRoute(it) },
+                onRemoveStopAt = { viewModel.removeStopAt(it) },
+                onClearRoute = { viewModel.clearRoute() },
+                onStartNavigation = { viewModel.startNavigation() },
+                onStopNavigation = { viewModel.stopNavigation() },
+                onRefreshSpklu = { done -> viewModel.refreshNearbySpklu(done) },
+                onAddUserSpklu = { n, sock, lat, lng ->
+                    viewModel.addUserSpklu(n, sock, lat, lng)
+                },
+                onAddFieldNote = { n, cat, note ->
+                    viewModel.addFieldNote(n, cat, note)
+                },
+                onSavePlace = {
+                    viewModel.savePlace(it)
+                    onShowSnackbar("Tempat disimpan: ${it.name}")
+                },
+                onStartMidStreaming = { viewModel.startMidStreaming() },
+                onStopMidStreaming = { viewModel.stopMidStreaming() },
+                onRequestScreenMirror = onRequestScreenMirror,
+                onStopScreenMirror = { viewModel.stopScreenMirror() },
+                onPickWallpaperImage = onPickWallpaperImage,
+                onUpdateSettings = { viewModel.updateSettings(it) },
+                onSetRideLocked = { viewModel.setRideLocked(it) },
+                onRetryGps = onRetryGps,
+                gpsDiagTextProvider = { viewModel.gpsDiagText() },
+                onShareText = onShareText,
+                modifier = screenMod
+            )
+            3 -> StatsScreen(
+                state = state,
+                onApplyCalFactor = { factor ->
+                    viewModel.updateSettings(state.settings.copy(routeCalFactor = factor))
+                    onShowSnackbar("Faktor kalibrasi diterapkan ($factor)")
+                },
+                onDeleteTrip = { viewModel.deleteTrip(it) },
+                onShareText = onShareText,
+                modifier = boundedMod
+            )
+            else -> GarageAccountScreen(
+                state = state,
+                onUpdateSettings = { viewModel.updateSettings(it) },
+                onOpenMotovlogCam = onOpenMotovlogCam,
+                onPickAvatarImage = onPickAvatarImage,
+                onSetContactRelay = { viewModel.setContactRelay(it) },
+                onShowMessage = onShowSnackbar,
+                onSetMatrixPower = { viewModel.setMatrixPower(it) },
+                onToggleMatrixAutoRotate = { viewModel.toggleMatrixAutoRotate(it) },
+                onAddMatrixItem = { viewModel.addMatrixItem(it) },
+                onSendMatrixItemNow = { viewModel.sendMatrixItemNow(it) },
+                onDeleteMatrixItem = { viewModel.deleteMatrixItem(it) },
+                onSendEsp1Command = { viewModel.sendEspCommand(1, it) },
+                modifier = boundedMod
             )
         }
     }
