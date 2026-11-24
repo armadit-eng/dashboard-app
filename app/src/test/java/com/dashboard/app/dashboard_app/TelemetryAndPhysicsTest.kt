@@ -633,12 +633,17 @@ class TelemetryAndPhysicsTest {
         )
         val seedFile = candidates.firstOrNull { it.exists() }
         assertNotNull(seedFile)
-        val stations = SpkluImportParser.parseJsonOrGeoJson(
-            seedFile!!.readText(),
-            sourceLabel = "GMap Molis"
+        val raw = seedFile!!.readText()
+        val json = kotlinx.serialization.json.Json {
+            ignoreUnknownKeys = true
+            encodeDefaults = true
+        }
+        val decoded = json.decodeFromString(
+            kotlinx.serialization.builtins.ListSerializer(com.dashboard.app.dashboard_app.model.SpkluStation.serializer()),
+            raw
         )
-        assertTrue(stations.size >= 700)
-        assertTrue(stations.all { it.lat in -12.0..7.0 && it.lng in 94.0..142.0 })
-        assertTrue(stations.all { it.isMolisFriendly && it.name.isNotBlank() })
+        assertTrue(decoded.size >= 700)
+        assertTrue(decoded.all { it.lat in -12.0..7.0 && it.lng in 94.0..142.0 })
+        assertTrue(decoded.all { it.isMolisFriendly && it.name.isNotBlank() })
     }
 }

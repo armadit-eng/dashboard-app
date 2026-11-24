@@ -182,6 +182,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private var devSimJob: Job? = null
     private var routeCalcJob: Job? = null
     private var cachedCommunitySpklu: List<SpkluStation> = emptyList()
+    private var lastSpkluDistOrigin: GeoPointX? = null
 
     init {
         wireHardwareCallbacks()
@@ -868,6 +869,20 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
         if (_uiState.value.isNavigating && _uiState.value.activeRoute != null) {
             updateNavigationProgress(gp)
+        }
+
+        val prevSpkluOrigin = lastSpkluDistOrigin
+        if (prevSpkluOrigin == null || RoutePhysics.haversineKm(prevSpkluOrigin, gp) >= 0.5) {
+            lastSpkluDistOrigin = gp
+            viewModelScope.launch(Dispatchers.Default) {
+                val list = _uiState.value.nearbySpklu
+                if (list.isNotEmpty()) {
+                    val resorted = list.map { s ->
+                        s.copy(distanceKm = RoutePhysics.haversineKm(gp, GeoPointX(s.lat, s.lng)))
+                    }.sortedBy { it.distanceKm ?: 999.0 }
+                    _uiState.update { it.copy(nearbySpklu = resorted) }
+                }
+            }
         }
     }
 

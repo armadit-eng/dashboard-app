@@ -47,6 +47,7 @@ import androidx.compose.material.icons.rounded.Clear
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.ElectricMoped
 import androidx.compose.material.icons.rounded.EvStation
 import androidx.compose.material.icons.rounded.FitScreen
 import androidx.compose.material.icons.rounded.GpsFixed
@@ -364,12 +365,18 @@ fun NavigationScreen(
                 it.name.contains(q, ignoreCase = true) || it.category.contains(q, ignoreCase = true)
             }
             val spkluHits = state.nearbySpklu
-                .filter { it.name.contains(q, ignoreCase = true) || it.operatorName.contains(q, ignoreCase = true) }
-                .take(4)
+                .filter {
+                    it.name.contains(q, ignoreCase = true) ||
+                        it.operatorName.contains(q, ignoreCase = true) ||
+                        it.socketType.contains(q, ignoreCase = true) ||
+                        it.notes.contains(q, ignoreCase = true)
+                }
+                .take(8)
                 .map {
+                    val distPart = it.distanceKm?.let { d -> " • ${String.format(Locale.US, "%.1f km", d)}" }.orEmpty()
                     SavedPlace(
                         id = "sp_${it.id}",
-                        name = "${it.name} (SPKLU)",
+                        name = "${it.name} (Charger Molis$distPart)",
                         category = it.socketType,
                         lat = it.lat,
                         lng = it.lng,
@@ -708,6 +715,7 @@ fun NavigationScreen(
                 spkluDialogItem = s
                 followRider = false
                 mapCenter = GeoPointX(s.lat, s.lng)
+                if (mapZoom < 14.5) mapZoom = 15.0
             },
             onDeleteUserStation = onRemoveUserSpklu,
             onDismiss = { showSpkluSheet = false }
@@ -1380,19 +1388,46 @@ fun NavigationScreen(
                         }
                     }
                 }
-                // Quick action pills below search bar (Favorit, Simpan, Trip Planner)
+                // Quick action pills below search bar (Charger Molis, Favorit, Simpan, Trip Planner)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    val molisTotal = remember(state.nearbySpklu) {
+                        state.nearbySpklu.count { it.isMolisFriendly }.takeIf { it > 0 } ?: state.nearbySpklu.size
+                    }
+                    Surface(
+                        shape = CircleShape,
+                        color = c.surfaceCard.copy(alpha = 0.96f),
+                        border = BorderStroke(1.2.dp, c.accent.copy(alpha = 0.7f)),
+                        modifier = Modifier
+                            .height(48.dp)
+                            .clip(CircleShape)
+                            .clickable { showSpkluSheet = true }
+                            .testTag("quick_molis_chip")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Rounded.ElectricMoped, contentDescription = null, tint = c.accent, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                if (molisTotal > 0) "Charger Molis ($molisTotal)" else "Charger Molis / SPKLU",
+                                fontSize = 12.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = c.accent
+                            )
+                        }
+                    }
                     Surface(
                         shape = CircleShape,
                         color = c.surfaceCard.copy(alpha = 0.94f),
                         border = BorderStroke(1.dp, c.borderSubtle),
                         modifier = Modifier
-                            .height(38.dp)
+                            .height(48.dp)
                             .clip(CircleShape)
                             .clickable { showFavoritesSheet = true }
                             .testTag("quick_favorites_chip")
