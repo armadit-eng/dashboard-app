@@ -29,8 +29,16 @@ import kotlin.math.roundToInt
 
 data class ReverseGeocodeResult(val road: String, val area: String)
 
+data class GoogleMapsListFetchResult(
+    val listTitle: String,
+    val resolvedUrl: String,
+    val stations: List<SpkluStation>
+)
+
 object RemoteApisService {
     private const val USER_AGENT = "DashboardAppEV/1.0 (com.dashboard.app.dashboard_app)"
+    private const val BROWSER_UA =
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
     private fun httpGet(
         urlStr: String,
@@ -48,6 +56,30 @@ object RemoteApisService {
             }
             if (conn.responseCode == HttpURLConnection.HTTP_OK) {
                 conn.inputStream.bufferedReader().use { it.readText() }
+            } else null
+        } catch (_: Exception) {
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun httpGetBytes(
+        urlStr: String,
+        timeoutMs: Int = 12_000,
+        userAgent: String = BROWSER_UA
+    ): ByteArray? {
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                instanceFollowRedirects = true
+                connectTimeout = timeoutMs
+                readTimeout = timeoutMs
+                setRequestProperty("User-Agent", userAgent)
+            }
+            if (conn.responseCode == HttpURLConnection.HTTP_OK) {
+                conn.inputStream.use { it.readBytes() }
             } else null
         } catch (_: Exception) {
             null
@@ -672,21 +704,46 @@ object RemoteApisService {
         } catch (_: Exception) {
         }
 
-        // 3. Optional Custom Community JSON / GeoJSON Feed (e.g. GitHub Raw URL)
+        // 3. Community Google Maps Shared List / My Maps / Custom Feed (JSON, GeoJSON, KML/KMZ, GPX, CSV)
         val cleanFeed = customFeedUrl.trim()
-        if (cleanFeed.startsWith("https://")) {
+        if (cleanFeed.startsWith("http://", true) || cleanFeed.startsWith("https://", true)) {
             try {
-                val body = httpGet(cleanFeed, 10_000)
-                if (body != null) {
-                    val feedStations = SpkluImportParser.parseJsonOrGeoJson(body, sourceLabel = "Feed JSON")
-                    for (fs in feedStations) {
+                val fetched = fetchSpkluFeedFromUrl(cleanFeed, markAsUserAdded = false)
+                if (fetched != null) {
+                    val grid = HashMap<Long, MutableList<SpkluStation>>(results.size * 2 + 16)
+                    fun cellKey(la: Double, lo: Double): Long {
+                        val cy = (la * 2000.0).roundToInt().toLong()
+                        val cx = (lo * 2000.0).roundToInt().toLong()
+                        return (cy shl 32) xor (cx and 0xFFFFFFFFL)
+                    }
+                    results.values.forEach { st ->
+                        grid.getOrPut(cellKey(st.lat, st.lng)) { mutableListOf() }.add(st)
+                    }
+                    for (fs in fetched.stations) {
                         val d = RoutePhysics.haversineKm(origin, GeoPointX(fs.lat, fs.lng))
-                        if (d > (radiusMeters / 1000.0) * 2.0) continue
-                        val dup = results.values.any { existing ->
-                            RoutePhysics.haversineKm(GeoPointX(existing.lat, existing.lng), GeoPointX(fs.lat, fs.lng)) < 0.06
+                        val cy = (fs.lat * 2000.0).roundToInt().toLong()
+                        val cx = (fs.lng * 2000.0).roundToInt().toLong()
+                        var dup = false
+                        for (dy in -1..1) {
+                            for (dx in -1..1) {
+                                val bucket = grid[((cy + dy) shl 32) xor ((cx + dx) and 0xFFFFFFFFL)] ?: continue
+                                if (bucket.any { existing ->
+                                        RoutePhysics.haversineKm(
+                                            GeoPointX(existing.lat, existing.lng),
+                                            GeoPointX(fs.lat, fs.lng)
+                                        ) < 0.045
+                                    }
+                                ) {
+                                    dup = true
+                                    break
+                                }
+                            }
+                            if (dup) break
                         }
                         if (!dup) {
-                            results[fs.id] = fs.copy(distanceKm = d)
+                            val withDist = fs.copy(distanceKm = d)
+                            results[withDist.id] = withDist
+                            grid.getOrPut(cellKey(withDist.lat, withDist.lng)) { mutableListOf() }.add(withDist)
                         }
                     }
                 }
@@ -695,5 +752,168 @@ object RemoteApisService {
         }
 
         results.values.sortedBy { it.distanceKm ?: 999.0 }
+    }
+
+    private fun resolveRedirectAndHtml(rawUrl: String, maxHops: Int = 6): Pair<String, String?> {
+        val urlMatch = Regex("""https?://\S+""").find(rawUrl.trim())?.value ?: return rawUrl to null
+        var current = urlMatch
+        repeat(maxHops) {
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(current).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    instanceFollowRedirects = false
+                    connectTimeout = 9_000
+                    readTimeout = 9_000
+                    setRequestProperty("User-Agent", BROWSER_UA)
+                }
+                val code = conn.responseCode
+                if (code in 300..399) {
+                    val loc = conn.getHeaderField("Location") ?: return current to null
+                    current = if (loc.startsWith("/")) {
+                        val u = URL(current)
+                        "${u.protocol}://${u.host}$loc"
+                    } else loc
+                } else if (code == HttpURLConnection.HTTP_OK) {
+                    val html = conn.inputStream.bufferedReader().use { it.readText() }.take(260_000)
+                    return current to html
+                } else {
+                    return current to null
+                }
+            } finally {
+                conn?.disconnect()
+            }
+        }
+        return current to null
+    }
+
+    suspend fun fetchGoogleMapsListStations(
+        rawUrl: String,
+        fallbackSourceLabel: String = "GMap Molis",
+        markAsUserAdded: Boolean = false
+    ): GoogleMapsListFetchResult? = withContext(Dispatchers.IO) {
+        try {
+            val clean = Regex("""https?://\S+""").find(rawUrl.trim())?.value ?: return@withContext null
+            var listId = SpkluImportParser.extractGoogleMapsListId(clean)
+            var myMapsId = SpkluImportParser.extractGoogleMyMapsId(clean)
+            var resolvedUrl = clean
+            var pageHtml: String? = null
+
+            if (listId == null && myMapsId == null) {
+                val (finalUrl, html) = resolveRedirectAndHtml(clean)
+                resolvedUrl = finalUrl
+                pageHtml = html
+                listId = SpkluImportParser.extractGoogleMapsListId(finalUrl)
+                    ?: html?.let { SpkluImportParser.extractGoogleMapsListId(it) }
+                myMapsId = SpkluImportParser.extractGoogleMyMapsId(finalUrl)
+            }
+
+            if (myMapsId != null) {
+                val kmlUrl = "https://www.google.com/maps/d/kml?mid=${URLEncoder.encode(myMapsId, "UTF-8")}&forcekml=1"
+                val bytes = httpGetBytes(kmlUrl, 15_000) ?: return@withContext null
+                val parsed = SpkluImportParser.parseBytes(bytes, "mymaps.kml").map {
+                    it.copy(
+                        isUserAdded = markAsUserAdded,
+                        sourceLabel = fallbackSourceLabel
+                    )
+                }
+                if (parsed.isEmpty()) return@withContext null
+                val title = parsed.firstOrNull()?.operatorName.orEmpty().ifBlank { "Google My Maps" }
+                return@withContext GoogleMapsListFetchResult(
+                    listTitle = title,
+                    resolvedUrl = resolvedUrl,
+                    stations = parsed
+                )
+            }
+
+            if (listId != null) {
+                fun buildGetListUrl(limit: Int): String {
+                    val pb = "!1m4!1s$listId!2e1!3m1!1e1!2e2!3e2!4i$limit!16b1"
+                    return "https://www.google.com/maps/preview/entitylist/getlist?authuser=0&hl=id&gl=id&pb=${
+                        URLEncoder.encode(pb, "UTF-8")
+                    }"
+                }
+
+                var rawResp = httpGet(
+                    buildGetListUrl(2000),
+                    15_000,
+                    mapOf("User-Agent" to BROWSER_UA)
+                )
+                if (rawResp.isNullOrBlank() && pageHtml != null) {
+                    val preloadUrl = SpkluImportParser.extractEntityListGetListUrl(pageHtml)
+                    if (preloadUrl != null) {
+                        rawResp = httpGet(preloadUrl, 15_000, mapOf("User-Agent" to BROWSER_UA))
+                    }
+                }
+                if (rawResp.isNullOrBlank()) return@withContext null
+
+                var parsed = SpkluImportParser.parseGoogleEntityListResponse(
+                    rawResponse = rawResp,
+                    fallbackSourceLabel = fallbackSourceLabel,
+                    markAsUserAdded = markAsUserAdded
+                )
+                if (parsed.totalCount > parsed.stations.size && parsed.totalCount > 2000) {
+                    val expanded = httpGet(
+                        buildGetListUrl((parsed.totalCount + 100).coerceAtMost(5000)),
+                        18_000,
+                        mapOf("User-Agent" to BROWSER_UA)
+                    )
+                    if (!expanded.isNullOrBlank()) {
+                        val second = SpkluImportParser.parseGoogleEntityListResponse(
+                            rawResponse = expanded,
+                            fallbackSourceLabel = fallbackSourceLabel,
+                            markAsUserAdded = markAsUserAdded
+                        )
+                        if (second.stations.size > parsed.stations.size) parsed = second
+                    }
+                }
+                if (parsed.stations.isEmpty()) return@withContext null
+                return@withContext GoogleMapsListFetchResult(
+                    listTitle = parsed.listTitle.ifBlank { "Google Maps List" },
+                    resolvedUrl = resolvedUrl,
+                    stations = parsed.stations
+                )
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    suspend fun fetchSpkluFeedFromUrl(
+        rawUrl: String,
+        markAsUserAdded: Boolean = false
+    ): GoogleMapsListFetchResult? = withContext(Dispatchers.IO) {
+        val clean = rawUrl.trim()
+        if (!clean.startsWith("http://", true) && !clean.startsWith("https://", true)) {
+            return@withContext null
+        }
+        val low = clean.lowercase(Locale.US)
+        if (isMapsShortUrl(clean) ||
+            SpkluImportParser.isGoogleMapsCollectionUrl(clean) ||
+            low.contains("google.com/maps")
+        ) {
+            val gm = fetchGoogleMapsListStations(
+                rawUrl = clean,
+                fallbackSourceLabel = if (markAsUserAdded) "Impor Maps" else "GMap Molis",
+                markAsUserAdded = markAsUserAdded
+            )
+            if (gm != null && gm.stations.isNotEmpty()) return@withContext gm
+        }
+
+        val bytes = httpGetBytes(clean, 14_000) ?: return@withContext null
+        val fileHint = clean.substringBefore('?').substringAfterLast('/')
+        val parsed = SpkluImportParser.parseBytes(bytes, fileHint).map {
+            it.copy(
+                isUserAdded = markAsUserAdded,
+                sourceLabel = it.sourceLabel.ifBlank { "Feed URL" }
+            )
+        }
+        if (parsed.isEmpty()) return@withContext null
+        GoogleMapsListFetchResult(
+            listTitle = "Feed Komunitas",
+            resolvedUrl = clean,
+            stations = parsed
+        )
     }
 }

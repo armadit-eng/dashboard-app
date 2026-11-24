@@ -157,6 +157,7 @@ fun NavigationScreen(
     onStartNavigation: () -> Unit,
     onStopNavigation: () -> Unit,
     onRefreshSpklu: ((() -> Unit)?) -> Unit,
+    onSyncSpkluUrl: (String, (Int, String) -> Unit) -> Unit,
     onAddUserSpklu: (name: String, socket: String, lat: Double, lng: Double, powerKw: Double?, notes: String, isMolis: Boolean) -> Unit,
     onRemoveUserSpklu: (String) -> Unit,
     onImportSpkluUri: (Uri, String?, (Int, String) -> Unit) -> Unit,
@@ -656,7 +657,7 @@ fun NavigationScreen(
     if (showSpkluSheet) {
         var loadingSpklu by remember { mutableStateOf(false) }
         LaunchedEffect(Unit) {
-            if (state.nearbySpklu.none { !it.isUserAdded }) {
+            if (!state.settings.offlineModeOnly && state.nearbySpklu.none { it.sourceLabel == "OSM" || it.sourceLabel == "OCM" }) {
                 loadingSpklu = true
                 onRefreshSpklu { loadingSpklu = false }
             }
@@ -670,6 +671,13 @@ fun NavigationScreen(
             onRefresh = {
                 loadingSpklu = true
                 onRefreshSpklu { loadingSpklu = false }
+            },
+            onSyncFeedUrl = { url ->
+                loadingSpklu = true
+                onSyncSpkluUrl(url) { _, msg ->
+                    loadingSpklu = false
+                    spkluImportFeedback = msg
+                }
             },
             onOpenAddDialog = {
                 addSpkluTarget = "" to (state.gpsState.location ?: mapCenter)

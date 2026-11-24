@@ -24,6 +24,8 @@ data class MatrixQueueItem(
     val effectId: Int = 0
 )
 
+const val DEFAULT_MOLIS_MAPS_LIST_URL = "https://maps.app.goo.gl/mw42QYsxUhsfVeED9?g_st=ac"
+
 @Serializable
 data class AppSettings(
     val riderName: String = "Pengendara EV",
@@ -95,7 +97,8 @@ data class AppSettings(
     val lastParkTsMs: Long = 0L,
     val tripPrepAsk: Boolean = true,
     val showElevationInPreview: Boolean = true,
-    val customSpkluFeedUrl: String = "",
+    val customSpkluFeedUrl: String = DEFAULT_MOLIS_MAPS_LIST_URL,
+    val molisCommunityEnabled: Boolean = true,
     val offlineModeOnly: Boolean = false
 ) {
     val batteryPriority: BatterySourcePriority

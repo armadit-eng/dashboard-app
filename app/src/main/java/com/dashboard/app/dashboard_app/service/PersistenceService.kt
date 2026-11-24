@@ -2,6 +2,7 @@ package com.dashboard.app.dashboard_app.service
 
 import android.content.Context
 import android.net.Uri
+import com.dashboard.app.dashboard_app.R
 import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.CalibrationEntry
 import com.dashboard.app.dashboard_app.model.ChargingLogEntry
@@ -47,6 +48,7 @@ class PersistenceService(private val context: Context) {
         private const val K_TRIPS_FILE = "trips_history.json"
         private const val K_PLACES_FILE = "saved_places.json"
         private const val K_SPKLU_FILE = "user_spklu.json"
+        private const val K_COMMUNITY_SPKLU_FILE = "community_spklu_cache.json"
         private const val K_NOTES_FILE = "field_notes.json"
         private const val K_MAINT_FILE = "maint_logs.json"
         private const val K_CALIB_FILE = "calib_logs.json"
@@ -159,6 +161,18 @@ class PersistenceService(private val context: Context) {
 
     suspend fun loadUserSpklu(): List<SpkluStation> = readJsonList(K_SPKLU_FILE, SpkluStation.serializer())
     suspend fun saveUserSpklu(list: List<SpkluStation>) = writeJsonList(K_SPKLU_FILE, SpkluStation.serializer(), list)
+
+    suspend fun loadCommunitySpkluCache(): List<SpkluStation> = readJsonList(K_COMMUNITY_SPKLU_FILE, SpkluStation.serializer())
+    suspend fun saveCommunitySpkluCache(list: List<SpkluStation>) = writeJsonList(K_COMMUNITY_SPKLU_FILE, SpkluStation.serializer(), list)
+
+    suspend fun loadBundledMolisSeed(): List<SpkluStation> = withContext(Dispatchers.IO) {
+        try {
+            val raw = context.resources.openRawResource(R.raw.molis_community_seed).bufferedReader().use { it.readText() }
+            json.decodeFromString(ListSerializer(SpkluStation.serializer()), raw)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
 
     suspend fun loadFieldNotes(): List<FieldNotePin> = readJsonList(K_NOTES_FILE, FieldNotePin.serializer())
     suspend fun saveFieldNotes(list: List<FieldNotePin>) = writeJsonList(K_NOTES_FILE, FieldNotePin.serializer(), list)

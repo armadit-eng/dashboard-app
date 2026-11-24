@@ -28,6 +28,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Directions
 import androidx.compose.material.icons.rounded.ElectricMoped
@@ -36,6 +38,7 @@ import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FileUpload
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.TravelExplore
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -51,6 +54,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -69,6 +73,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dashboard.app.dashboard_app.model.AppSettings
+import com.dashboard.app.dashboard_app.model.DEFAULT_MOLIS_MAPS_LIST_URL
 import com.dashboard.app.dashboard_app.model.GeoPointX
 import com.dashboard.app.dashboard_app.model.SpkluStation
 import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
@@ -98,6 +103,7 @@ fun SpkluBottomSheet(
     importFeedback: String?,
     onDismissImportFeedback: () -> Unit,
     onRefresh: () -> Unit,
+    onSyncFeedUrl: (String) -> Unit,
     onOpenAddDialog: () -> Unit,
     onOpenImportPicker: () -> Unit,
     onSearchInGoogleMaps: () -> Unit,
@@ -108,18 +114,28 @@ fun SpkluBottomSheet(
 ) {
     val c = LocalCockpitColors.current
     var filter by remember { mutableStateOf(SpkluFilter.ALL) }
+    var searchQuery by remember { mutableStateOf("") }
     var showSourcesPanel by remember { mutableStateOf(false) }
     var ocmKeyDraft by remember(settings.ocmApiKey) { mutableStateOf(settings.ocmApiKey) }
-    var feedUrlDraft by remember(settings.customSpkluFeedUrl) { mutableStateOf(settings.customSpkluFeedUrl) }
+    var feedUrlDraft by remember(settings.customSpkluFeedUrl) {
+        mutableStateOf(settings.customSpkluFeedUrl.ifBlank { DEFAULT_MOLIS_MAPS_LIST_URL })
+    }
 
     val molisCount = remember(stations) { stations.count { it.isMolisFriendly } }
     val mineCount = remember(stations) { stations.count { it.isUserAdded } }
-    val filtered = remember(stations, filter) {
-        when (filter) {
+    val filtered = remember(stations, filter, searchQuery) {
+        val byTab = when (filter) {
             SpkluFilter.ALL -> stations
             SpkluFilter.MOLIS -> stations.filter { it.isMolisFriendly }
             SpkluFilter.GENERAL -> stations.filter { !it.isMolisFriendly }
             SpkluFilter.MINE -> stations.filter { it.isUserAdded }
+        }
+        val q = searchQuery.trim()
+        if (q.isEmpty()) byTab else byTab.filter { s ->
+            s.name.contains(q, ignoreCase = true) ||
+                s.notes.contains(q, ignoreCase = true) ||
+                s.operatorName.contains(q, ignoreCase = true) ||
+                s.socketType.contains(q, ignoreCase = true)
         }
     }
 
@@ -197,9 +213,31 @@ fun SpkluBottomSheet(
 
             Spacer(Modifier.height(6.dp))
             Text(
-                "Tip: Temukan \"charger molis\" di Google Maps lalu tekan Bagikan ke aplikasi ini, atau impor peta komunitas Google My Maps (.kml/.kmz).",
+                "Daftar Molis Komunitas (PEVR/Indonesia) aktif • Anda juga bisa menempel link Google Maps List (maps.app.goo.gl) atau impor file KML/GPX/CSV.",
                 fontSize = 11.sp,
                 color = c.textMuted
+            )
+
+            Spacer(Modifier.height(6.dp))
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder = { Text("Cari kota, nama lokasi, PLN, Polytron, SPLU...", fontSize = 12.5.sp) },
+                leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                trailingIcon = {
+                    if (searchQuery.isNotEmpty()) {
+                        IconButton(
+                            onClick = { searchQuery = "" },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(Icons.Rounded.Close, contentDescription = "Hapus filter", modifier = Modifier.size(18.dp))
+                        }
+                    }
+                },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("spklu_search_input")
             )
 
             if (!importFeedback.isNullOrBlank()) {
@@ -256,7 +294,7 @@ fun SpkluBottomSheet(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            "Sumber Data: OSM (SPLU/Swap) • OpenChargeMap • Feed JSON",
+                            "Sumber Data: Google Maps Molis • OSM • OpenChargeMap",
                             fontSize = 11.5.sp,
                             fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.weight(1f)
@@ -267,6 +305,68 @@ fun SpkluBottomSheet(
                         )
                     }
                     if (showSourcesPanel) {
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Daftar Molis Google Maps", fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "Sinkron otomatis titik charger motor listrik komunitas",
+                                    fontSize = 11.sp,
+                                    color = c.textMuted
+                                )
+                            }
+                            Switch(
+                                checked = settings.molisCommunityEnabled,
+                                onCheckedChange = { enabled ->
+                                    onUpdateSettings(settings.copy(molisCommunityEnabled = enabled))
+                                    onRefresh()
+                                },
+                                modifier = Modifier.testTag("toggle_molis_community_switch")
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = feedUrlDraft,
+                            onValueChange = { feedUrlDraft = it },
+                            label = { Text("Link Google Maps List / My Maps / JSON") },
+                            placeholder = { Text(DEFAULT_MOLIS_MAPS_LIST_URL) },
+                            singleLine = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("custom_spklu_feed_input")
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = { onSyncFeedUrl(feedUrlDraft) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("sync_spklu_feed_button")
+                            ) {
+                                Icon(Icons.Rounded.CloudSync, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Sinkron Link Maps", fontSize = 12.5.sp)
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    feedUrlDraft = DEFAULT_MOLIS_MAPS_LIST_URL
+                                    onSyncFeedUrl(DEFAULT_MOLIS_MAPS_LIST_URL)
+                                },
+                                modifier = Modifier
+                                    .height(48.dp)
+                                    .testTag("reset_spklu_feed_button")
+                            ) {
+                                Text("Default", fontSize = 12.sp)
+                            }
+                        }
                         Spacer(Modifier.height(8.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -287,7 +387,7 @@ fun SpkluBottomSheet(
                                     onUpdateSettings(
                                         settings.copy(
                                             ocmApiKey = ocmKeyDraft.trim(),
-                                            customSpkluFeedUrl = feedUrlDraft.trim()
+                                            customSpkluFeedUrl = feedUrlDraft.trim().ifBlank { DEFAULT_MOLIS_MAPS_LIST_URL }
                                         )
                                     )
                                     onRefresh()
@@ -299,17 +399,6 @@ fun SpkluBottomSheet(
                                 Text("Muat")
                             }
                         }
-                        Spacer(Modifier.height(6.dp))
-                        OutlinedTextField(
-                            value = feedUrlDraft,
-                            onValueChange = { feedUrlDraft = it },
-                            label = { Text("URL Feed JSON / GeoJSON Komunitas (https://...)") },
-                            placeholder = { Text("https://raw.githubusercontent.com/.../molis.json") },
-                            singleLine = true,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("custom_spklu_feed_input")
-                        )
                     }
                 }
             }
@@ -322,22 +411,31 @@ fun SpkluBottomSheet(
 
             if (filtered.isEmpty()) {
                 Text(
-                    when (filter) {
-                        SpkluFilter.MOLIS -> "Belum ada titik khusus Molis / SPLU di radius 15 km. Tambahkan manual, bagikan dari Google Maps, atau impor file KML/GPX."
-                        SpkluFilter.MINE -> "Belum ada koleksi SPKLU pribadi atau hasil impor."
-                        else -> "Belum ada titik ditemukan dalam radius 15 km."
+                    when {
+                        searchQuery.isNotBlank() -> "Tidak ada titik yang cocok dengan \"${searchQuery.trim()}\"."
+                        filter == SpkluFilter.MOLIS -> "Belum ada titik khusus Molis / SPLU. Aktifkan Daftar Komunitas atau tambahkan manual."
+                        filter == SpkluFilter.MINE -> "Belum ada koleksi SPKLU pribadi atau hasil impor."
+                        else -> "Belum ada titik ditemukan."
                     },
                     color = c.textMuted,
                     fontSize = 13.sp,
                     modifier = Modifier.padding(vertical = 20.dp)
                 )
             } else {
+                if (filtered.size > 50) {
+                    Text(
+                        "Menampilkan 50 terdekat dari ${filtered.size} titik • pakai pencarian untuk kota lain",
+                        fontSize = 11.sp,
+                        color = c.textMuted,
+                        modifier = Modifier.padding(bottom = 4.dp)
+                    )
+                }
                 LazyColumn(
                     modifier = Modifier.heightIn(max = 360.dp),
                     contentPadding = PaddingValues(bottom = 24.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(filtered.take(35), key = { it.id }) { s ->
+                    items(filtered.take(50), key = { it.id }) { s ->
                         SpkluStationCard(
                             station = s,
                             onClick = { onSelectStation(s) },

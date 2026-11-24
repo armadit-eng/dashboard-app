@@ -606,6 +606,12 @@ private fun MainTabContent(
                 onStartNavigation = { viewModel.startNavigation() },
                 onStopNavigation = { viewModel.stopNavigation() },
                 onRefreshSpklu = { done -> viewModel.refreshNearbySpklu(done) },
+                onSyncSpkluUrl = { url, cb ->
+                    viewModel.syncCustomSpkluUrl(url) { count, msg ->
+                        onShowSnackbar(msg)
+                        cb(count, msg)
+                    }
+                },
                 onAddUserSpklu = { n, sock, lat, lng, kw, notes, isMolis ->
                     viewModel.addUserSpklu(n, sock, lat, lng, kw, notes, isMolis)
                     onShowSnackbar("Titik charger disimpan: $n")

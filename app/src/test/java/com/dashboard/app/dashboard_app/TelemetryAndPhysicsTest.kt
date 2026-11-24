@@ -586,4 +586,59 @@ class TelemetryAndPhysicsTest {
         val searchPoi = reloaded.searchPlaces("Alun-Alun")
         assertTrue(searchPoi.any { it.name == "Alun-Alun Kota" })
     }
+
+    @Test
+    fun parsesGoogleMapsSharedListResponseAndIds() {
+        val sampleUrl = "https://www.google.com/maps/@/data=!4m3!11m2!2sjogYqDUmJTaKRVpDmG-Wkc3X2wiJAQ!3e3!18m1!1e1?g_st=ac"
+        assertEquals("jogYqDUmJTaKRVpDmG-Wkc3X2wiJAQ", SpkluImportParser.extractGoogleMapsListId(sampleUrl))
+        assertTrue(SpkluImportParser.isGoogleMapsCollectionUrl(sampleUrl))
+        assertEquals(
+            "abcDEF1234567890",
+            SpkluImportParser.extractGoogleMyMapsId("https://www.google.com/maps/d/viewer?mid=abcDEF1234567890")
+        )
+
+        val xssiPayload = """
+            )]}'
+            [[["jogYqDUmJTaKRVpDmG-Wkc3X2wiJAQ",1],4,[3,1,"https://www.google.com/maps/placelists/list/jogYqDUmJTaKRVpDmG-Wkc3X2wiJAQ"],["Sunuasta Motobiker",""], "MOLIS CHARGING STATION", "lokasi charging", null, null, [
+              [null, [null, null, "", null, "Jl. Perintis Kemerdekaan No.3A, Klaten", [null, null, -7.68918, 110.62273], ["1", "2"], "/g/11b74nr6h8"], "PT PLN (Persero) UP3 Klaten", "SPLU koin aman untuk molis"],
+              [null, [null, null, "", null, "Jl. Raya Solo - Yogyakarta, Prambanan", [null, null, -7.751931, 110.518523], ["3", "4"], "/g/11hfxknby_"], "PT. Polytron", "Fast charging Polytron socket M23"]
+            ], null, null, null, 757]]
+        """.trimIndent()
+
+        val parsed = SpkluImportParser.parseGoogleEntityListResponse(xssiPayload)
+        assertEquals("MOLIS CHARGING STATION", parsed.listTitle)
+        assertEquals("Sunuasta Motobiker", parsed.author)
+        assertEquals(757, parsed.totalCount)
+        assertEquals(2, parsed.stations.size)
+
+        val s0 = parsed.stations[0]
+        assertEquals("PT PLN (Persero) UP3 Klaten", s0.name)
+        assertEquals(-7.68918, s0.lat, 0.0001)
+        assertEquals(110.62273, s0.lng, 0.0001)
+        assertTrue(s0.isMolisFriendly)
+        assertTrue(s0.notes.contains("SPLU koin"))
+        assertEquals("GMap Molis", s0.sourceLabel)
+
+        val s1 = parsed.stations[1]
+        assertEquals("Polytron EV", s1.operatorName)
+        assertEquals("Fast / Socket Molis", s1.socketType)
+        assertTrue(s1.isMolisFriendly)
+    }
+
+    @Test
+    fun bundledMolisSeedIsValidAndComplete() {
+        val candidates = listOf(
+            java.io.File("src/main/res/raw/molis_community_seed.json"),
+            java.io.File("app/src/main/res/raw/molis_community_seed.json")
+        )
+        val seedFile = candidates.firstOrNull { it.exists() }
+        assertNotNull(seedFile)
+        val stations = SpkluImportParser.parseJsonOrGeoJson(
+            seedFile!!.readText(),
+            sourceLabel = "GMap Molis"
+        )
+        assertTrue(stations.size >= 700)
+        assertTrue(stations.all { it.lat in -12.0..7.0 && it.lng in 94.0..142.0 })
+        assertTrue(stations.all { it.isMolisFriendly && it.name.isNotBlank() })
+    }
 }

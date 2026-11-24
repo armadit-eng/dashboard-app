@@ -8,6 +8,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -18,6 +19,13 @@ import java.io.StringReader
 import java.util.zip.ZipInputStream
 import javax.xml.parsers.DocumentBuilderFactory
 import kotlin.math.abs
+
+data class GoogleListParseResult(
+    val listTitle: String,
+    val author: String,
+    val totalCount: Int,
+    val stations: List<SpkluStation>
+)
 
 object SpkluImportParser {
 
@@ -376,15 +384,136 @@ object SpkluImportParser {
         .replace(Regex("\\s+"), " ")
         .trim()
 
-    private fun inferSocketLabel(name: String, notes: String, extra: String): String {
+    fun inferSocketLabel(name: String, notes: String, extra: String): String {
         val hay = "$name $notes $extra".lowercase()
         return when {
             hay.contains("swap") || hay.contains("spbklu") || hay.contains("oyika") || hay.contains("smoot") ->
                 "Swap Baterai / SPBKLU"
+            hay.contains("m23") || hay.contains("polytron") || hay.contains("fast charging") ->
+                "Fast / Socket Molis"
             hay.contains("schuko") || hay.contains("rumah") || hay.contains("16a") || hay.contains("splu") || hay.contains("molis") ->
-                "Schuko / SPLU Molis"
+                "SPLU / Schuko Molis"
             hay.contains("ccs") -> "CCS2 / Type 2"
             else -> "Charger Molis / SPKLU"
         }
+    }
+
+    private fun inferOperatorLabel(name: String, notes: String, fallback: String): String {
+        val hay = "$name $notes".lowercase()
+        return when {
+            hay.contains("pln") || hay.contains("splu") -> "PLN / SPLU"
+            hay.contains("polytron") -> "Polytron EV"
+            hay.contains("gesits") -> "Komunitas Gesits"
+            hay.contains("volta") || hay.contains("sgb") -> "Volta / SGB"
+            hay.contains("oyika") || hay.contains("smoot") -> "Swap Komunitas"
+            else -> fallback.ifBlank { "Komunitas Molis" }
+        }
+    }
+
+    fun extractGoogleMapsListId(urlOrText: String): String? {
+        val patterns = listOf(
+            Regex("""/(?:placelists|userlists)/list/([A-Za-z0-9_-]{8,})"""),
+            Regex("""!11m2!2s([A-Za-z0-9_-]{10,})"""),
+            Regex("""!1m4!1s([A-Za-z0-9_-]{10,})""")
+        )
+        for (p in patterns) {
+            val m = p.find(urlOrText)
+            if (m != null) return m.groupValues[1]
+        }
+        return null
+    }
+
+    fun extractGoogleMyMapsId(urlOrText: String): String? {
+        if (!urlOrText.contains("google.", ignoreCase = true) && !urlOrText.contains("mymaps", ignoreCase = true)) {
+            return null
+        }
+        return Regex("""[?&]mid=([A-Za-z0-9_-]{10,})""").find(urlOrText)?.groupValues?.getOrNull(1)
+    }
+
+    fun extractEntityListGetListUrl(html: String): String? {
+        val m = Regex("""(/maps/preview/entitylist/getlist\?[^"'\s<>]+)""").find(html) ?: return null
+        val path = m.groupValues[1].replace("&amp;", "&").replace("\\u0026", "&")
+        return "https://www.google.com$path"
+    }
+
+    fun isGoogleMapsCollectionUrl(url: String): Boolean {
+        return extractGoogleMapsListId(url) != null || extractGoogleMyMapsId(url) != null
+    }
+
+    fun parseGoogleEntityListResponse(
+        rawResponse: String,
+        fallbackSourceLabel: String = "GMap Molis",
+        markAsUserAdded: Boolean = false
+    ): GoogleListParseResult {
+        val cleaned = rawResponse.trimStart('\uFEFF').trim()
+            .replace(Regex("""^\)\]\}'\s*"""), "")
+        if (cleaned.isBlank()) return GoogleListParseResult("", "", 0, emptyList())
+        return runCatching {
+            val top = jsonParser.parseToJsonElement(cleaned) as? JsonArray
+                ?: return@runCatching GoogleListParseResult("", "", 0, emptyList())
+            val root = top.getOrNull(0) as? JsonArray
+                ?: return@runCatching GoogleListParseResult("", "", 0, emptyList())
+            val listTitle = (root.getOrNull(4) as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+            val author = (root.getOrNull(3) as? JsonArray)?.getOrNull(0)
+                ?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull?.trim() }
+                .orEmpty()
+            val totalCount = (root.getOrNull(12) as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: 0
+            val items = root.getOrNull(8) as? JsonArray ?: JsonArray(emptyList())
+            val molisListHint = inferMolisFriendly(listTitle, "", author)
+            val stations = mutableListOf<SpkluStation>()
+            val seenIds = HashSet<String>()
+
+            items.forEachIndexed { idx, el ->
+                val itemArr = el as? JsonArray ?: return@forEachIndexed
+                val loc = itemArr.getOrNull(1) as? JsonArray
+                val coords = loc?.getOrNull(5) as? JsonArray
+                val lat = (coords?.getOrNull(2) as? kotlinx.serialization.json.JsonPrimitive)?.doubleOrNull
+                val lng = (coords?.getOrNull(3) as? kotlinx.serialization.json.JsonPrimitive)?.doubleOrNull
+                if (lat == null || lng == null || lat !in -90.0..90.0 || lng !in -180.0..180.0) return@forEachIndexed
+
+                val addr = (loc.getOrNull(4) as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                val rawName = (itemArr.getOrNull(2) as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                val name = rawName.ifBlank { addr.ifBlank { "Charger Molis #${idx + 1}" } }
+                val rawNote = (itemArr.getOrNull(3) as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                val noteClean = stripHtml(rawNote)
+                val addrClean = stripHtml(addr).take(85)
+                val combinedNotes = listOf(noteClean, addrClean)
+                    .filter { it.isNotBlank() }
+                    .joinToString(" • ")
+                    .take(180)
+                val placeKey = (loc.getOrNull(7) as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
+                    ?.trim()?.trim('/')?.replace('/', '_')
+                    .orEmpty()
+                var sid = "gm_molis_${placeKey.ifBlank { idx.toString() }}_${abs((lat * 1e4).toInt())}"
+                if (!seenIds.add(sid)) {
+                    sid = "${sid}_$idx"
+                    seenIds.add(sid)
+                }
+                val socket = inferSocketLabel(name, combinedNotes, listTitle)
+                val op = inferOperatorLabel(name, combinedNotes, author.ifBlank { listTitle })
+                stations.add(
+                    SpkluStation(
+                        id = sid,
+                        name = name,
+                        operatorName = op,
+                        lat = lat,
+                        lng = lng,
+                        socketType = socket,
+                        powerKw = null,
+                        isUserAdded = markAsUserAdded,
+                        distanceKm = null,
+                        notes = combinedNotes,
+                        sourceLabel = fallbackSourceLabel,
+                        isMolisFriendly = molisListHint || inferMolisFriendly(name, socket, combinedNotes)
+                    )
+                )
+            }
+            GoogleListParseResult(
+                listTitle = listTitle,
+                author = author,
+                totalCount = totalCount.coerceAtLeast(stations.size),
+                stations = stations
+            )
+        }.getOrDefault(GoogleListParseResult("", "", 0, emptyList()))
     }
 }

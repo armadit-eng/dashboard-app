@@ -21,6 +21,7 @@ import com.dashboard.app.dashboard_app.model.Battery2Data
 import com.dashboard.app.dashboard_app.model.CalibrationEntry
 import com.dashboard.app.dashboard_app.model.ChargingLogEntry
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.DEFAULT_MOLIS_MAPS_LIST_URL
 import com.dashboard.app.dashboard_app.model.DailyChallenge
 import com.dashboard.app.dashboard_app.model.DiscoveredDeviceX
 import com.dashboard.app.dashboard_app.model.EffectiveTelemetry
@@ -180,6 +181,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private var mapsStreamJob: Job? = null
     private var devSimJob: Job? = null
     private var routeCalcJob: Job? = null
+    private var cachedCommunitySpklu: List<SpkluStation> = emptyList()
 
     init {
         wireHardwareCallbacks()
@@ -203,6 +205,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             val regions = withContext(Dispatchers.IO) {
                 OfflineMapPackageService.listRegions(getApplication())
             }
+            var communitySpklu = storage.loadCommunitySpkluCache()
+            if (communitySpklu.isEmpty() && settings.molisCommunityEnabled) {
+                communitySpklu = storage.loadBundledMolisSeed()
+                if (communitySpklu.isNotEmpty()) {
+                    storage.saveCommunitySpkluCache(communitySpklu)
+                }
+            }
+            cachedCommunitySpklu = communitySpklu
 
             TileCacheService.offlineOnly = settings.offlineModeOnly
             ble.invertB2Current = settings.invertB2Current
@@ -210,6 +220,15 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             ScreenMirrorService.mirrorOffsetX = settings.mirrorOffsetX.coerceIn(0f, 1f)
             ScreenMirrorService.mirrorOffsetY = settings.mirrorOffsetY.coerceIn(0f, 1f)
             ScreenMirrorService.mirrorScalePct = settings.mirrorScalePct.coerceIn(35, 100)
+
+            val initOrigin = cachedGeo?.let { GeoPointX(it.lat, it.lng) }
+            val activeCommunity = if (settings.molisCommunityEnabled) {
+                communitySpklu.map { s ->
+                    val d = initOrigin?.let { RoutePhysics.haversineKm(it, GeoPointX(s.lat, s.lng)) }
+                    if (d != null) s.copy(distanceKm = d) else s
+                }
+            } else emptyList()
+            val mergedInitialSpklu = (uSpklu + activeCommunity).sortedBy { it.distanceKm ?: 999.0 }
 
             _uiState.update { cur ->
                 val gps = if (cachedGeo != null) {
@@ -226,7 +245,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     tripHistory = trips,
                     savedPlaces = places,
                     userSpklu = uSpklu,
-                    nearbySpklu = if (cur.nearbySpklu.isEmpty()) uSpklu else cur.nearbySpklu,
+                    nearbySpklu = if (cur.nearbySpklu.isEmpty()) mergedInitialSpklu else cur.nearbySpklu,
                     fieldNotes = notes,
                     maintLogs = maint,
                     calibLogs = calib,
@@ -1474,16 +1493,39 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         saveCurrentTripAndReset(isPartial = false, predictedWh = est?.netWh)
     }
 
+    private fun activeCommunityFeedUrl(settings: AppSettings): String {
+        if (!settings.molisCommunityEnabled) return ""
+        return settings.customSpkluFeedUrl.trim().ifBlank { DEFAULT_MOLIS_MAPS_LIST_URL }
+    }
+
     fun refreshNearbySpklu(onDone: (() -> Unit)? = null) {
         viewModelScope.launch {
             val cur = _uiState.value
             val origin = cur.gpsState.location ?: GeoPointX(-6.1754, 106.8272)
-            val apiFound = RemoteApisService.fetchNearbySpklu(
-                lat = origin.lat,
-                lng = origin.lng,
-                ocmApiKey = cur.settings.ocmApiKey,
-                customFeedUrl = cur.settings.customSpkluFeedUrl
-            )
+            val feedUrl = activeCommunityFeedUrl(cur.settings)
+            val apiFound = if (cur.settings.offlineModeOnly) {
+                emptyList()
+            } else {
+                RemoteApisService.fetchNearbySpklu(
+                    lat = origin.lat,
+                    lng = origin.lng,
+                    ocmApiKey = cur.settings.ocmApiKey,
+                    customFeedUrl = feedUrl
+                )
+            }
+            val liveCommunity = apiFound.filter {
+                it.sourceLabel == "GMap Molis" || it.sourceLabel == "Feed URL" || it.sourceLabel == "Feed JSON"
+            }
+            if (liveCommunity.isNotEmpty()) {
+                cachedCommunitySpklu = liveCommunity.map { it.copy(distanceKm = null) }
+                storage.saveCommunitySpkluCache(cachedCommunitySpklu)
+            }
+            val fallbackCommunity = if (liveCommunity.isEmpty() && cur.settings.molisCommunityEnabled) {
+                cachedCommunitySpklu.map { s ->
+                    s.copy(distanceKm = RoutePhysics.haversineKm(origin, GeoPointX(s.lat, s.lng)))
+                }
+            } else emptyList()
+
             val updatedUser = cur.userSpklu.map { u ->
                 val d = RoutePhysics.haversineKm(origin, GeoPointX(u.lat, u.lng))
                 u.copy(
@@ -1492,9 +1534,46 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     isMolisFriendly = u.isMolisFriendly || SpkluImportParser.inferMolisFriendly(u.name, u.socketType, u.notes, u.powerKw)
                 )
             }
-            val merged = (updatedUser + apiFound).sortedBy { it.distanceKm ?: 999.0 }
+            val merged = (updatedUser + apiFound + fallbackCommunity)
+                .distinctBy { it.id }
+                .sortedBy { it.distanceKm ?: 999.0 }
             _uiState.update { it.copy(nearbySpklu = merged) }
             onDone?.invoke()
+        }
+    }
+
+    fun syncCustomSpkluUrl(rawUrl: String, onResult: (Int, String) -> Unit) {
+        val cleanUrl = rawUrl.trim().ifBlank { DEFAULT_MOLIS_MAPS_LIST_URL }
+        viewModelScope.launch {
+            val cur = _uiState.value
+            val updatedSettings = cur.settings.copy(
+                customSpkluFeedUrl = cleanUrl,
+                molisCommunityEnabled = true
+            )
+            updateSettings(updatedSettings)
+            val fetched = RemoteApisService.fetchSpkluFeedFromUrl(cleanUrl, markAsUserAdded = false)
+            if (fetched == null || fetched.stations.isEmpty()) {
+                onResult(0, "Gagal menyinkronkan tautan. Pastikan link Google Maps List / My Maps bersifat publik.")
+                return@launch
+            }
+            cachedCommunitySpklu = fetched.stations
+            storage.saveCommunitySpkluCache(cachedCommunitySpklu)
+            val origin = _uiState.value.gpsState.location ?: GeoPointX(-6.1754, 106.8272)
+            val withDist = fetched.stations.map { s ->
+                s.copy(distanceKm = RoutePhysics.haversineKm(origin, GeoPointX(s.lat, s.lng)))
+            }
+            val curNow = _uiState.value
+            val existingNonCommunity = curNow.nearbySpklu.filter {
+                it.isUserAdded || (it.sourceLabel != "GMap Molis" && it.sourceLabel != "Feed URL" && it.sourceLabel != "Feed JSON")
+            }
+            val merged = (existingNonCommunity + withDist)
+                .distinctBy { it.id }
+                .sortedBy { it.distanceKm ?: 999.0 }
+            _uiState.update { it.copy(nearbySpklu = merged) }
+            onResult(
+                fetched.stations.size,
+                "Daftar \"${fetched.listTitle}\" disinkronkan: ${fetched.stations.size} titik."
+            )
         }
     }
 
@@ -1889,6 +1968,40 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             return
         }
         viewModelScope.launch {
+            if (SpkluImportParser.isGoogleMapsCollectionUrl(text) || RemoteApisService.isMapsShortUrl(text)) {
+                val listResult = RemoteApisService.fetchGoogleMapsListStations(
+                    rawUrl = text,
+                    fallbackSourceLabel = "Impor Maps",
+                    markAsUserAdded = true
+                )
+                if (listResult != null && listResult.stations.isNotEmpty()) {
+                    val cur = _uiState.value
+                    val existing = cur.userSpklu.toMutableList()
+                    var addedCount = 0
+                    for (item in listResult.stations) {
+                        val dup = existing.any { e ->
+                            RoutePhysics.haversineKm(GeoPointX(e.lat, e.lng), GeoPointX(item.lat, item.lng)) < 0.03
+                        }
+                        if (!dup) {
+                            existing.add(0, item)
+                            addedCount++
+                        }
+                    }
+                    val origin = cur.gpsState.location
+                    val updatedUser = existing.map { u ->
+                        val d = origin?.let { RoutePhysics.haversineKm(it, GeoPointX(u.lat, u.lng)) } ?: u.distanceKm
+                        u.copy(distanceKm = d)
+                    }
+                    val nonUser = cur.nearbySpklu.filterNot { it.isUserAdded }
+                    val merged = (updatedUser + nonUser).distinctBy { it.id }.sortedBy { it.distanceKm ?: 999.0 }
+                    _uiState.update { it.copy(userSpklu = updatedUser, nearbySpklu = merged) }
+                    storage.saveUserSpklu(updatedUser)
+                    onMessage(
+                        "Daftar \"${listResult.listTitle}\" diimpor ke SPKLU: $addedCount titik baru (${listResult.stations.size} total)."
+                    )
+                    return@launch
+                }
+            }
             if (RemoteApisService.isMapsShortUrl(text)) {
                 val resolved = RemoteApisService.resolveGoogleMapsShortUrl(text)
                 if (resolved != null) {
