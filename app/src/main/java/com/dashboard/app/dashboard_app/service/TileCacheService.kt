@@ -144,6 +144,10 @@ object TileCacheService {
         return null
     }
 
+    private val FALLBACK_OFFLINE_STYLES = listOf(
+        "carto_voyager", "osm", "dark", "topo", "osm_hot", "carto_positron", "sat"
+    )
+
     suspend fun getTileAndroidBitmap(
         context: Context,
         styleId: String,
@@ -164,7 +168,19 @@ object TileCacheService {
                 } catch (_: Exception) {
                 }
             }
-            if (offlineOnly) return@withContext null
+            if (offlineOnly) {
+                for (altStyle in FALLBACK_OFFLINE_STYLES) {
+                    if (altStyle == styleId) continue
+                    val af = tileFile(context, altStyle, z, x, y)
+                    if (af.exists() && af.length() > 0L) {
+                        try {
+                            return@withContext af.readBytes()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                return@withContext null
+            }
             networkPermits.withPermit {
                 val url = resolveTileUrl(urlTemplate, z, x, y, cartoApiKey)
                 val fetched = fetchBytes(url) ?: return@withPermit null

@@ -118,6 +118,7 @@ import com.dashboard.app.dashboard_app.model.MapStyleOption
 import com.dashboard.app.dashboard_app.model.PlannedStop
 import com.dashboard.app.dashboard_app.model.SavedPlace
 import com.dashboard.app.dashboard_app.model.SpkluStation
+import com.dashboard.app.dashboard_app.service.OfflineMapPackageService
 import com.dashboard.app.dashboard_app.service.RemoteApisService
 import com.dashboard.app.dashboard_app.service.TileCacheService
 import com.dashboard.app.dashboard_app.ui.components.AddSpkluDialog
@@ -169,6 +170,9 @@ fun NavigationScreen(
     onPickWallpaperImage: () -> Unit,
     onUpdateSettings: (AppSettings) -> Unit,
     onSetRideLocked: (Boolean) -> Unit,
+    onToggleOfflineMode: (Boolean) -> Unit,
+    onRefreshOfflineRegions: () -> Unit,
+    onDeleteOfflineRegion: (String) -> Unit,
     onRetryGps: () -> Unit,
     gpsDiagTextProvider: () -> String,
     onShareText: (text: String, subject: String) -> Unit,
@@ -278,9 +282,16 @@ fun NavigationScreen(
             straightKm = straightKm
         )
         scope.launch {
-            val geoDeferred = async { RemoteApisService.reverseGeocode(gp.lat, gp.lng) }
+            val isOfflineOnly = TileCacheService.offlineOnly
+            val geoDeferred = async {
+                val online = if (!isOfflineOnly) RemoteApisService.reverseGeocode(gp.lat, gp.lng) else null
+                online ?: OfflineMapPackageService.reverseGeocodeOffline(context, gp.lat, gp.lng)
+            }
             val routeDeferred = async {
-                if (origin != null) RemoteApisService.fetchQuickRouteSummary(origin, gp) else null
+                if (origin != null) {
+                    val onlineRt = if (!isOfflineOnly) RemoteApisService.fetchQuickRouteSummary(origin, gp) else null
+                    onlineRt ?: OfflineMapPackageService.quickRouteSummaryOffline(context, origin, gp)
+                } else null
             }
             val geo = geoDeferred.await()
             val rt = routeDeferred.await()
@@ -324,7 +335,8 @@ fun NavigationScreen(
         }
         scope.launch {
             searching = true
-            if (RemoteApisService.isMapsShortUrl(q)) {
+            val isOfflineOnly = TileCacheService.offlineOnly
+            if (!isOfflineOnly && RemoteApisService.isMapsShortUrl(q)) {
                 val resolved = RemoteApisService.resolveGoogleMapsShortUrl(q)
                 if (resolved != null) {
                     searching = false
@@ -342,8 +354,34 @@ fun NavigationScreen(
                     return@launch
                 }
             }
-            val found = RemoteApisService.searchPlaces(q)
-            searchResults = found
+            val offlineHits = OfflineMapPackageService.searchPlacesOffline(
+                context = context,
+                query = q,
+                biasOrigin = state.gpsState.location
+            )
+            val savedHits = state.savedPlaces.filter {
+                it.name.contains(q, ignoreCase = true) || it.category.contains(q, ignoreCase = true)
+            }
+            val spkluHits = state.nearbySpklu
+                .filter { it.name.contains(q, ignoreCase = true) || it.operatorName.contains(q, ignoreCase = true) }
+                .take(4)
+                .map {
+                    SavedPlace(
+                        id = "sp_${it.id}",
+                        name = "${it.name} (SPKLU)",
+                        category = it.socketType,
+                        lat = it.lat,
+                        lng = it.lng,
+                        createdAtMs = 0L
+                    )
+                }
+            val localCombined = (savedHits + spkluHits + offlineHits)
+                .distinctBy { "${it.name.lowercase(Locale.US)}|${(it.lat * 1000).roundToInt()}" }
+
+            val onlineHits = if (!isOfflineOnly) RemoteApisService.searchPlaces(q) else emptyList()
+            searchResults = (onlineHits + localCombined)
+                .distinctBy { "${it.name.lowercase(Locale.US)}|${(it.lat * 1000).roundToInt()}" }
+                .take(15)
             searching = false
         }
     }
@@ -592,13 +630,23 @@ fun NavigationScreen(
                 }
                 item {
                     OfflineMapSection(
-                        styleId = style.id,
-                        urlTemplate = style.tileUrlTemplate,
+                        styleOption = style,
                         cartoApiKey = state.settings.cartoApiKey,
+                        offlineModeOnly = state.settings.offlineModeOnly,
+                        offlineRegions = state.offlineRegions,
                         centerProvider = { mapCenter },
-                        canBulkDownload = style.usesCartoKey ||
+                        canBulkTileDownload = style.usesCartoKey ||
                             style == MapStyleOption.OSM_HOT ||
-                            style == MapStyleOption.TOPO
+                            style == MapStyleOption.TOPO,
+                        onToggleOfflineMode = onToggleOfflineMode,
+                        onRegionsChanged = onRefreshOfflineRegions,
+                        onDeleteRegion = onDeleteOfflineRegion,
+                        onFocusRegion = { pt ->
+                            followRider = false
+                            mapCenter = pt
+                            if (mapZoom < 13.5) mapZoom = 14.0
+                            showStyleSheet = false
+                        }
                     )
                 }
             }
@@ -1488,6 +1536,47 @@ fun NavigationScreen(
                             fontSize = 11.5.sp,
                             color = c.textMuted
                         )
+                        if (state.settings.offlineModeOnly) {
+                            Surface(
+                                shape = CircleShape,
+                                color = Color(0xFF22C55E).copy(alpha = 0.22f)
+                            ) {
+                                Text(
+                                    "OFFLINE",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF22C55E),
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        } else if (state.offlineRouteActive) {
+                            Surface(
+                                shape = CircleShape,
+                                color = c.accent.copy(alpha = 0.2f)
+                            ) {
+                                Text(
+                                    "RUTE OFFLINE",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = c.accent,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                        if (state.isRerouting) {
+                            Surface(
+                                shape = CircleShape,
+                                color = c.warning.copy(alpha = 0.25f)
+                            ) {
+                                Text(
+                                    "REROUTE...",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = c.warning,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
                     }
                 }
             }

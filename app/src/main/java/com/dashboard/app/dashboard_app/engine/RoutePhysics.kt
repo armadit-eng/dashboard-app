@@ -49,6 +49,41 @@ object RoutePhysics {
         return 2.0 * r * atan2(sqrt(h), sqrt(max(0.0, 1.0 - h)))
     }
 
+    fun distanceToPolylineM(point: GeoPointX, polyline: List<GeoPointX>): Double {
+        if (polyline.isEmpty()) return Double.MAX_VALUE
+        if (polyline.size == 1) return haversineKm(point, polyline[0]) * 1000.0
+        val cosLat = cos(degToRad(point.lat)).coerceIn(0.2, 1.0)
+        var minDistM = Double.MAX_VALUE
+        for (i in 0 until polyline.lastIndex) {
+            val a = polyline[i]
+            val b = polyline[i + 1]
+            val bx = (b.lng - a.lng) * 111320.0 * cosLat
+            val by = (b.lat - a.lat) * 110540.0
+            val px = (point.lng - a.lng) * 111320.0 * cosLat
+            val py = (point.lat - a.lat) * 110540.0
+            val len2 = bx * bx + by * by
+            val t = if (len2 > 1e-6) ((px * bx + py * by) / len2).coerceIn(0.0, 1.0) else 0.0
+            val distM = hypot(px - t * bx, py - t * by)
+            if (distM < minDistM) minDistM = distM
+        }
+        return minDistM
+    }
+
+    fun bearingDeg(a: GeoPointX, b: GeoPointX): Double {
+        val lat1 = degToRad(a.lat)
+        val lat2 = degToRad(b.lat)
+        val dLon = degToRad(b.lng - a.lng)
+        val y = sin(dLon) * cos(lat2)
+        val x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+        return ((atan2(y, x) * 180.0 / PI) + 360.0) % 360.0
+    }
+
+    fun normalizeSignedDeg(deg: Double): Double {
+        var d = ((deg % 360.0) + 360.0) % 360.0
+        if (d > 180.0) d -= 360.0
+        return d
+    }
+
     fun parseCoordinatesOrGoogleMapsUrl(input: String): GeoPointX? {
         val trimmed = input.trim()
         val direct = Regex("""(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)""").find(trimmed)

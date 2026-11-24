@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.dashboard.app.dashboard_app.GesitsWidgetProvider
 import com.dashboard.app.dashboard_app.MidForegroundService
 import com.dashboard.app.dashboard_app.ScreenMirrorService
+import com.dashboard.app.dashboard_app.engine.OfflineRegionMeta
 import com.dashboard.app.dashboard_app.engine.RoutePhysics
 import com.dashboard.app.dashboard_app.engine.TelemetryEngine
 import com.dashboard.app.dashboard_app.hardware.BleGattManager
@@ -48,9 +49,11 @@ import com.dashboard.app.dashboard_app.model.TripRecord
 import com.dashboard.app.dashboard_app.model.TripSummaryCardData
 import com.dashboard.app.dashboard_app.model.WeatherData
 import com.dashboard.app.dashboard_app.service.MidFrameRenderer
+import com.dashboard.app.dashboard_app.service.OfflineMapPackageService
 import com.dashboard.app.dashboard_app.service.PersistenceService
 import com.dashboard.app.dashboard_app.service.RemoteApisService
 import com.dashboard.app.dashboard_app.service.SpkluImportParser
+import com.dashboard.app.dashboard_app.service.TileCacheService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -105,6 +108,9 @@ data class DashboardUiState(
     val plannedStops: List<PlannedStop> = emptyList(),
     val activeRoute: NavRouteX? = null,
     val isLoadingRoute: Boolean = false,
+    val isRerouting: Boolean = false,
+    val offlineRouteActive: Boolean = false,
+    val offlineRegions: List<OfflineRegionMeta> = emptyList(),
     val isNavigating: Boolean = false,
     val activeStepIndex: Int = 0,
     val distToNextStepM: Double = 0.0,
@@ -157,6 +163,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private var lastWeatherFetchMs = 0L
     private var lastGeoFetchMs = 0L
     private var lastOffRouteCheckMs = 0L
+    private var offRouteStrikes = 0
+    private var lastRerouteMs = 0L
+    private var activeStopIndex = 0
     private var tripStartArea = ""
     private var activeRouteInitialSoc: Double? = null
     private var hillAlertSpokenForRoute = false
@@ -170,6 +179,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private var gpsWatchdogJob: Job? = null
     private var mapsStreamJob: Job? = null
     private var devSimJob: Job? = null
+    private var routeCalcJob: Job? = null
 
     init {
         wireHardwareCallbacks()
@@ -190,7 +200,11 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             val cachedGeo = storage.loadCachedGeocode()
             val chargeLogs = storage.loadChargingLogs()
             val sohHist = storage.loadSohHistory()
+            val regions = withContext(Dispatchers.IO) {
+                OfflineMapPackageService.listRegions(getApplication())
+            }
 
+            TileCacheService.offlineOnly = settings.offlineModeOnly
             ble.invertB2Current = settings.invertB2Current
             ScreenMirrorService.overlayStripEnabled = settings.mirrorOverlayStrip
             ScreenMirrorService.mirrorOffsetX = settings.mirrorOffsetX.coerceIn(0f, 1f)
@@ -219,6 +233,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     matrixQueue = matrix,
                     chargingLogs = chargeLogs,
                     sohHistory = sohHist,
+                    offlineRegions = regions,
                     gpsState = gps
                 ).recomputeDerived()
             }
@@ -294,22 +309,26 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun syncBackgroundServiceState() {
         val st = _uiState.value
-        val needBg = !st.screenMirrorActive && (
-            st.midStreaming ||
-                st.isNavigating ||
-                st.motorConnState == ConnectionStateX.CONNECTED
+        val needBg = st.isNavigating || (
+            !st.screenMirrorActive && (
+                st.midStreaming ||
+                    st.motorConnState == ConnectionStateX.CONNECTED
+                )
             )
         if (needBg) {
             val title = when {
-                st.isNavigating -> "Navigasi & MID Aktif"
+                st.isRerouting -> "Menghitung Ulang Rute…"
+                st.isNavigating -> if (st.offlineRouteActive) "Navigasi Offline & MID Aktif" else "Navigasi & MID Aktif"
                 st.midStreaming -> "Stream Peta MID Aktif"
                 else -> "Terhubung ke Motor MID"
             }
             val sub = when {
+                st.isRerouting ->
+                    "Rute diperbarui otomatis meski layar terkunci"
                 st.isNavigating && st.midStreaming ->
-                    "AT+MAPS & AT+NAV berjalan di latar (layar terkunci aman)"
+                    "AT+MAPS, GPS, rerute & AT+NAV aktif (layar terkunci aman)"
                 st.isNavigating ->
-                    "Panduan belokan AT+NAV & GPS aktif saat layar mati"
+                    "Panduan belokan AT+NAV, rerute & GPS aktif saat layar mati"
                 st.midStreaming ->
                     "AT+MAPS & AT+NAV terus memperbarui layar MID motor"
                 else ->
@@ -838,27 +857,46 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             val loc = _uiState.value.gpsState.location
             val useLat = lat ?: loc?.lat ?: -6.1754
             val useLng = lng ?: loc?.lng ?: 106.8272
-            val w = RemoteApisService.fetchWeather(useLat, useLng)
-            if (w != null) {
-                _uiState.update { it.copy(weather = w) }
+            if (!TileCacheService.offlineOnly) {
+                val w = RemoteApisService.fetchWeather(useLat, useLng)
+                if (w != null) {
+                    _uiState.update { it.copy(weather = w) }
+                }
             }
             refreshReverseGeo(useLat, useLng)
         }
     }
 
     private suspend fun refreshReverseGeo(lat: Double, lng: Double) {
-        val geo = RemoteApisService.reverseGeocode(lat, lng)
-        if (geo != null && (geo.road.isNotEmpty() || geo.area.isNotEmpty())) {
+        val onlineGeo = if (!TileCacheService.offlineOnly) {
+            RemoteApisService.reverseGeocode(lat, lng)
+        } else null
+
+        if (onlineGeo != null && (onlineGeo.road.isNotEmpty() || onlineGeo.area.isNotEmpty())) {
             _uiState.update { cur ->
                 cur.copy(
                     gpsState = cur.gpsState.copy(
-                        roadName = geo.road,
-                        areaName = geo.area,
+                        roadName = onlineGeo.road,
+                        areaName = onlineGeo.area,
                         isFromCache = false
                     )
                 )
             }
-            storage.saveCachedGeocode(geo.road, geo.area, lat, lng)
+            storage.saveCachedGeocode(onlineGeo.road, onlineGeo.area, lat, lng)
+            return
+        }
+
+        val offlineGeo = OfflineMapPackageService.reverseGeocodeOffline(getApplication(), lat, lng)
+        if (offlineGeo != null && (offlineGeo.road.isNotEmpty() || offlineGeo.area.isNotEmpty())) {
+            _uiState.update { cur ->
+                cur.copy(
+                    gpsState = cur.gpsState.copy(
+                        roadName = offlineGeo.road.ifEmpty { cur.gpsState.roadName },
+                        areaName = offlineGeo.area.ifEmpty { cur.gpsState.areaName },
+                        isFromCache = true
+                    )
+                )
+            }
         }
     }
 
@@ -1057,23 +1095,55 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch { storage.saveChargingLogs(next) }
     }
 
+    fun setOfflineMode(enabled: Boolean) {
+        TileCacheService.offlineOnly = enabled
+        val next = _uiState.value.settings.copy(offlineModeOnly = enabled)
+        updateSettings(next)
+        addLog("OFFLINE", if (enabled) "Mode navigasi FULL OFFLINE diaktifkan." else "Mode online+offline aktif.", false)
+    }
+
+    fun refreshOfflineRegions() {
+        viewModelScope.launch {
+            val regions = OfflineMapPackageService.reloadRegions(getApplication())
+            _uiState.update { it.copy(offlineRegions = regions) }
+        }
+    }
+
+    fun deleteOfflineRegion(regionId: String) {
+        viewModelScope.launch {
+            val regions = OfflineMapPackageService.deleteRegion(getApplication(), regionId)
+            _uiState.update { it.copy(offlineRegions = regions) }
+        }
+    }
+
     // Navigation & Route Planning
     fun addStopAndRoute(stop: PlannedStop) {
+        offRouteStrikes = 0
         _uiState.update { it.copy(plannedStops = it.plannedStops + stop) }
         calculateRoute()
     }
 
     fun setSingleDestination(stop: PlannedStop) {
+        activeStopIndex = 0
+        offRouteStrikes = 0
+        lastRerouteMs = 0L
         _uiState.update { it.copy(plannedStops = listOf(stop)) }
         calculateRoute()
     }
 
     fun clearRoute() {
+        routeCalcJob?.cancel()
         hillAlertSpokenForRoute = false
+        activeStopIndex = 0
+        offRouteStrikes = 0
+        lastRerouteMs = 0L
         _uiState.update {
             it.copy(
                 plannedStops = emptyList(),
                 activeRoute = null,
+                isLoadingRoute = false,
+                isRerouting = false,
+                offlineRouteActive = false,
                 isNavigating = false,
                 isRideLocked = false,
                 wakelockActive = false,
@@ -1090,6 +1160,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         if (nextStops.isEmpty()) {
             clearRoute()
         } else {
+            activeStopIndex = activeStopIndex.coerceIn(0, nextStops.lastIndex)
+            offRouteStrikes = 0
             _uiState.update { it.copy(plannedStops = nextStops) }
             calculateRoute()
         }
@@ -1100,6 +1172,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         if (fromIndex !in cur.indices || toIndex !in cur.indices || fromIndex == toIndex) return
         val item = cur.removeAt(fromIndex)
         cur.add(toIndex, item)
+        activeStopIndex = 0
+        offRouteStrikes = 0
         _uiState.update { it.copy(plannedStops = cur) }
         calculateRoute()
     }
@@ -1129,45 +1203,100 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun calculateRoute() {
+    fun calculateRoute(isReroute: Boolean = false, overrideOrigin: GeoPointX? = null) {
         val cur = _uiState.value
         if (cur.plannedStops.isEmpty()) return
-        val origin = cur.gpsState.location ?: GeoPointX(-6.1754, 106.8272)
+        val targetStops = cur.plannedStops.drop(activeStopIndex).ifEmpty { cur.plannedStops }
+        val origin = overrideOrigin ?: cur.gpsState.location ?: GeoPointX(-6.1754, 106.8272)
         val cacheKey = buildString {
             append(String.format(Locale.US, "%.3f,%.3f", origin.lat, origin.lng))
-            cur.plannedStops.forEach {
+            targetStops.forEach {
                 append("|${String.format(Locale.US, "%.3f,%.3f", it.lat, it.lng)}")
             }
         }
-        viewModelScope.launch {
-            _uiState.update { it.copy(isLoadingRoute = true) }
-            hillAlertSpokenForRoute = false
-            var route = RemoteApisService.fetchOsrmRoute(
-                origin = origin,
-                stops = _uiState.value.plannedStops,
-                settings = _uiState.value.settings,
-                currentSocPct = _uiState.value.effective.combinedSocPct
-            )
-            if (route != null && _uiState.value.settings.routeCacheEnabled) {
+        routeCalcJob?.cancel()
+        routeCalcJob = viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isLoadingRoute = !isReroute,
+                    isRerouting = isReroute
+                )
+            }
+            if (!isReroute) hillAlertSpokenForRoute = false
+
+            val snapshot = _uiState.value
+            var usedOffline = false
+            var route = if (!TileCacheService.offlineOnly) {
+                RemoteApisService.fetchOsrmRoute(
+                    origin = origin,
+                    stops = targetStops,
+                    settings = snapshot.settings,
+                    currentSocPct = snapshot.effective.combinedSocPct
+                )
+            } else null
+
+            if (route != null && snapshot.settings.routeCacheEnabled) {
                 storage.saveCachedRoute(cacheKey, route)
-            } else if (route == null && _uiState.value.settings.routeCacheEnabled) {
-                route = storage.loadCachedRoute(cacheKey)
+            } else if (route == null) {
+                // Full Offline Routing Engine (works with 0 internet & while locked)
+                route = OfflineMapPackageService.computeOfflineRoute(
+                    context = getApplication(),
+                    origin = origin,
+                    stops = targetStops,
+                    settings = snapshot.settings,
+                    currentSocPct = snapshot.effective.combinedSocPct
+                )
                 if (route != null) {
-                    addLog("NAV", "Memuat rute dari cache offline.", false)
+                    usedOffline = true
+                    addLog(
+                        "NAV",
+                        if (isReroute) "Rerute selesai menggunakan mesin navigasi offline."
+                        else "Rute dihitung dengan mesin navigasi FULL OFFLINE.",
+                        false
+                    )
+                } else if (!isReroute && snapshot.settings.routeCacheEnabled) {
+                    route = storage.loadCachedRoute(cacheKey)
+                    if (route != null) {
+                        usedOffline = true
+                        addLog("NAV", "Memuat rute dari cache offline.", false)
+                    }
                 }
             }
-            _uiState.update { state ->
-                if (route != null) {
+
+            if (route != null) {
+                offRouteStrikes = 0
+                _uiState.update { state ->
                     state.copy(
                         isLoadingRoute = false,
+                        isRerouting = false,
+                        offlineRouteActive = usedOffline,
                         activeRoute = route,
                         activeStepIndex = 0,
                         remainingDistKm = route.distanceM / 1000.0,
                         etaMin = route.durationSec / 60.0,
                         distToNextStepM = route.steps.firstOrNull()?.distanceM ?: 0.0
                     )
-                } else {
-                    state.copy(isLoadingRoute = false)
+                }
+                val latest = _uiState.value
+                syncBackgroundServiceState()
+                if (isReroute && latest.isNavigating) {
+                    val s0 = route.steps.firstOrNull()
+                    if (s0 != null && latest.motorConnState == ConnectionStateX.CONNECTED) {
+                        sendMotorNavText("${latest.distToNextStepM.roundToInt()}m ${s0.instruction}")
+                        atNavLastSentSec = System.currentTimeMillis() / 1000L
+                    }
+                    if (latest.midStreaming && latest.motorConnState == ConnectionStateX.CONNECTED) {
+                        sendSingleMidFrame()
+                    }
+                    if (latest.settings.voiceNavEnabled && s0 != null) {
+                        locationTts.speak("Rute baru siap. ${s0.instruction}", force = true)
+                    }
+                }
+            } else {
+                _uiState.update { it.copy(isLoadingRoute = false, isRerouting = false) }
+                syncBackgroundServiceState()
+                if (isReroute) {
+                    addLog("NAV", "Rerute gagal: area belum diunduh & tidak ada internet.", true)
                 }
             }
         }
@@ -1176,6 +1305,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     fun startNavigation() {
         val route = _uiState.value.activeRoute ?: return
         activeRouteInitialSoc = _uiState.value.effective.combinedSocPct
+        offRouteStrikes = 0
+        lastOffRouteCheckMs = 0L
         _uiState.update {
             it.copy(
                 isNavigating = true,
@@ -1210,8 +1341,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun stopNavigation() {
         _uiState.update {
-            it.copy(isNavigating = false, isRideLocked = false, wakelockActive = false)
+            it.copy(isNavigating = false, isRerouting = false, isRideLocked = false, wakelockActive = false)
         }
+        offRouteStrikes = 0
         syncBackgroundServiceState()
     }
 
@@ -1220,11 +1352,20 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         val route = cur.activeRoute ?: return
         if (route.steps.isEmpty()) return
 
+        // Advance intermediate waypoint cursor when passed (< 80 m)
+        val stops = cur.plannedStops
+        if (activeStopIndex < stops.lastIndex) {
+            val curTarget = stops[activeStopIndex]
+            if (RoutePhysics.haversineKm(pos, GeoPointX(curTarget.lat, curTarget.lng)) < 0.08) {
+                activeStopIndex++
+            }
+        }
+
         var stepIdx = cur.activeStepIndex.coerceIn(0, route.steps.lastIndex)
         var distNext = RoutePhysics.haversineKm(pos, route.steps[stepIdx].location) * 1000.0
         var stepChanged = false
 
-        if (distNext < 30.0 && stepIdx < route.steps.lastIndex) {
+        if (distNext < 32.0 && stepIdx < route.steps.lastIndex) {
             stepIdx++
             stepChanged = true
             val next = route.steps[stepIdx]
@@ -1263,19 +1404,30 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             )
         }
 
+        // Exact polyline distance off-route & automatic reroute (works even with screen locked)
         val now = System.currentTimeMillis()
-        if (now - lastOffRouteCheckMs > 8000L && route.geometry.isNotEmpty()) {
+        if (now - lastOffRouteCheckMs >= 3500L && route.geometry.size >= 2) {
             lastOffRouteCheckMs = now
-            var minDistKm = 999.0
-            var i = 0
-            while (i < route.geometry.size) {
-                val d = RoutePhysics.haversineKm(pos, route.geometry[i])
-                if (d < minDistKm) minDistKm = d
-                i += 2
-            }
-            if (minDistKm > 0.09) {
-                addLog("NAV", "Keluar jalur (${(minDistKm * 1000).toInt()}m), hitung ulang…", false)
-                calculateRoute()
+            val accOk = cur.gpsState.accuracyM == null || cur.gpsState.accuracyM <= 50.0
+            if (!accOk) return
+
+            val minDistM = RoutePhysics.distanceToPolylineM(pos, route.geometry)
+            if (minDistM > 65.0) {
+                offRouteStrikes += if (minDistM > 140.0) 2 else 1
+                if (offRouteStrikes >= 2 && now - lastRerouteMs >= 10_000L && !cur.isRerouting) {
+                    lastRerouteMs = now
+                    offRouteStrikes = 0
+                    addLog("NAV", "Keluar jalur (${minDistM.roundToInt()}m), hitung ulang otomatis…", false)
+                    if (cur.settings.voiceNavEnabled) {
+                        locationTts.speak("Keluar jalur, menghitung ulang rute", force = true)
+                    }
+                    if (cur.motorConnState == ConnectionStateX.CONNECTED) {
+                        sendMotorNavText("REROUTE JALUR...")
+                    }
+                    calculateRoute(isReroute = true, overrideOrigin = pos)
+                }
+            } else if (minDistM <= 45.0) {
+                offRouteStrikes = 0
             }
         }
     }

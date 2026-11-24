@@ -95,7 +95,8 @@ data class AppSettings(
     val lastParkTsMs: Long = 0L,
     val tripPrepAsk: Boolean = true,
     val showElevationInPreview: Boolean = true,
-    val customSpkluFeedUrl: String = ""
+    val customSpkluFeedUrl: String = "",
+    val offlineModeOnly: Boolean = false
 ) {
     val batteryPriority: BatterySourcePriority
         get() = BatterySourcePriority.fromId(batteryPriorityId)

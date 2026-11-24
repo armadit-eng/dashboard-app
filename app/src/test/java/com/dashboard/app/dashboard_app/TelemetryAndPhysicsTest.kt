@@ -1,5 +1,9 @@
 package com.dashboard.app.dashboard_app
 
+import com.dashboard.app.dashboard_app.engine.OfflinePlaceEntry
+import com.dashboard.app.dashboard_app.engine.OfflineRoadClass
+import com.dashboard.app.dashboard_app.engine.OfflineRoutingGraph
+import com.dashboard.app.dashboard_app.engine.OsmWayInput
 import com.dashboard.app.dashboard_app.engine.RoutePhysics
 import com.dashboard.app.dashboard_app.engine.TelemetryEngine
 import com.dashboard.app.dashboard_app.model.AppSettings
@@ -11,6 +15,7 @@ import com.dashboard.app.dashboard_app.model.JkBmsData
 import com.dashboard.app.dashboard_app.model.LiveTripMetrics
 import com.dashboard.app.dashboard_app.model.MapStyleOption
 import com.dashboard.app.dashboard_app.model.MotorData
+import com.dashboard.app.dashboard_app.model.PlannedStop
 import com.dashboard.app.dashboard_app.model.RidingScoreState
 import com.dashboard.app.dashboard_app.model.TripRecord
 import com.dashboard.app.dashboard_app.service.RemoteApisService
@@ -22,6 +27,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 
 class TelemetryAndPhysicsTest {
 
@@ -480,5 +487,103 @@ class TelemetryAndPhysicsTest {
         val aspectExpected = outW.toFloat() / outH.toFloat()
         val aspectActual = bottomRight.width.toFloat() / bottomRight.height.toFloat()
         assertEquals(aspectExpected, aspectActual, 0.03f)
+    }
+
+    @Test
+    fun measuresExactPolylineDistanceOnLongSegmentsForReroute() {
+        val poly = listOf(
+            GeoPointX(-6.2000, 106.8000),
+            GeoPointX(-6.2000, 106.8200) // ~2.2 km straight East segment
+        )
+        // Dead center along the long segment should be ~0 m even though vertices are > 1.1 km away
+        val onSegment = GeoPointX(-6.2000, 106.8100)
+        assertTrue(RoutePhysics.distanceToPolylineM(onSegment, poly) < 2.0)
+
+        // ~110 m north of the segment midpoint triggers off-route (> 65 m)
+        val offRoute = GeoPointX(-6.1990, 106.8100)
+        val dM = RoutePhysics.distanceToPolylineM(offRoute, poly)
+        assertTrue(dM in 95.0..125.0)
+    }
+
+    @Test
+    fun buildsOfflineRoadGraphRoutesWithTurnsAndSerializesCleanly() {
+        // Construct a street grid:
+        // Node 1 (-6.200, 106.800) -> 2 (-6.196, 106.800) North (Jl. Merdeka, degree-2 pass-through 10 added!)
+        // Node 2 -> 3 (-6.196, 106.805) East (Jl. Sudirman)
+        // Node 3 -> 4 (-6.200, 106.805) South (Jl. Diponegoro, oneway 4->3 only! so 3->4 blocked)
+        // Node 3 -> 5 (-6.193, 106.805) North (Jl. Thamrin)
+        val nLat = mapOf(
+            1L to -6.2000,
+            10L to -6.1980,
+            2L to -6.1960,
+            3L to -6.1960,
+            4L to -6.2000,
+            5L to -6.1930
+        )
+        val nLng = mapOf(
+            1L to 106.8000,
+            10L to 106.8000,
+            2L to 106.8000,
+            3L to 106.8050,
+            4L to 106.8050,
+            5L to 106.8050
+        )
+        val ways = listOf(
+            OsmWayInput(listOf(1L, 10L, 2L), "Jl. Merdeka", OfflineRoadClass.PRIMARY, true, true),
+            OsmWayInput(listOf(2L, 3L), "Jl. Sudirman", OfflineRoadClass.SECONDARY, true, true),
+            OsmWayInput(listOf(4L, 3L), "Jl. Diponegoro", OfflineRoadClass.TERTIARY, true, false),
+            OsmWayInput(listOf(3L, 5L), "Jl. Thamrin", OfflineRoadClass.PRIMARY, true, true)
+        )
+        val rawPlaces = listOf(
+            OfflinePlaceEntry("Gambir", "Kecamatan / Kota", "", -6.1970, 106.8020, "area"),
+            OfflinePlaceEntry("Alun-Alun Kota", "Park", "Gambir", -6.1962, 106.8035, "poi")
+        )
+        val graph = OfflineRoutingGraph.buildFromOsm(
+            id = "test_jkt",
+            label = "Jakarta Test",
+            centerLat = -6.196,
+            centerLng = 106.8025,
+            radiusKm = 3.0,
+            minLat = -6.21,
+            maxLat = -6.18,
+            minLng = 106.79,
+            maxLng = 106.82,
+            osmWays = ways,
+            osmNodesLat = nLat,
+            osmNodesLng = nLng,
+            rawPlaces = rawPlaces
+        )
+
+        // Binary round-trip test
+        val baos = ByteArrayOutputStream()
+        graph.writeBinary(baos)
+        val reloaded = OfflineRoutingGraph.readBinary(ByteArrayInputStream(baos.toByteArray()), baos.size().toLong())
+        assertNotNull(reloaded)
+
+        // Multi-turn route from Jl. Merdeka (-6.199, 106.800) to Jl. Thamrin (-6.194, 106.805)
+        val route = reloaded!!.computeRoute(
+            origin = GeoPointX(-6.1990, 106.8000),
+            stops = listOf(PlannedStop("d1", "Thamrin", -6.1940, 106.8050)),
+            settings = AppSettings(),
+            currentSocPct = 82.0
+        )
+        assertNotNull(route)
+        assertTrue(route!!.distanceM > 900.0)
+        assertTrue(route.steps.any { it.maneuverType == "depart" && it.roadName == "Jl. Merdeka" })
+        assertTrue(route.steps.any { it.modifier == "right" && it.roadName == "Jl. Sudirman" })
+        assertTrue(route.steps.any { it.modifier == "left" && it.roadName == "Jl. Thamrin" })
+        assertEquals("arrive", route.steps.last().maneuverType)
+
+        // Offline reverse geocoding returns road & area
+        val rev = reloaded.reverseGeocode(GeoPointX(-6.1980, 106.8001))
+        assertNotNull(rev)
+        assertEquals("Jl. Merdeka", rev!!.road)
+        assertEquals("Gambir", rev.area)
+
+        // Offline search finds streets, areas, and POIs
+        val searchStreet = reloaded.searchPlaces("Sudirman")
+        assertTrue(searchStreet.any { it.name == "Jl. Sudirman" })
+        val searchPoi = reloaded.searchPlaces("Alun-Alun")
+        assertTrue(searchPoi.any { it.name == "Alun-Alun Kota" })
     }
 }
