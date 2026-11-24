@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -15,15 +16,26 @@ import android.view.View
 import android.view.WindowManager
 import java.util.Locale
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
+
+data class CaptureBounds(
+    val left: Int,
+    val top: Int,
+    val right: Int,
+    val bottom: Int
+) {
+    val width: Int get() = right - left
+    val height: Int get() = bottom - top
+}
 
 /**
  * Draws a non-touchable green border slightly OUTSIDE the cropped capture region
  * so riders can preview the exact area sent to the MID without the border leaking
- * into the captured frames.
+ * into the captured frames. Also provides unified capture-rect math used by ScreenMirrorService.
  */
 object MirrorRegionOverlay {
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val autoHideTask = Runnable { hideNow() }
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
@@ -31,13 +43,51 @@ object MirrorRegionOverlay {
     fun canDraw(context: Context): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context)
 
+    fun computeCaptureBounds(
+        fw: Int,
+        fh: Int,
+        outW: Int,
+        outH: Int,
+        offsetX: Float,
+        offsetY: Float,
+        scalePct: Int
+    ): CaptureBounds {
+        val safeFw = fw.coerceAtLeast(32)
+        val safeFh = fh.coerceAtLeast(32)
+        val ratio = outW.coerceAtLeast(16).toFloat() / outH.coerceAtLeast(16).toFloat()
+        val scale = (scalePct / 100f).coerceIn(0.35f, 1.0f)
+        val maxPossibleW = min(safeFw.toFloat(), safeFh.toFloat() * ratio)
+        val sw = (maxPossibleW * scale).roundToInt().coerceIn(32, safeFw)
+        val sh = (sw / ratio).roundToInt().coerceIn(32, safeFh)
+        val maxX = (safeFw - sw).coerceAtLeast(0)
+        val maxY = (safeFh - sh).coerceAtLeast(0)
+        val sx = (offsetX.coerceIn(0f, 1f) * maxX).roundToInt().coerceIn(0, maxX)
+        val sy = (offsetY.coerceIn(0f, 1f) * maxY).roundToInt().coerceIn(0, maxY)
+        return CaptureBounds(sx, sy, sx + sw, sy + sh)
+    }
+
+    fun computeCaptureRect(
+        fw: Int,
+        fh: Int,
+        outW: Int,
+        outH: Int,
+        offsetX: Float,
+        offsetY: Float,
+        scalePct: Int
+    ): Rect {
+        val b = computeCaptureBounds(fw, fh, outW, outH, offsetX, offsetY, scalePct)
+        return Rect(b.left, b.top, b.right, b.bottom)
+    }
+
     fun show(
         context: Context,
-        crop: FloatArray = floatArrayOf(0f, 0.10f, 1f, 0.78f),
+        offsetX: Float = ScreenMirrorService.mirrorOffsetX,
+        offsetY: Float = ScreenMirrorService.mirrorOffsetY,
+        scalePct: Int = ScreenMirrorService.mirrorScalePct,
         autoHideMs: Long = 5_000L
     ) {
         val app = context.applicationContext
-        mainHandler.post { showNow(app, crop, autoHideMs) }
+        mainHandler.post { showNow(app, offsetX, offsetY, scalePct, autoHideMs) }
     }
 
     fun hide() {
@@ -45,9 +95,15 @@ object MirrorRegionOverlay {
     }
 
     @Suppress("DEPRECATION")
-    private fun showNow(app: Context, crop: FloatArray, autoHideMs: Long) {
+    private fun showNow(
+        app: Context,
+        offsetX: Float,
+        offsetY: Float,
+        scalePct: Int,
+        autoHideMs: Long
+    ) {
         hideNow()
-        if (!canDraw(app) || crop.size != 4) return
+        if (!canDraw(app)) return
         try {
             val wm = app.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             windowManager = wm
@@ -59,8 +115,22 @@ object MirrorRegionOverlay {
                 wm.defaultDisplay.getRealMetrics(dm)
                 Triple(dm.widthPixels, dm.heightPixels, dm.density)
             }
-            val eff = effectiveCrop(crop, fw, fh)
-            val v = RegionView(app, eff, density)
+            val rect = computeCaptureRect(
+                fw = fw,
+                fh = fh,
+                outW = ScreenMirrorService.reqOutWidth,
+                outH = ScreenMirrorService.reqOutHeight,
+                offsetX = offsetX,
+                offsetY = offsetY,
+                scalePct = scalePct
+            )
+            val eff = floatArrayOf(
+                rect.left.toFloat() / fw.coerceAtLeast(1),
+                rect.top.toFloat() / fh.coerceAtLeast(1),
+                rect.right.toFloat() / fw.coerceAtLeast(1),
+                rect.bottom.toFloat() / fh.coerceAtLeast(1)
+            )
+            val v = RegionView(app, eff, offsetX, offsetY, scalePct, density)
             val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             } else {
@@ -108,38 +178,12 @@ object MirrorRegionOverlay {
         overlayView = null
     }
 
-    private fun effectiveCrop(c: FloatArray, fw: Int, fh: Int): FloatArray {
-        val l = (fw * c[0]).roundToInt()
-        val t = (fh * c[1]).roundToInt()
-        val r = (fw * c[2]).roundToInt()
-        val b = (fh * c[3]).roundToInt()
-        val rw = max(1, r - l)
-        val rh = max(1, b - t)
-        val outW = ScreenMirrorService.reqOutWidth.coerceIn(160, 480)
-        val outH = ScreenMirrorService.reqOutHeight.coerceIn(120, 360)
-        val ratio = outW.toFloat() / outH.toFloat()
-        val sw: Int
-        val sh: Int
-        if (rw.toFloat() / rh.toFloat() > ratio) {
-            sh = rh
-            sw = (sh * ratio).roundToInt()
-        } else {
-            sw = rw
-            sh = (sw / ratio).roundToInt()
-        }
-        val sx = l + (rw - sw) / 2
-        val sy = t + (rh - sh) / 2
-        return floatArrayOf(
-            sx.toFloat() / fw,
-            sy.toFloat() / fh,
-            (sx + sw).toFloat() / fw,
-            (sy + sh).toFloat() / fh
-        )
-    }
-
     private class RegionView(
         context: Context,
         private val eff: FloatArray,
+        private val offsetX: Float,
+        private val offsetY: Float,
+        private val scalePct: Int,
         private val dp: Float
     ) : View(context) {
         private val dim = Paint().apply { color = 0x66000000 }
@@ -178,9 +222,10 @@ object MirrorRegionOverlay {
 
             val label = String.format(
                 Locale.US,
-                "AREA MIRROR MID  atas %d%% | bawah %d%%",
-                (eff[1] * 100).roundToInt(),
-                (eff[3] * 100).roundToInt()
+                "AREA MIRROR MID  X:%d%% Y:%d%% (%d%%)",
+                (offsetX * 100).roundToInt(),
+                (offsetY * 100).roundToInt(),
+                scalePct
             )
             val x = max(8f * dp, l)
             if (ot - s > 22f * dp) {

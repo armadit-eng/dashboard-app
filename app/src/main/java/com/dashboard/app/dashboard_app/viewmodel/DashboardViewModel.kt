@@ -193,6 +193,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
             ble.invertB2Current = settings.invertB2Current
             ScreenMirrorService.overlayStripEnabled = settings.mirrorOverlayStrip
+            ScreenMirrorService.mirrorOffsetX = settings.mirrorOffsetX.coerceIn(0f, 1f)
+            ScreenMirrorService.mirrorOffsetY = settings.mirrorOffsetY.coerceIn(0f, 1f)
+            ScreenMirrorService.mirrorScalePct = settings.mirrorScalePct.coerceIn(35, 100)
 
             _uiState.update { cur ->
                 val gps = if (cachedGeo != null) {
@@ -1585,6 +1588,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             height = s.mapsSnapHeight.coerceIn(120, 360),
             quality = s.mapsQualityPct.coerceIn(30, 95),
             intervalMs = max(450L, s.mapsIntervalMs.toLong()),
+            offsetX = s.mirrorOffsetX.coerceIn(0f, 1f),
+            offsetY = s.mirrorOffsetY.coerceIn(0f, 1f),
+            scalePct = s.mirrorScalePct.coerceIn(35, 100),
             overlayStrip = s.mirrorOverlayStrip
         )
         _uiState.update { it.copy(screenMirrorActive = true) }
@@ -1699,6 +1705,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     fun updateSettings(updated: AppSettings) {
         ble.invertB2Current = updated.invertB2Current
         ScreenMirrorService.overlayStripEnabled = updated.mirrorOverlayStrip
+        ScreenMirrorService.mirrorOffsetX = updated.mirrorOffsetX.coerceIn(0f, 1f)
+        ScreenMirrorService.mirrorOffsetY = updated.mirrorOffsetY.coerceIn(0f, 1f)
+        ScreenMirrorService.mirrorScalePct = updated.mirrorScalePct.coerceIn(35, 100)
         _uiState.update { it.copy(settings = updated).recomputeDerived() }
         viewModelScope.launch { storage.saveSettings(updated) }
     }

@@ -746,7 +746,7 @@ object MidFrameRenderer {
                 canvas.drawText(socTxt, left, midBase(tp, 128f * sc), tp)
             }
 
-            // Bottom elevation profile card
+            // Dynamic lookahead elevation profile card (1.5 - 2.0 km ahead of rider)
             val cx1 = x0 + 6f * sc
             val cx2 = w - 6f * sc
             val cy1 = 144f * sc
@@ -754,40 +754,74 @@ object MidFrameRenderer {
             if (cy2 - cy1 > 34f * sc) {
                 f.color = 0xFF10202B.toInt()
                 canvas.drawRoundRect(RectF(cx1, cy1, cx2, cy2), 5f * sc, 5f * sc, f)
-                val samples = route.elevationSamples
-                if (samples.size >= 3) {
-                    val maxClimb = route.energyEstimate?.maxClimbPct ?: 0.0
-                    val label = if (maxClimb >= 5.0) "Tanjakan ${maxClimb.roundToInt()}%" else "Profil Elevasi"
-                    tp.color = if (maxClimb >= 5.0) 0xFFFFB300.toInt() else 0xFFD6E2EA.toInt()
-                    fitText(tp, label, cx2 - cx1 - 10f * sc, 12f * sc, 9f * sc)
-                    canvas.drawText(label, cx1 + 6f * sc, midBase(tp, cy1 + 12f * sc), tp)
+                val winSamples = RoutePhysics.sliceElevationWindow(
+                    samples = route.elevationSamples,
+                    riderLocation = gps.location,
+                    windowKm = 2.0
+                )
+                if (winSamples.size >= 2) {
+                    val spanKm = winSamples.last().distanceKm.coerceAtLeast(0.1)
+                    val maxClimbAhead = winSamples.drop(1).maxOfOrNull { it.gradePct } ?: 0.0
+                    val spanLabel = if (spanKm >= 1.0) {
+                        String.format(Locale.US, "%.1fkm", spanKm)
+                    } else {
+                        "${(spanKm * 1000.0).roundToInt()}m"
+                    }
+                    val label = if (maxClimbAhead >= 5.0) {
+                        "NANJAK ${maxClimbAhead.roundToInt()}% (+$spanLabel)"
+                    } else {
+                        "ELEVASI +$spanLabel"
+                    }
+                    tp.color = if (maxClimbAhead >= 5.0) 0xFFFFB300.toInt() else 0xFFD6E2EA.toInt()
+                    fitText(tp, label, cx2 - cx1 - 10f * sc, 11.5f * sc, 8.5f * sc)
+                    canvas.drawText(label, cx1 + 6f * sc, midBase(tp, cy1 + 11.5f * sc), tp)
 
-                    val minE = samples.minOf { it.elevationM }
-                    val maxERaw = samples.maxOf { it.elevationM }
-                    val range = max(20.0, maxERaw - minE)
+                    val minE = winSamples.minOf { it.elevationM }
+                    val maxERaw = winSamples.maxOf { it.elevationM }
+                    val range = max(18.0, maxERaw - minE)
                     val base = minE - (range - (maxERaw - minE)) / 2.0
-                    val x1 = cx1 + 8f * sc
+                    val x1 = cx1 + 9f * sc
                     val x2 = cx2 - 8f * sc
                     val y1 = cy1 + 22f * sc
-                    val y2 = cy2 - 6f * sc
+                    val y2 = cy2 - 7f * sc
                     val lineP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                         style = Paint.Style.STROKE
-                        strokeWidth = max(2f, 2.5f * sc)
+                        strokeWidth = max(2.2f, 2.7f * sc)
                         strokeCap = Paint.Cap.ROUND
                     }
-                    for (i in 1 until samples.size) {
-                        val xa = x1 + (x2 - x1) * (i - 1f) / (samples.size - 1f)
-                        val xb = x1 + (x2 - x1) * i.toFloat() / (samples.size - 1f)
-                        val ya = (y2 - ((samples[i - 1].elevationM - base) / range) * (y2 - y1)).toFloat()
-                        val yb = (y2 - ((samples[i].elevationM - base) / range) * (y2 - y1)).toFloat()
-                        lineP.color = when (samples[i].gradeType) {
-                            HillGrade.UPHILL_STEEP -> 0xFFFF3D00.toInt()
-                            HillGrade.UPHILL_MILD -> 0xFFFFB300.toInt()
-                            HillGrade.DOWNHILL -> 0xFFA24BF0.toInt()
-                            HillGrade.FLAT -> 0xFF00E676.toInt()
+
+                    var firstY = y2
+                    for (i in 0 until winSamples.size) {
+                        val s = winSamples[i]
+                        val px = (x1 + (x2 - x1) * (s.distanceKm / spanKm).coerceIn(0.0, 1.0)).toFloat()
+                        val py = (y2 - ((s.elevationM - base) / range) * (y2 - y1)).toFloat().coerceIn(y1, y2)
+                        if (i == 0) {
+                            firstY = py
+                        } else {
+                            val prev = winSamples[i - 1]
+                            val xa = (x1 + (x2 - x1) * (prev.distanceKm / spanKm).coerceIn(0.0, 1.0)).toFloat()
+                            val ya = (y2 - ((prev.elevationM - base) / range) * (y2 - y1)).toFloat().coerceIn(y1, y2)
+                            lineP.color = when (s.gradeType) {
+                                HillGrade.UPHILL_STEEP -> 0xFFFF3D00.toInt()
+                                HillGrade.UPHILL_MILD -> 0xFFFFB300.toInt()
+                                HillGrade.DOWNHILL -> 0xFFA24BF0.toInt()
+                                HillGrade.FLAT -> 0xFF00E676.toInt()
+                            }
+                            canvas.drawLine(xa, ya, px, py, lineP)
                         }
-                        canvas.drawLine(xa, ya, xb, yb, lineP)
                     }
+
+                    // White dot on left edge marking rider's current position on elevation profile
+                    val dotRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = 0xFF0B1620.toInt()
+                        style = Paint.Style.FILL
+                    }
+                    val dotWhite = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = Color.WHITE
+                        style = Paint.Style.FILL
+                    }
+                    canvas.drawCircle(x1, firstY, max(3.6f, 4.4f * sc), dotRing)
+                    canvas.drawCircle(x1, firstY, max(2.4f, 3.0f * sc), dotWhite)
                 }
             }
         } else {

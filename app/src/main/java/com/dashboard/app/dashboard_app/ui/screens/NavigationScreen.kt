@@ -7,6 +7,7 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -34,6 +36,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AddLocationAlt
@@ -90,7 +93,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -190,6 +197,7 @@ fun NavigationScreen(
     var showSpkluSheet by remember { mutableStateOf(false) }
     var showNotesSheet by remember { mutableStateOf(false) }
     var showMidSheet by remember { mutableStateOf(false) }
+    var showMirrorAreaDialog by remember { mutableStateOf(false) }
     var showMultiStopSheet by remember { mutableStateOf(false) }
     var showFavoritesSheet by remember { mutableStateOf(false) }
     var showGpsDiag by remember { mutableStateOf(false) }
@@ -729,6 +737,7 @@ fun NavigationScreen(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
@@ -840,20 +849,12 @@ fun NavigationScreen(
                             .height(48.dp)
                             .testTag("preview_mirror_region_button"),
                         onClick = {
-                            if (MirrorRegionOverlay.canDraw(context)) {
-                                showMidSheet = false
-                                MirrorRegionOverlay.show(context)
-                            } else {
-                                context.startActivity(
-                                    Intent(
-                                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                        Uri.parse("package:${context.packageName}")
-                                    )
-                                )
-                            }
+                            showMirrorAreaDialog = true
                         }
                     ) {
-                        Text("Area Mirror")
+                        val xPct = (state.settings.mirrorOffsetX * 100f).roundToInt()
+                        val yPct = (state.settings.mirrorOffsetY * 100f).roundToInt()
+                        Text("Area Mirror ($xPct,$yPct)", maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     OutlinedButton(
                         modifier = Modifier
@@ -881,6 +882,199 @@ fun NavigationScreen(
                 Spacer(Modifier.height(14.dp))
             }
         }
+    }
+
+    if (showMirrorAreaDialog) {
+        val s = state.settings
+        val xPct = (s.mirrorOffsetX.coerceIn(0f, 1f) * 100f).roundToInt()
+        val yPct = (s.mirrorOffsetY.coerceIn(0f, 1f) * 100f).roundToInt()
+        val scalePct = s.mirrorScalePct.coerceIn(35, 100)
+        AlertDialog(
+            onDismissRequest = { showMirrorAreaDialog = false },
+            containerColor = c.surfaceCard,
+            title = { Text("Custom Area Mirror MID") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier.fillMaxWidth(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Canvas(
+                            modifier = Modifier
+                                .width(112.dp)
+                                .aspectRatio(9f / 18f)
+                                .testTag("mirror_area_preview_canvas")
+                        ) {
+                            val fw = 900
+                            val fh = 1800
+                            val sx = size.width / fw.toFloat()
+                            val sy = size.height / fh.toFloat()
+                            drawRoundRect(
+                                color = Color(0xFF0E1621),
+                                cornerRadius = CornerRadius(14.dp.toPx(), 14.dp.toPx())
+                            )
+                            drawRoundRect(
+                                color = Color(0xFF2B3A4A),
+                                cornerRadius = CornerRadius(14.dp.toPx(), 14.dp.toPx()),
+                                style = Stroke(width = 1.5.dp.toPx())
+                            )
+                            // Center guide lines
+                            drawLine(
+                                color = Color(0x28FFFFFF),
+                                start = Offset(size.width / 2f, 0f),
+                                end = Offset(size.width / 2f, size.height),
+                                strokeWidth = 1.dp.toPx()
+                            )
+                            drawLine(
+                                color = Color(0x28FFFFFF),
+                                start = Offset(0f, size.height / 2f),
+                                end = Offset(size.width, size.height / 2f),
+                                strokeWidth = 1.dp.toPx()
+                            )
+                            val rect = MirrorRegionOverlay.computeCaptureRect(
+                                fw = fw,
+                                fh = fh,
+                                outW = s.mapsSnapWidth,
+                                outH = s.mapsSnapHeight,
+                                offsetX = s.mirrorOffsetX,
+                                offsetY = s.mirrorOffsetY,
+                                scalePct = scalePct
+                            )
+                            val rl = rect.left * sx
+                            val rt = rect.top * sy
+                            val rw = rect.width() * sx
+                            val rh = rect.height() * sy
+                            drawRect(
+                                color = Color(0x3800E5A3),
+                                topLeft = Offset(rl, rt),
+                                size = Size(rw, rh)
+                            )
+                            drawRect(
+                                color = Color(0xFF00E5A3),
+                                topLeft = Offset(rl, rt),
+                                size = Size(rw, rh),
+                                style = Stroke(width = 2.dp.toPx())
+                            )
+                            drawCircle(
+                                color = Color.White,
+                                radius = 3.dp.toPx(),
+                                center = Offset(rl + rw / 2f, rt + rh / 2f)
+                            )
+                        }
+                    }
+
+                    Text(
+                        "Geser Kiri ↔ Kanan: $xPct%",
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Slider(
+                        value = s.mirrorOffsetX.coerceIn(0f, 1f),
+                        onValueChange = { v ->
+                            val nextScale = if (s.mirrorScalePct >= 98) 80 else s.mirrorScalePct
+                            onUpdateSettings(s.copy(mirrorOffsetX = v, mirrorScalePct = nextScale))
+                        },
+                        valueRange = 0f..1f,
+                        modifier = Modifier.testTag("mirror_offset_x_slider")
+                    )
+                    if (scalePct >= 98) {
+                        Text(
+                            "Tips: menggeser Kiri/Kanan otomatis menyesuaikan lebar area ke 80% agar posisi bisa bergeser.",
+                            fontSize = 11.sp,
+                            color = c.textMuted
+                        )
+                    }
+
+                    Text(
+                        "Geser Atas ↕ Bawah: $yPct%",
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Slider(
+                        value = s.mirrorOffsetY.coerceIn(0f, 1f),
+                        onValueChange = { v ->
+                            onUpdateSettings(s.copy(mirrorOffsetY = v))
+                        },
+                        valueRange = 0f..1f,
+                        modifier = Modifier.testTag("mirror_offset_y_slider")
+                    )
+
+                    Text(
+                        "Lebar Area Tangkapan: $scalePct%",
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Slider(
+                        value = scalePct.toFloat(),
+                        onValueChange = { v ->
+                            onUpdateSettings(s.copy(mirrorScalePct = v.roundToInt().coerceIn(35, 100)))
+                        },
+                        valueRange = 35f..100f,
+                        modifier = Modifier.testTag("mirror_scale_slider")
+                    )
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = {
+                                onUpdateSettings(
+                                    s.copy(
+                                        mirrorOffsetX = 0.5f,
+                                        mirrorOffsetY = 0.44f,
+                                        mirrorScalePct = 100
+                                    )
+                                )
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("mirror_reset_button")
+                        ) {
+                            Text("Reset Tengah")
+                        }
+                        Button(
+                            onClick = {
+                                if (MirrorRegionOverlay.canDraw(context)) {
+                                    showMirrorAreaDialog = false
+                                    showMidSheet = false
+                                    MirrorRegionOverlay.show(
+                                        context = context,
+                                        offsetX = s.mirrorOffsetX,
+                                        offsetY = s.mirrorOffsetY,
+                                        scalePct = s.mirrorScalePct
+                                    )
+                                } else {
+                                    context.startActivity(
+                                        Intent(
+                                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                            Uri.parse("package:${context.packageName}")
+                                        )
+                                    )
+                                }
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("mirror_show_overlay_button")
+                        ) {
+                            Text("Lihat di Layar")
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { showMirrorAreaDialog = false },
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Text("Selesai")
+                }
+            }
+        )
     }
 
     if (showMultiStopSheet) {

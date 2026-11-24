@@ -277,9 +277,13 @@ fun SlippyMapView(
         }
 
         fun screenToGeo(offset: Offset): GeoPointX {
-            val worldPx = baseTilePx * 2.0.pow(clampedZoom)
-            val wx = centerWx + (offset.x - widthPx / 2f) / worldPx
-            val wy = centerWy + (offset.y - heightPx / 2f) / worldPx
+            val liveCenter = viewCenter
+            val liveZoom = viewZoom.coerceIn(5.0, currentMaxZ)
+            val liveCenterWx = lngToWorldX(liveCenter.lng)
+            val liveCenterWy = latToWorldY(liveCenter.lat)
+            val worldPx = baseTilePx * 2.0.pow(liveZoom)
+            val wx = liveCenterWx + (offset.x - widthPx / 2f) / worldPx
+            val wy = liveCenterWy + (offset.y - heightPx / 2f) / worldPx
             return GeoPointX(
                 lat = worldYToLat(wy),
                 lng = worldXToLng(wx)

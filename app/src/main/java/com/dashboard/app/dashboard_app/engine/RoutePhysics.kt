@@ -13,6 +13,7 @@ import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.floor
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -402,6 +403,86 @@ object RoutePhysics {
                 )
             )
         }
+        return out
+    }
+
+    /**
+     * Slices route elevation samples to a rolling lookahead window (default 2.0 km)
+     * starting at the rider's current projected position along the route.
+     * Returned sample distances are relative to the rider (0.0 at left edge).
+     */
+    fun sliceElevationWindow(
+        samples: List<ElevationSample>,
+        riderLocation: GeoPointX?,
+        windowKm: Double = 2.0
+    ): List<ElevationSample> {
+        if (samples.size < 2) return samples
+        val totalKm = samples.last().distanceKm
+        if (totalKm <= 0.05) return samples
+
+        var riderDistKm = samples.first().distanceKm
+        if (riderLocation != null) {
+            var bestSg = 0
+            var bestT = 0.0
+            var bestOff = Double.MAX_VALUE
+            val cosLat = kotlin.math.cos(Math.toRadians(riderLocation.lat))
+            for (i in 0 until samples.lastIndex) {
+                val p0 = samples[i].point
+                val p1 = samples[i + 1].point
+                val bx = (p1.lng - p0.lng) * 111320.0 * cosLat
+                val by = (p1.lat - p0.lat) * 110540.0
+                val px = (riderLocation.lng - p0.lng) * 111320.0 * cosLat
+                val py = (riderLocation.lat - p0.lat) * 110540.0
+                val len2 = bx * bx + by * by
+                val t = if (len2 > 1e-6) ((px * bx + py * by) / len2).coerceIn(0.0, 1.0) else 0.0
+                val off = hypot(px - t * bx, py - t * by)
+                if (off < bestOff) {
+                    bestOff = off
+                    bestSg = i
+                    bestT = t
+                }
+            }
+            val d0 = samples[bestSg].distanceKm
+            val d1 = samples[bestSg + 1].distanceKm
+            riderDistKm = (d0 + (d1 - d0) * bestT).coerceIn(0.0, totalKm)
+        }
+
+        val spanTarget = windowKm.coerceIn(0.5, 5.0)
+        val startKm = if (totalKm - riderDistKm < 0.25 && totalKm > 0.5) {
+            max(0.0, totalKm - 0.5)
+        } else {
+            riderDistKm
+        }
+        val endKm = (startKm + spanTarget).coerceAtMost(totalKm)
+        if (endKm - startKm < 0.05) return samples
+
+        fun sampleAtDist(targetKm: Double): ElevationSample {
+            val idx = samples.indexOfFirst { it.distanceKm >= targetKm }
+            if (idx <= 0) return samples.first().copy(distanceKm = targetKm - startKm)
+            val a = samples[idx - 1]
+            val b = samples[idx]
+            val span = (b.distanceKm - a.distanceKm).coerceAtLeast(1e-6)
+            val t = ((targetKm - a.distanceKm) / span).coerceIn(0.0, 1.0)
+            return ElevationSample(
+                distanceKm = (targetKm - startKm).coerceAtLeast(0.0),
+                elevationM = a.elevationM + (b.elevationM - a.elevationM) * t,
+                gradePct = b.gradePct,
+                gradeType = b.gradeType,
+                point = GeoPointX(
+                    lat = a.point.lat + (b.point.lat - a.point.lat) * t,
+                    lng = a.point.lng + (b.point.lng - a.point.lng) * t
+                )
+            )
+        }
+
+        val out = mutableListOf<ElevationSample>()
+        out.add(sampleAtDist(startKm))
+        for (s in samples) {
+            if (s.distanceKm > startKm + 0.01 && s.distanceKm < endKm - 0.01) {
+                out.add(s.copy(distanceKm = s.distanceKm - startKm))
+            }
+        }
+        out.add(sampleAtDist(endKm))
         return out
     }
 

@@ -400,4 +400,85 @@ class TelemetryAndPhysicsTest {
         assertTrue(slots.all { it.length <= 20 })
         assertTrue(slots.any { it.startsWith("ETA 12m 6.4km") })
     }
+
+    @Test
+    fun slicesDynamicElevationWindowAheadOfRider() {
+        // 6.0 km linear elevation route heading north (~0.009 deg lat per km)
+        val pts = (0..12).map { i -> GeoPointX(-7.0 + i * 0.0045, 110.0) }
+        val elevs = (0..12).map { i -> 100.0 + i * 25.0 }
+        val res = RoutePhysics.buildElevationAndEnergy(
+            sampledPoints = pts,
+            elevations = elevs,
+            totalDistanceKm = 6.0,
+            durationMin = 15.0,
+            bikeKg = 95.0,
+            riderKg = 70.0,
+            loadKg = 5.0,
+            calFactor = 1.0,
+            totalPackWh = 1440.0,
+            currentSocPct = 80.0
+        )
+        val totalKm = res.samples.last().distanceKm
+        val riderLoc = pts[4] // ~2.0 km into route
+        val sliced = RoutePhysics.sliceElevationWindow(
+            samples = res.samples,
+            riderLocation = riderLoc,
+            windowKm = 2.0
+        )
+        assertTrue(sliced.size >= 2)
+        assertEquals(0.0, sliced.first().distanceKm, 0.001)
+        assertEquals(2.0, sliced.last().distanceKm, 0.05)
+        assertEquals(res.samples[4].elevationM, sliced.first().elevationM, 2.0)
+        assertTrue(sliced.last().elevationM > sliced.first().elevationM)
+
+        // Near end of route still returns valid trailing slice
+        val tail = RoutePhysics.sliceElevationWindow(
+            samples = res.samples,
+            riderLocation = pts.last(),
+            windowKm = 2.0
+        )
+        assertTrue(tail.size >= 2)
+        assertEquals(0.0, tail.first().distanceKm, 0.001)
+        assertTrue(tail.last().distanceKm <= 0.55 && totalKm > 0.5)
+    }
+
+    @Test
+    fun computesMirrorCaptureRectAcrossXYSizesAndBounds() {
+        val fw = 1080
+        val fh = 2400
+        val outW = 350
+        val outH = 220
+
+        val topLeft = MirrorRegionOverlay.computeCaptureBounds(
+            fw = fw,
+            fh = fh,
+            outW = outW,
+            outH = outH,
+            offsetX = 0f,
+            offsetY = 0f,
+            scalePct = 60
+        )
+        assertEquals(0, topLeft.left)
+        assertEquals(0, topLeft.top)
+        assertEquals(648, topLeft.width)
+        assertTrue(topLeft.right <= fw)
+
+        val bottomRight = MirrorRegionOverlay.computeCaptureBounds(
+            fw = fw,
+            fh = fh,
+            outW = outW,
+            outH = outH,
+            offsetX = 1f,
+            offsetY = 1f,
+            scalePct = 60
+        )
+        assertEquals(fw, bottomRight.right)
+        assertEquals(fh, bottomRight.bottom)
+        assertEquals(topLeft.width, bottomRight.width)
+        assertEquals(topLeft.height, bottomRight.height)
+
+        val aspectExpected = outW.toFloat() / outH.toFloat()
+        val aspectActual = bottomRight.width.toFloat() / bottomRight.height.toFloat()
+        assertEquals(aspectExpected, aspectActual, 0.03f)
+    }
 }

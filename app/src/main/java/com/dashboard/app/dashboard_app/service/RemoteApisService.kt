@@ -446,7 +446,7 @@ object RemoteApisService {
                     }
                 }
 
-                val downsampled = RoutePhysics.downsamplePoints(geometry, maxSamples = 36)
+                val downsampled = RoutePhysics.downsamplePoints(geometry, maxSamples = 60)
                 val elevations = fetchElevations(downsampled) ?: emptyList()
                 val physics = RoutePhysics.buildElevationAndEnergy(
                     sampledPoints = downsampled,

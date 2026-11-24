@@ -81,6 +81,13 @@ class ScreenMirrorService : Service() {
         @Volatile var navIcon: Bitmap? = null
         @Volatile var overlayStripEnabled: Boolean = true
         @Volatile var overlayTop: Boolean = false
+        @Volatile var mirrorOffsetX: Float = 0.5f
+        @Volatile var mirrorOffsetY: Float = 0.44f
+        @Volatile var mirrorScalePct: Int = 100
+
+        const val EXTRA_OFFSET_X = "offset_x"
+        const val EXTRA_OFFSET_Y = "offset_y"
+        const val EXTRA_SCALE_PCT = "scale_pct"
 
         fun startService(
             context: Context,
@@ -90,11 +97,16 @@ class ScreenMirrorService : Service() {
             height: Int,
             quality: Int = 72,
             intervalMs: Long = 900L,
-            crop: FloatArray = floatArrayOf(0f, 0.10f, 1f, 0.78f),
+            offsetX: Float = 0.5f,
+            offsetY: Float = 0.44f,
+            scalePct: Int = 100,
             overlayStrip: Boolean = true
         ) {
             reqOutWidth = width.coerceIn(160, 480)
             reqOutHeight = height.coerceIn(120, 360)
+            mirrorOffsetX = offsetX.coerceIn(0f, 1f)
+            mirrorOffsetY = offsetY.coerceIn(0f, 1f)
+            mirrorScalePct = scalePct.coerceIn(35, 100)
             overlayStripEnabled = overlayStrip
             val intent = Intent(context, ScreenMirrorService::class.java).apply {
                 action = ACTION_START
@@ -104,7 +116,9 @@ class ScreenMirrorService : Service() {
                 putExtra(EXTRA_HEIGHT, height)
                 putExtra(EXTRA_QUALITY, quality)
                 putExtra(EXTRA_INTERVAL_MS, intervalMs)
-                putExtra(EXTRA_CROP, crop)
+                putExtra(EXTRA_OFFSET_X, mirrorOffsetX)
+                putExtra(EXTRA_OFFSET_Y, mirrorOffsetY)
+                putExtra(EXTRA_SCALE_PCT, mirrorScalePct)
                 putExtra(EXTRA_OVERLAY_STRIP, overlayStrip)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -176,7 +190,9 @@ class ScreenMirrorService : Service() {
                 reqOutHeight = outHeight
                 jpegQuality = intent.getIntExtra(EXTRA_QUALITY, 72).coerceIn(15, 90)
                 intervalMs = intent.getLongExtra(EXTRA_INTERVAL_MS, 900L).coerceIn(350L, 5000L)
-                intent.getFloatArrayExtra(EXTRA_CROP)?.takeIf { it.size == 4 }?.let { crop = it }
+                mirrorOffsetX = intent.getFloatExtra(EXTRA_OFFSET_X, mirrorOffsetX).coerceIn(0f, 1f)
+                mirrorOffsetY = intent.getFloatExtra(EXTRA_OFFSET_Y, mirrorOffsetY).coerceIn(0f, 1f)
+                mirrorScalePct = intent.getIntExtra(EXTRA_SCALE_PCT, mirrorScalePct).coerceIn(35, 100)
                 overlayStripEnabled = intent.getBooleanExtra(EXTRA_OVERLAY_STRIP, overlayStripEnabled)
 
                 startForegroundCompat()
@@ -374,34 +390,24 @@ class ScreenMirrorService : Service() {
             img.close()
         }
 
-        // Cover-crop user region to target MID aspect ratio (eliminates portrait black bars)
+        // Crop user-positioned capture rectangle (X/Y offset + scale %) to MID output aspect ratio
         val fw = fullBmp.width
         val fh = fullBmp.height
-        val l = (fw * crop[0]).roundToInt().coerceIn(0, fw - 1)
-        val t = (fh * crop[1]).roundToInt().coerceIn(0, fh - 1)
-        val r = (fw * crop[2]).roundToInt().coerceIn(l + 1, fw)
-        val b = (fh * crop[3]).roundToInt().coerceIn(t + 1, fh)
-        val rw = max(1, r - l)
-        val rh = max(1, b - t)
-        val ratio = outWidth.toFloat() / outHeight.toFloat()
-
-        val sw: Int
-        val sh: Int
-        if (rw.toFloat() / rh.toFloat() > ratio) {
-            sh = rh
-            sw = (sh * ratio).roundToInt().coerceIn(1, rw)
-        } else {
-            sw = rw
-            sh = (sw / ratio).roundToInt().coerceIn(1, rh)
-        }
-        val sx = (l + (rw - sw) / 2f).roundToInt().coerceIn(0, fw - sw)
-        val sy = (t + (rh - sh) / 2f).roundToInt().coerceIn(0, fh - sh)
+        val srcRect = MirrorRegionOverlay.computeCaptureRect(
+            fw = fw,
+            fh = fh,
+            outW = outWidth,
+            outH = outHeight,
+            offsetX = mirrorOffsetX,
+            offsetY = mirrorOffsetY,
+            scalePct = mirrorScalePct
+        )
 
         val outBmp = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(outBmp)
         canvas.drawBitmap(
             fullBmp,
-            Rect(sx, sy, sx + sw, sy + sh),
+            srcRect,
             Rect(0, 0, outWidth, outHeight),
             Paint(Paint.FILTER_BITMAP_FLAG)
         )
