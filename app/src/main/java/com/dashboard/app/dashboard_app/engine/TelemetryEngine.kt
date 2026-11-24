@@ -652,15 +652,44 @@ object TelemetryEngine {
         )
     }
 
+    fun formatAtNavText(raw: String): String {
+        val ascii = java.text.Normalizer.normalize(raw, java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{M}+"), "")
+            .replace(Regex("[^\\x20-\\x7E]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return if (ascii.length > 20) ascii.substring(0, 20).trim() else ascii
+    }
+
     fun buildAtNavSlots(
         eff: EffectiveTelemetry,
         trip: LiveTripMetrics,
         roadName: String,
         areaName: String,
         weatherMood: String,
-        slots: AtNavSlotConfig
+        slots: AtNavSlotConfig,
+        isNavigating: Boolean = false,
+        navStepInstruction: String = "",
+        distToNextStepM: Double = 0.0,
+        remainingDistKm: Double = 0.0,
+        etaMin: Double = 0.0
     ): List<String> {
         val out = mutableListOf<String>()
+        if (isNavigating && navStepInstruction.isNotBlank()) {
+            val distStr = if (distToNextStepM >= 1000.0) {
+                "${String.format(Locale.US, "%.1f", distToNextStepM / 1000.0)}k"
+            } else {
+                "${distToNextStepM.roundToInt().coerceAtLeast(0)}m"
+            }
+            val turnLine = formatAtNavText("$distStr $navStepInstruction")
+            if (turnLine.isNotEmpty()) out.add(turnLine)
+            if (remainingDistKm > 0.0 || etaMin > 0.0) {
+                val etaLine = formatAtNavText(
+                    "ETA ${etaMin.roundToInt().coerceAtLeast(1)}m ${String.format(Locale.US, "%.1f", remainingDistKm)}km"
+                )
+                if (etaLine.isNotEmpty()) out.add(etaLine)
+            }
+        }
         if (slots.showRange) out.add("RNG ${String.format(Locale.US, "%.1f", eff.rangeKm)} km")
         if (slots.showTrip) out.add("TRP ${String.format(Locale.US, "%.1f", trip.distanceKm)} km")
         if (slots.showEnergy) out.add("ENG ${trip.energyWh.roundToInt()} Wh")
@@ -674,10 +703,10 @@ object TelemetryEngine {
         }
         if (slots.showLocation && (roadName.isNotBlank() || areaName.isNotBlank())) {
             val loc = listOf(roadName, areaName).filter { it.isNotBlank() }.joinToString(", ")
-            out.add(if (loc.length > 20) loc.substring(0, 20) else loc)
+            out.add(formatAtNavText(loc))
         }
         if (slots.showWeather && weatherMood.isNotBlank()) {
-            out.add(if (weatherMood.length > 20) weatherMood.substring(0, 20) else weatherMood)
+            out.add(formatAtNavText(weatherMood))
         }
         return out
     }

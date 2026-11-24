@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.dashboard.app.dashboard_app.GesitsWidgetProvider
+import com.dashboard.app.dashboard_app.MidForegroundService
 import com.dashboard.app.dashboard_app.ScreenMirrorService
 import com.dashboard.app.dashboard_app.engine.RoutePhysics
 import com.dashboard.app.dashboard_app.engine.TelemetryEngine
@@ -151,6 +152,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private var atNavCursor = 0
     private var atNavLastSentSec = 0L
     private var lastGpsFixMs = 0L
+    private var lastMirrorFallbackMs = 0L
     private var lastWidgetUpdateMs = 0L
     private var lastWeatherFetchMs = 0L
     private var lastGeoFetchMs = 0L
@@ -287,12 +289,42 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
+    private fun syncBackgroundServiceState() {
+        val st = _uiState.value
+        val needBg = !st.screenMirrorActive && (
+            st.midStreaming ||
+                st.isNavigating ||
+                st.motorConnState == ConnectionStateX.CONNECTED
+            )
+        if (needBg) {
+            val title = when {
+                st.isNavigating -> "Navigasi & MID Aktif"
+                st.midStreaming -> "Stream Peta MID Aktif"
+                else -> "Terhubung ke Motor MID"
+            }
+            val sub = when {
+                st.isNavigating && st.midStreaming ->
+                    "AT+MAPS & AT+NAV berjalan di latar (layar terkunci aman)"
+                st.isNavigating ->
+                    "Panduan belokan AT+NAV & GPS aktif saat layar mati"
+                st.midStreaming ->
+                    "AT+MAPS & AT+NAV terus memperbarui layar MID motor"
+                else ->
+                    "Telemetri & AT+NAV motor tetap aktif di latar"
+            }
+            MidForegroundService.startOrUpdate(getApplication(), title, sub)
+        } else {
+            MidForegroundService.stop(getApplication())
+        }
+    }
+
     private fun onMotorConnected() {
         idleDrainCheckedOnConnect = false
         val st = _uiState.value
         if (st.settings.mapsAutoStream && !st.screenMirrorActive && !st.midStreaming) {
             startMidStreaming()
         }
+        syncBackgroundServiceState()
     }
 
     private fun wireHardwareCallbacks() {
@@ -318,12 +350,29 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
         ScreenMirrorService.onMirrorStateChanged = { running ->
             _uiState.update { it.copy(screenMirrorActive = running) }
+            syncBackgroundServiceState()
+        }
+        ScreenMirrorService.onLockscreenFallbackFrameNeeded = {
+            val now = System.currentTimeMillis()
+            val interval = max(500L, _uiState.value.settings.mapsIntervalMs.toLong())
+            if (now - lastMirrorFallbackMs >= interval) {
+                lastMirrorFallbackMs = now
+                viewModelScope.launch { sendSingleMidFrame() }
+            }
+        }
+        ScreenMirrorService.onProjectionLostOnUnlock = {
+            viewModelScope.launch {
+                val st = _uiState.value
+                if (st.motorConnState == ConnectionStateX.CONNECTED && !st.midStreaming) {
+                    startMidStreaming()
+                }
+            }
         }
         ScreenMirrorService.onExternalNavLine = { line ->
             val st = _uiState.value
             if (st.motorConnState == ConnectionStateX.CONNECTED) {
                 if (st.motorViaBle) {
-                    val ascii = line.padEnd(20, ' ').take(20)
+                    val ascii = TelemetryEngine.formatAtNavText(line).padEnd(20, ' ')
                     ble.writeMotorBle("AT+NAV=\"$ascii\"\r\n")
                 } else {
                     btClassic.sendNavText(line)
@@ -487,6 +536,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         if (st.settings.autoSaveTrip && st.liveTrip.distanceKm >= 0.2) {
             saveCurrentTripAndReset(isPartial = false)
         }
+        syncBackgroundServiceState()
     }
 
     private fun addLog(source: String, msg: String, isError: Boolean) {
@@ -675,13 +725,21 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                     if ((nowSec - atNavLastSentSec) >= cur.settings.atNavSlots.intervalSec) {
                         atNavLastSentSec = nowSec
+                        val navStepInstr = if (cur.isNavigating && route != null && route.steps.isNotEmpty()) {
+                            route.steps[cur.activeStepIndex.coerceIn(0, route.steps.lastIndex)].instruction
+                        } else ""
                         val slots = TelemetryEngine.buildAtNavSlots(
                             eff = eff,
                             trip = nextTrip,
                             roadName = cur.gpsState.roadName,
                             areaName = cur.gpsState.areaName,
                             weatherMood = cur.weather?.moodTag ?: "",
-                            slots = cur.settings.atNavSlots
+                            slots = cur.settings.atNavSlots,
+                            isNavigating = cur.isNavigating,
+                            navStepInstruction = navStepInstr,
+                            distToNextStepM = cur.distToNextStepM,
+                            remainingDistKm = cur.remainingDistKm,
+                            etaMin = cur.etaMin
                         )
                         if (slots.isNotEmpty()) {
                             val msg = slots[atNavCursor % slots.size]
@@ -725,7 +783,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 while (isActive) {
                     delay(12_000L)
                     if (System.currentTimeMillis() - lastGpsFixMs > 12_000L) {
-                        locationTts.startGps()
+                        locationTts.startGps(force = true)
                     }
                 }
             }
@@ -857,6 +915,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update {
             it.copy(motorConnState = ConnectionStateX.DISCONNECTED).recomputeDerived()
         }
+        syncBackgroundServiceState()
     }
 
     fun sendMotorCommand(cmd: String) {
@@ -878,8 +937,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun sendMotorNavText(txt: String) {
         if (_uiState.value.motorViaBle) {
-            val clean = txt.replace(Regex("[^\\x20-\\x7E]"), " ").trim()
-            val clipped = if (clean.length > 20) clean.substring(0, 20) else clean
+            val clipped = TelemetryEngine.formatAtNavText(txt)
             sendMotorCommand("AT+NAV=\"${clipped.padEnd(20, ' ')}\"")
         } else {
             btClassic.sendNavText(txt)
@@ -1019,6 +1077,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 spkluAheadKm = null
             )
         }
+        syncBackgroundServiceState()
     }
 
     fun removeStopAt(index: Int) {
@@ -1122,6 +1181,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             )
         }
         val st = _uiState.value
+        syncBackgroundServiceState()
+        locationTts.startGps(force = true)
+        if (st.motorConnState == ConnectionStateX.CONNECTED && route.steps.isNotEmpty()) {
+            val s0 = route.steps.first()
+            sendMotorNavText("${st.distToNextStepM.roundToInt()}m ${s0.instruction}")
+            atNavLastSentSec = System.currentTimeMillis() / 1000L
+        }
         val est = route.energyEstimate
         if (st.settings.hillAlertVoice && !hillAlertSpokenForRoute && est != null && est.maxClimbPct >= 6.0) {
             hillAlertSpokenForRoute = true
@@ -1143,6 +1209,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update {
             it.copy(isNavigating = false, isRideLocked = false, wakelockActive = false)
         }
+        syncBackgroundServiceState()
     }
 
     private fun updateNavigationProgress(pos: GeoPointX) {
@@ -1152,9 +1219,11 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
         var stepIdx = cur.activeStepIndex.coerceIn(0, route.steps.lastIndex)
         var distNext = RoutePhysics.haversineKm(pos, route.steps[stepIdx].location) * 1000.0
+        var stepChanged = false
 
         if (distNext < 30.0 && stepIdx < route.steps.lastIndex) {
             stepIdx++
+            stepChanged = true
             val next = route.steps[stepIdx]
             distNext = RoutePhysics.haversineKm(pos, next.location) * 1000.0
             if (cur.settings.voiceNavEnabled) {
@@ -1164,6 +1233,10 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     sendEspCommand(1, "NAV_VOICE:$code")
                 }
             }
+        }
+        if (stepChanged && cur.motorConnState == ConnectionStateX.CONNECTED) {
+            sendMotorNavText("${distNext.roundToInt()}m ${route.steps[stepIdx].instruction}")
+            atNavLastSentSec = System.currentTimeMillis() / 1000L
         }
 
         val dest = cur.plannedStops.lastOrNull()
@@ -1208,6 +1281,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         val cur = _uiState.value
         if (!cur.isNavigating) return
         _uiState.update { it.copy(isNavigating = false, wakelockActive = false) }
+        syncBackgroundServiceState()
         if (cur.settings.voiceNavEnabled) {
             locationTts.speak("Anda telah tiba di tujuan.", force = true)
         }
@@ -1403,6 +1477,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         if (_uiState.value.midStreaming) return
         if (_uiState.value.screenMirrorActive) stopScreenMirror()
         _uiState.update { it.copy(midStreaming = true) }
+        syncBackgroundServiceState()
         mapsStreamJob?.cancel()
         mapsStreamJob = viewModelScope.launch {
             while (isActive && _uiState.value.midStreaming) {
@@ -1417,6 +1492,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         mapsStreamJob?.cancel()
         mapsStreamJob = null
         _uiState.update { it.copy(midStreaming = false) }
+        syncBackgroundServiceState()
     }
 
     suspend fun sendSingleMidFrame() {
@@ -1512,11 +1588,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             overlayStrip = s.mirrorOverlayStrip
         )
         _uiState.update { it.copy(screenMirrorActive = true) }
+        syncBackgroundServiceState()
     }
 
     fun stopScreenMirror() {
         ScreenMirrorService.stopService(getApplication())
         _uiState.update { it.copy(screenMirrorActive = false) }
+        syncBackgroundServiceState()
     }
 
     fun saveCurrentTripAndReset(isPartial: Boolean = false, predictedWh: Double? = null) {
@@ -1741,6 +1819,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         gpsWatchdogJob?.cancel()
         mapsStreamJob?.cancel()
         devSimJob?.cancel()
+        MidForegroundService.stop(getApplication())
         locationTts.dispose()
         btClassic.dispose()
         ble.dispose()

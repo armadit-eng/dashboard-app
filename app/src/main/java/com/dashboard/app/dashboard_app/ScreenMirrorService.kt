@@ -65,6 +65,8 @@ class ScreenMirrorService : Service() {
         @Volatile var onFrameReady: ((String) -> Unit)? = null
         @Volatile var onMirrorStateChanged: ((Boolean) -> Unit)? = null
         @Volatile var onExternalNavLine: ((String) -> Unit)? = null
+        @Volatile var onLockscreenFallbackFrameNeeded: (() -> Unit)? = null
+        @Volatile var onProjectionLostOnUnlock: (() -> Unit)? = null
         @Volatile var isRunning: Boolean = false
             private set
 
@@ -326,16 +328,21 @@ class ScreenMirrorService : Service() {
                 if (!projectionDead) imageReader?.acquireLatestImage()?.close()
             } catch (_: Exception) {
             }
-            sendNavCard()
+            if (!sendNavCard()) {
+                onLockscreenFallbackFrameNeeded?.invoke()
+            }
             return
         }
 
         if (projectionDead || imageReader == null) {
             if (keyguard) {
-                sendNavCard()
+                if (!sendNavCard()) {
+                    onLockscreenFallbackFrameNeeded?.invoke()
+                }
                 return
             }
             stopMirroring()
+            onProjectionLostOnUnlock?.invoke()
             stopSelf()
             return
         }
@@ -402,7 +409,9 @@ class ScreenMirrorService : Service() {
 
         if (keyguard && looksBlank(outBmp)) {
             outBmp.recycle()
-            sendNavCard()
+            if (!sendNavCard()) {
+                onLockscreenFallbackFrameNeeded?.invoke()
+            }
             return
         }
 
@@ -437,12 +446,12 @@ class ScreenMirrorService : Service() {
         return count > 0 && dark * 100 >= count * 97
     }
 
-    private fun sendNavCard() {
+    private fun sendNavCard(): Boolean {
         val now = System.currentTimeMillis()
-        if (now - navUpdatedMs > 120_000L) return
-        if (navInstr.isEmpty() && navDist.isEmpty()) return
+        if (now - navUpdatedMs > 600_000L) return false
+        if (navInstr.isEmpty() && navDist.isEmpty()) return false
         val key = "$navDist|$navInstr|$navEta"
-        if (key == lastCardKey && now - lastCardMs < 10_000L) return
+        if (key == lastCardKey && now - lastCardMs < 8_000L) return true
 
         val card = renderNavCard()
         val b64 = encodeUnderLimit(card)
@@ -452,6 +461,7 @@ class ScreenMirrorService : Service() {
             lastCardMs = now
             onFrameReady?.invoke(b64)
         }
+        return true
     }
 
     /** High-contrast black/white turn card for locked/off screen, padded for MID overlays. */

@@ -332,4 +332,72 @@ class TelemetryAndPhysicsTest {
         assertEquals("SPLU Stasiun", csvRes[1].name)
         assertEquals(-7.57, csvRes[1].lat, 0.001)
     }
+
+    @Test
+    fun computesParentTileFallbackSliceAcrossZoomLevels() {
+        val slice1 = TileCacheService.computeParentFallbackSlice(
+            targetZ = 16,
+            targetX = 52431,
+            targetY = 33981,
+            parentZ = 15,
+            bmpWidth = 256,
+            bmpHeight = 256
+        )
+        assertNotNull(slice1)
+        assertEquals(15, slice1!!.z)
+        assertEquals(26215, slice1.x)
+        assertEquals(16990, slice1.y)
+        assertEquals(128, slice1.srcX)
+        assertEquals(128, slice1.srcY)
+        assertEquals(128, slice1.srcW)
+        assertEquals(128, slice1.srcH)
+
+        val slice2 = TileCacheService.computeParentFallbackSlice(
+            targetZ = 17,
+            targetX = 104860,
+            targetY = 67963,
+            parentZ = 15,
+            bmpWidth = 256,
+            bmpHeight = 256
+        )
+        assertNotNull(slice2)
+        assertEquals(15, slice2!!.z)
+        assertEquals(64, slice2.srcW)
+        assertEquals(64, slice2.srcH)
+        assertTrue(slice2.srcX in 0 until 256)
+        assertTrue(slice2.srcY in 0 until 256)
+    }
+
+    @Test
+    fun buildsActiveTurnByTurnAtNavSlotsWithAsciiNormalization() {
+        val slots = TelemetryEngine.buildAtNavSlots(
+            eff = TelemetryEngine.computeEffective(
+                motor = MotorData(),
+                motorState = ConnectionStateX.DISCONNECTED,
+                jk = JkBmsData(),
+                jkState = ConnectionStateX.DISCONNECTED,
+                esp1 = Esp32Data(),
+                esp1State = ConnectionStateX.DISCONNECTED,
+                b2 = Battery2Data(),
+                esp2State = ConnectionStateX.DISCONNECTED,
+                gpsSpeedKmh = 35.0,
+                trip = LiveTripMetrics(distanceKm = 4.2, energyWh = 110.0),
+                settings = AppSettings()
+            ),
+            trip = LiveTripMetrics(distanceKm = 4.2, energyWh = 110.0),
+            roadName = "Jl. Sudirman",
+            areaName = "Jakarta",
+            weatherMood = "Cerah",
+            slots = com.dashboard.app.dashboard_app.model.AtNavSlotConfig(),
+            isNavigating = true,
+            navStepInstruction = "Belok kanan ke Jl. Jenderal Sudirman",
+            distToNextStepM = 240.0,
+            remainingDistKm = 6.4,
+            etaMin = 12.0
+        )
+        assertTrue(slots.isNotEmpty())
+        assertTrue(slots.first().startsWith("240m Belok kanan"))
+        assertTrue(slots.all { it.length <= 20 })
+        assertTrue(slots.any { it.startsWith("ETA 12m 6.4km") })
+    }
 }

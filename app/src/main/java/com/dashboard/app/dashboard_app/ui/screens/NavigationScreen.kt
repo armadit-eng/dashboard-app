@@ -1318,7 +1318,8 @@ fun NavigationScreen(
                 tint = Color.White,
                 testTag = "map_zoom_in_fab"
             ) {
-                mapZoom = (mapZoom + 1.0).coerceAtMost(18.0)
+                val maxZ = if (state.settings.dataSaverMap) 16.0 else 18.0
+                mapZoom = (mapZoom + 1.0).coerceAtMost(maxZ)
             }
             MapFabButton(
                 icon = Icons.Rounded.Remove,

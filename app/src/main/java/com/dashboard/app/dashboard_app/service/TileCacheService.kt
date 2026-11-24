@@ -11,6 +11,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.HttpURLConnection
@@ -27,6 +29,15 @@ import kotlin.math.tan
 
 data class TileCoord(val z: Int, val x: Int, val y: Int)
 data class TileCacheStats(val files: Int, val bytes: Long)
+data class TileFallbackSlice(
+    val z: Int,
+    val x: Int,
+    val y: Int,
+    val srcX: Int,
+    val srcY: Int,
+    val srcW: Int,
+    val srcH: Int
+)
 
 object TileCacheService {
     @Volatile
@@ -34,7 +45,9 @@ object TileCacheService {
 
     const val MAX_TILES_PER_DOWNLOAD = 3500
 
-    private val memCache = LruCache<String, Bitmap>(160)
+    private val memCache = LruCache<String, Bitmap>(240)
+    private val imageMemCache = LruCache<String, ImageBitmap>(240)
+    private val networkPermits = Semaphore(6)
 
     private fun rootDir(context: Context): File = File(context.filesDir, "tile_cache")
 
@@ -53,11 +66,82 @@ object TileCacheService {
 
     fun evictMemoryCache() {
         memCache.evictAll()
+        imageMemCache.evictAll()
     }
 
     fun getCachedMemBitmap(styleId: String, z: Int, x: Int, y: Int): Bitmap? {
         val key = "$styleId/$z/$x/$y"
         return memCache.get(key)?.takeIf { !it.isRecycled }
+    }
+
+    fun getCachedImageBitmap(styleId: String, z: Int, x: Int, y: Int): ImageBitmap? {
+        val key = "$styleId/$z/$x/$y"
+        imageMemCache.get(key)?.let { return it }
+        val bmp = memCache.get(key)?.takeIf { !it.isRecycled } ?: return null
+        val img = bmp.asImageBitmap()
+        imageMemCache.put(key, img)
+        return img
+    }
+
+    fun computeParentFallbackSlice(
+        targetZ: Int,
+        targetX: Int,
+        targetY: Int,
+        parentZ: Int,
+        bmpWidth: Int = 256,
+        bmpHeight: Int = 256
+    ): TileFallbackSlice? {
+        val diff = targetZ - parentZ
+        if (diff !in 1..4 || parentZ < 0 || bmpWidth <= 0 || bmpHeight <= 0) return null
+        val scale = 1 shl diff
+        val rawPx = Math.floorDiv(targetX, scale)
+        val rawPy = Math.floorDiv(targetY, scale)
+        val numParent = 1 shl parentZ
+        if (rawPy < 0 || rawPy >= numParent) return null
+        val wrappedPx = ((rawPx % numParent) + numParent) % numParent
+        val subCol = targetX - rawPx * scale
+        val subRow = targetY - rawPy * scale
+        val srcW = max(1, bmpWidth / scale)
+        val srcH = max(1, bmpHeight / scale)
+        return TileFallbackSlice(
+            z = parentZ,
+            x = wrappedPx,
+            y = rawPy,
+            srcX = (subCol * srcW).coerceIn(0, bmpWidth - 1),
+            srcY = (subRow * srcH).coerceIn(0, bmpHeight - 1),
+            srcW = srcW.coerceAtMost(bmpWidth),
+            srcH = srcH.coerceAtMost(bmpHeight)
+        )
+    }
+
+    fun findFallbackImageBitmap(
+        styleId: String,
+        targetZ: Int,
+        targetX: Int,
+        targetY: Int,
+        minZ: Int = 5
+    ): Pair<ImageBitmap, TileFallbackSlice>? {
+        for (diff in 1..3) {
+            val pz = targetZ - diff
+            if (pz < minZ) break
+            val scale = 1 shl diff
+            val rawPx = Math.floorDiv(targetX, scale)
+            val rawPy = Math.floorDiv(targetY, scale)
+            val numParent = 1 shl pz
+            if (rawPy < 0 || rawPy >= numParent) continue
+            val wrappedPx = ((rawPx % numParent) + numParent) % numParent
+            val img = getCachedImageBitmap(styleId, pz, wrappedPx, rawPy) ?: continue
+            val slice = computeParentFallbackSlice(
+                targetZ = targetZ,
+                targetX = targetX,
+                targetY = targetY,
+                parentZ = pz,
+                bmpWidth = img.width,
+                bmpHeight = img.height
+            ) ?: continue
+            return img to slice
+        }
+        return null
     }
 
     suspend fun getTileAndroidBitmap(
@@ -81,16 +165,19 @@ object TileCacheService {
                 }
             }
             if (offlineOnly) return@withContext null
-            val url = resolveTileUrl(urlTemplate, z, x, y, cartoApiKey)
-            val fetched = fetchBytes(url) ?: return@withContext null
-            saveBytes(f, fetched)
-            fetched
+            networkPermits.withPermit {
+                val url = resolveTileUrl(urlTemplate, z, x, y, cartoApiKey)
+                val fetched = fetchBytes(url) ?: return@withPermit null
+                saveBytes(f, fetched)
+                fetched
+            }
         } ?: return null
 
         return withContext(Dispatchers.Default) {
             try {
                 val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@withContext null
                 memCache.put(key, bmp)
+                imageMemCache.put(key, bmp.asImageBitmap())
                 bmp
             } catch (_: Exception) {
                 null
@@ -106,7 +193,12 @@ object TileCacheService {
         x: Int,
         y: Int,
         cartoApiKey: String = ""
-    ): ImageBitmap? = getTileAndroidBitmap(context, styleId, urlTemplate, z, x, y, cartoApiKey)?.asImageBitmap()
+    ): ImageBitmap? {
+        val key = "$styleId/$z/$x/$y"
+        imageMemCache.get(key)?.let { return it }
+        val bmp = getTileAndroidBitmap(context, styleId, urlTemplate, z, x, y, cartoApiKey) ?: return null
+        return imageMemCache.get(key) ?: bmp.asImageBitmap().also { imageMemCache.put(key, it) }
+    }
 
     private fun fetchBytes(urlStr: String): ByteArray? {
         var conn: HttpURLConnection? = null

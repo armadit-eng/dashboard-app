@@ -56,7 +56,10 @@ class LocationAndTtsManager(private val context: Context) : LocationListener {
     private var lastSpokenMs = 0L
 
     @SuppressLint("MissingPermission")
-    fun startGps() {
+    fun startGps(force: Boolean = false) {
+        if (force) {
+            regProviders.clear()
+        }
         val hasFine = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         val hasCoarse = context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         if (!hasFine && !hasCoarse) return
