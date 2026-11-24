@@ -121,6 +121,8 @@ import com.dashboard.app.dashboard_app.model.SavedPlace
 import com.dashboard.app.dashboard_app.model.SpkluStation
 import com.dashboard.app.dashboard_app.service.OfflineMapPackageService
 import com.dashboard.app.dashboard_app.service.RemoteApisService
+import com.dashboard.app.dashboard_app.service.SpkluExportFormat
+import com.dashboard.app.dashboard_app.service.SpkluImportParser
 import com.dashboard.app.dashboard_app.service.TileCacheService
 import com.dashboard.app.dashboard_app.ui.components.AddSpkluDialog
 import com.dashboard.app.dashboard_app.ui.components.CatatNamaDialog
@@ -132,13 +134,16 @@ import com.dashboard.app.dashboard_app.ui.components.RoutePreviewSheetCard
 import com.dashboard.app.dashboard_app.ui.components.SlippyMapView
 import com.dashboard.app.dashboard_app.ui.components.SpkluBottomSheet
 import com.dashboard.app.dashboard_app.ui.components.SpkluDetailDialog
+import com.dashboard.app.dashboard_app.ui.components.SpkluExportDialog
 import com.dashboard.app.dashboard_app.ui.components.TappedMapPlace
 import com.dashboard.app.dashboard_app.ui.components.TripPrepDialog
 import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
 import com.dashboard.app.dashboard_app.viewmodel.DashboardUiState
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -210,6 +215,10 @@ fun NavigationScreen(
     var spkluDialogItem by remember { mutableStateOf<SpkluStation?>(null) }
     var addSpkluTarget by remember { mutableStateOf<Pair<String, GeoPointX>?>(null) }
     var spkluImportFeedback by remember { mutableStateOf<String?>(null) }
+    var showSpkluExportDialog by remember { mutableStateOf(false) }
+    var exportFilteredStations by remember { mutableStateOf<List<SpkluStation>>(emptyList()) }
+    var pendingExportFormat by remember { mutableStateOf<SpkluExportFormat?>(null) }
+    var pendingExportStations by remember { mutableStateOf<List<SpkluStation>>(emptyList()) }
 
     val spkluImportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -223,6 +232,34 @@ fun NavigationScreen(
             }.getOrNull() ?: uri.lastPathSegment
             onImportSpkluUri(uri, fileName) { _, msg ->
                 spkluImportFeedback = msg
+            }
+        }
+    }
+
+    val spkluExportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("*/*")
+    ) { uri ->
+        val fmt = pendingExportFormat
+        val list = pendingExportStations
+        pendingExportFormat = null
+        pendingExportStations = emptyList()
+        if (uri != null && fmt != null && list.isNotEmpty()) {
+            scope.launch {
+                val ok = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val content = SpkluImportParser.exportStations(list, fmt)
+                        context.contentResolver.openOutputStream(uri)?.use { out ->
+                            out.write(content.toByteArray(Charsets.UTF_8))
+                            out.flush()
+                        } ?: throw IllegalStateException("Stream kosong")
+                        true
+                    }.getOrDefault(false)
+                }
+                spkluImportFeedback = if (ok) {
+                    "Berhasil menyimpan ${list.size} titik (${fmt.label})."
+                } else {
+                    "Gagal menyimpan file ekspor."
+                }
             }
         }
     }
@@ -692,6 +729,10 @@ fun NavigationScreen(
             onOpenImportPicker = {
                 spkluImportLauncher.launch(arrayOf("*/*"))
             },
+            onOpenExport = { filteredList ->
+                exportFilteredStations = filteredList
+                showSpkluExportDialog = true
+            },
             onSearchInGoogleMaps = {
                 val center = state.gpsState.location ?: mapCenter
                 val uri = Uri.parse(
@@ -719,6 +760,25 @@ fun NavigationScreen(
             },
             onDeleteUserStation = onRemoveUserSpklu,
             onDismiss = { showSpkluSheet = false }
+        )
+    }
+
+    if (showSpkluExportDialog) {
+        SpkluExportDialog(
+            totalCount = state.nearbySpklu.size,
+            filteredCount = exportFilteredStations.size,
+            onExport = { format, onlyFiltered ->
+                val listToWrite = if (onlyFiltered && exportFilteredStations.isNotEmpty()) {
+                    exportFilteredStations
+                } else {
+                    state.nearbySpklu
+                }
+                showSpkluExportDialog = false
+                pendingExportFormat = format
+                pendingExportStations = listToWrite
+                spkluExportLauncher.launch(format.fileName)
+            },
+            onDismiss = { showSpkluExportDialog = false }
         )
     }
 

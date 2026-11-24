@@ -32,6 +32,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Directions
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.ElectricMoped
 import androidx.compose.material.icons.rounded.EvStation
 import androidx.compose.material.icons.rounded.ExpandLess
@@ -76,6 +77,7 @@ import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.DEFAULT_MOLIS_MAPS_LIST_URL
 import com.dashboard.app.dashboard_app.model.GeoPointX
 import com.dashboard.app.dashboard_app.model.SpkluStation
+import com.dashboard.app.dashboard_app.service.SpkluExportFormat
 import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
 import java.util.Locale
 
@@ -106,6 +108,7 @@ fun SpkluBottomSheet(
     onSyncFeedUrl: (String) -> Unit,
     onOpenAddDialog: () -> Unit,
     onOpenImportPicker: () -> Unit,
+    onOpenExport: (filteredStations: List<SpkluStation>) -> Unit,
     onSearchInGoogleMaps: () -> Unit,
     onUpdateSettings: (AppSettings) -> Unit,
     onSelectStation: (SpkluStation) -> Unit,
@@ -197,7 +200,18 @@ fun SpkluBottomSheet(
                 ) {
                     Icon(Icons.Rounded.FileUpload, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(5.dp))
-                    Text("Impor KML/GPX/CSV", fontSize = 12.5.sp)
+                    Text("Impor", fontSize = 12.5.sp)
+                }
+                OutlinedButton(
+                    onClick = { onOpenExport(filtered) },
+                    enabled = stations.isNotEmpty(),
+                    modifier = Modifier
+                        .height(48.dp)
+                        .testTag("spklu_export_button")
+                ) {
+                    Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(5.dp))
+                    Text("Ekspor / Unduh", fontSize = 12.5.sp)
                 }
                 OutlinedButton(
                     onClick = onSearchInGoogleMaps,
@@ -795,6 +809,93 @@ fun SpkluDetailDialog(
         dismissButton = {
             TextButton(onClick = onDismiss, modifier = Modifier.height(48.dp)) {
                 Text("Tutup")
+            }
+        }
+    )
+}
+
+@Composable
+fun SpkluExportDialog(
+    totalCount: Int,
+    filteredCount: Int,
+    onExport: (format: SpkluExportFormat, onlyFiltered: Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val c = LocalCockpitColors.current
+    var onlyFiltered by remember { mutableStateOf(filteredCount in 1 until totalCount) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = c.surfaceCard,
+        title = { Text("Unduh / Ekspor Data Charger") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Simpan daftar titik SPKLU / Charger Molis ke file di ponsel atau Google Drive untuk dipakai di aplikasi/repo lain.",
+                    fontSize = 12.sp,
+                    color = c.textMuted
+                )
+                if (filteredCount in 1 until totalCount) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clickable { onlyFiltered = !onlyFiltered }
+                    ) {
+                        Checkbox(checked = onlyFiltered, onCheckedChange = { onlyFiltered = it })
+                        Text(
+                            "Hanya hasil filter saat ini ($filteredCount dari $totalCount titik)",
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+                val countToExport = if (onlyFiltered && filteredCount > 0) filteredCount else totalCount
+                Text(
+                    "Pilih format untuk $countToExport titik:",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = c.accent
+                )
+                SpkluExportFormat.entries.forEach { fmt ->
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = c.surfaceElevated,
+                        border = BorderStroke(1.dp, c.borderSubtle),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 52.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { onExport(fmt, onlyFiltered && filteredCount > 0) }
+                            .testTag("export_format_${fmt.name.lowercase()}")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Rounded.Download,
+                                contentDescription = null,
+                                tint = c.accent,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(fmt.label, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                Text(fmt.desc, fontSize = 11.sp, color = c.textMuted)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.height(48.dp)
+            ) {
+                Text("Batal")
             }
         }
     )

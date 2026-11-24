@@ -646,4 +646,42 @@ class TelemetryAndPhysicsTest {
         assertTrue(decoded.all { it.lat in -12.0..7.0 && it.lng in 94.0..142.0 })
         assertTrue(decoded.all { it.isMolisFriendly && it.name.isNotBlank() })
     }
+
+    @Test
+    fun exportsAndRoundTripsSpkluAcrossJsonGeoJsonKmlAndCsv() {
+        val sample = listOf(
+            com.dashboard.app.dashboard_app.model.SpkluStation(
+                id = "s1",
+                name = "SPLU Alun-Alun \"Jogja\" & Sekitar",
+                operatorName = "PLN / SPLU",
+                lat = -7.801234,
+                lng = 110.364567,
+                socketType = "SPLU / Schuko Molis",
+                powerKw = 2.2,
+                notes = "Koin, aman parkir",
+                sourceLabel = "GMap Molis",
+                isMolisFriendly = true
+            ),
+            com.dashboard.app.dashboard_app.model.SpkluStation(
+                id = "s2",
+                name = "Polytron Fast M23",
+                operatorName = "Polytron EV",
+                lat = -7.751931,
+                lng = 110.518523,
+                socketType = "Fast / Socket Molis",
+                notes = "Gratis khusus Polytron",
+                sourceLabel = "GMap Molis",
+                isMolisFriendly = true
+            )
+        )
+        com.dashboard.app.dashboard_app.service.SpkluExportFormat.entries.forEach { fmt ->
+            val text = SpkluImportParser.exportStations(sample, fmt)
+            assertTrue(text.isNotBlank())
+            val reparsed = SpkluImportParser.parseBytes(text.toByteArray(Charsets.UTF_8), fmt.fileName)
+            assertEquals("Failed round-trip for ${fmt.name}", 2, reparsed.size)
+            assertEquals(-7.801234, reparsed[0].lat, 0.0001)
+            assertEquals(110.364567, reparsed[0].lng, 0.0001)
+            assertTrue(reparsed[0].isMolisFriendly)
+        }
+    }
 }

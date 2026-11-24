@@ -2,16 +2,21 @@ package com.dashboard.app.dashboard_app.service
 
 import com.dashboard.app.dashboard_app.engine.RoutePhysics
 import com.dashboard.app.dashboard_app.model.SpkluStation
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.w3c.dom.Element
 import org.xml.sax.InputSource
 import java.io.ByteArrayInputStream
@@ -19,6 +24,38 @@ import java.io.StringReader
 import java.util.zip.ZipInputStream
 import javax.xml.parsers.DocumentBuilderFactory
 import kotlin.math.abs
+
+enum class SpkluExportFormat(
+    val label: String,
+    val fileName: String,
+    val mimeType: String,
+    val desc: String
+) {
+    JSON(
+        label = "JSON Standar (.json)",
+        fileName = "charging_molis_indonesia.json",
+        mimeType = "application/json",
+        desc = "Array objek lengkap (id, name, lat, lng, socketType, notes, dll.)"
+    ),
+    GEOJSON(
+        label = "GeoJSON (.geojson)",
+        fileName = "charging_molis_indonesia.geojson",
+        mimeType = "application/geo+json",
+        desc = "Siap langsung dipakai di MapLibre / Leaflet / WebView"
+    ),
+    KML(
+        label = "KML Google My Maps (.kml)",
+        fileName = "charging_molis_indonesia.kml",
+        mimeType = "application/vnd.google-earth.kml+xml",
+        desc = "Bisa dibuka di Google Earth, My Maps, dan aplikasi GPS"
+    ),
+    CSV(
+        label = "CSV Tabel (.csv)",
+        fileName = "charging_molis_indonesia.csv",
+        mimeType = "text/csv",
+        desc = "Bisa dibuka di Excel / Google Sheets"
+    )
+}
 
 data class GoogleListParseResult(
     val listTitle: String,
@@ -515,5 +552,104 @@ object SpkluImportParser {
                 stations = stations
             )
         }.getOrDefault(GoogleListParseResult("", "", 0, emptyList()))
+    }
+
+    private val prettyJson = Json { prettyPrint = true; encodeDefaults = true }
+
+    fun exportStations(stations: List<SpkluStation>, format: SpkluExportFormat): String {
+        val cleanList = stations.map { it.copy(distanceKm = null) }
+        return when (format) {
+            SpkluExportFormat.JSON -> {
+                prettyJson.encodeToString(ListSerializer(SpkluStation.serializer()), cleanList)
+            }
+            SpkluExportFormat.GEOJSON -> {
+                val root = buildJsonObject {
+                    put("type", "FeatureCollection")
+                    put("features", buildJsonArray {
+                        cleanList.forEach { s ->
+                            add(buildJsonObject {
+                                put("type", "Feature")
+                                put("geometry", buildJsonObject {
+                                    put("type", "Point")
+                                    put("coordinates", buildJsonArray {
+                                        add(JsonPrimitive(s.lng))
+                                        add(JsonPrimitive(s.lat))
+                                    })
+                                })
+                                put("properties", buildJsonObject {
+                                    put("id", s.id)
+                                    put("name", s.name)
+                                    put("operator", s.operatorName)
+                                    put("socket", s.socketType)
+                                    s.powerKw?.let { put("powerKw", it) }
+                                    put("notes", s.notes)
+                                    put("molis", s.isMolisFriendly)
+                                    put("source", s.sourceLabel)
+                                })
+                            })
+                        }
+                    })
+                }
+                prettyJson.encodeToString(JsonObject.serializer(), root)
+            }
+            SpkluExportFormat.KML -> {
+                val sb = StringBuilder()
+                sb.appendLine("""<?xml version="1.0" encoding="UTF-8"?>""")
+                sb.appendLine("""<kml xmlns="http://www.opengis.net/kml/2.2">""")
+                sb.appendLine("<Document>")
+                sb.appendLine("  <name>Charging Molis &amp; SPKLU Indonesia</name>")
+                cleanList.forEach { s ->
+                    val descParts = listOfNotNull(
+                        "Operator: ${s.operatorName}",
+                        "Soket: ${s.socketType}",
+                        s.powerKw?.let { "Daya: $it kW" },
+                        s.notes.takeIf { it.isNotBlank() }
+                    ).joinToString("\n")
+                    sb.appendLine("  <Placemark>")
+                    sb.appendLine("    <name>${escapeXml(s.name)}</name>")
+                    sb.appendLine("    <description>${escapeXml(descParts)}</description>")
+                    sb.appendLine("    <Point><coordinates>${s.lng},${s.lat},0</coordinates></Point>")
+                    sb.appendLine("  </Placemark>")
+                }
+                sb.appendLine("</Document>")
+                sb.appendLine("</kml>")
+                sb.toString()
+            }
+            SpkluExportFormat.CSV -> {
+                val sb = StringBuilder()
+                sb.appendLine("name,lat,lng,operator,socket,powerKw,molis,source,notes")
+                cleanList.forEach { s ->
+                    val cols = listOf(
+                        escapeCsv(s.name),
+                        s.lat.toString(),
+                        s.lng.toString(),
+                        escapeCsv(s.operatorName),
+                        escapeCsv(s.socketType),
+                        s.powerKw?.toString().orEmpty(),
+                        s.isMolisFriendly.toString(),
+                        escapeCsv(s.sourceLabel),
+                        escapeCsv(s.notes)
+                    )
+                    sb.appendLine(cols.joinToString(","))
+                }
+                sb.toString()
+            }
+        }
+    }
+
+    private fun escapeXml(s: String): String = s
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&apos;")
+
+    private fun escapeCsv(s: String): String {
+        val clean = s.replace("\r", " ").replace("\n", " ")
+        return if (clean.contains(',') || clean.contains('"')) {
+            "\"" + clean.replace("\"", "\"\"") + "\""
+        } else {
+            clean
+        }
     }
 }
