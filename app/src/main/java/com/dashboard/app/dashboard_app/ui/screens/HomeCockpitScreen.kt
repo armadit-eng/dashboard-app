@@ -428,21 +428,36 @@ fun HomeCockpitScreen(
                     HorizontalDivider(color = c.borderSubtle)
                     Spacer(Modifier.height(12.dp))
 
+                    val m = state.motorData
+                    val jk = state.jkData
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         MiniMetric(
-                            title = "Baterai 1 (${eff.b1SourceLabel})",
-                            value = "${eff.b1SocPct?.roundToInt()?.toString() ?: "—"}%",
-                            sub = "${eff.b1Vbat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}V • ${eff.b1Ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}A",
+                            title = "Baterai ORI (MID)",
+                            value = "${m.socPct?.roundToInt()?.toString() ?: "—"}%",
+                            sub = "${m.vbat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}V • ${m.ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}A" +
+                                (m.cbatCycles?.let { " • ${it}x" } ?: ""),
                             modifier = Modifier.weight(1f)
                         )
                         MiniMetric(
-                            title = "Baterai 2 (CAN/ESP)",
-                            value = if (eff.b2Active) "${eff.b2SocPct?.roundToInt()?.toString() ?: "—"}%" else "Nonaktif",
-                            sub = if (eff.b2Active) "${eff.b2Vbat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}V • ${eff.b2Ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}A" else "Hubung ESP32 #2",
+                            title = "JK-BMS",
+                            value = "${jk.socPct?.roundToInt()?.toString() ?: "—"}%",
+                            sub = if (jk.vpack != null || jk.ibat != null) {
+                                "${jk.vpack?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}V • ${jk.ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}A" +
+                                    (jk.cycles?.let { " • ${it}x" } ?: "")
+                            } else "Belum terhubung",
                             modifier = Modifier.weight(1f)
+                        )
+                    }
+                    if (eff.b2Active) {
+                        Spacer(Modifier.height(8.dp))
+                        MiniMetric(
+                            title = "Baterai 2 (CAN/ESP32 #2)",
+                            value = "${eff.b2SocPct?.roundToInt()?.toString() ?: "—"}%",
+                            sub = "${eff.b2Vbat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}V • ${eff.b2Ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}A",
+                            modifier = Modifier.fillMaxWidth()
                         )
                     }
                     Spacer(Modifier.height(10.dp))
@@ -451,7 +466,7 @@ fun HomeCockpitScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         MiniMetric(
-                            title = "Daya Total",
+                            title = "Daya Total (${eff.b1SourceLabel})",
                             value = "${eff.combinedPowerW?.roundToInt()?.toString() ?: "—"} W",
                             sub = "Mode: ${eff.modeLabel}",
                             modifier = Modifier.weight(1f)

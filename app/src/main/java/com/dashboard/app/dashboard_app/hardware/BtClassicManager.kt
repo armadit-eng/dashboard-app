@@ -97,6 +97,8 @@ class BtClassicManager(private val context: Context) {
 
     private var lastNavSentText: String = ""
     private var lastNavSentAt: Long = 0L
+    @Volatile
+    private var cbatReceived: Boolean = false
 
     private val adapter: BluetoothAdapter?
         get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -212,6 +214,9 @@ class BtClassicManager(private val context: Context) {
                 val line = reader.readLine() ?: break
                 val trimmed = line.trim()
                 if (trimmed.isNotEmpty()) {
+                    if (!cbatReceived && trimmed.contains("CBAT", ignoreCase = true) && trimmed.any { it.isDigit() }) {
+                        cbatReceived = true
+                    }
                     mainHandler.post { onLineReceived?.invoke(trimmed) }
                 }
             }
@@ -420,7 +425,22 @@ class BtClassicManager(private val context: Context) {
 
     private fun startPolling() {
         stopPolling()
+        cbatReceived = false
         pollSchedule.forEach { it.lastSentMs = 0L }
+
+        // Query battery & odometer snapshot immediately after socket settles, before AT+MAPS floods link
+        scheduler.schedule({
+            if (connected) {
+                listOf(
+                    "AT+CBAT?\r\n",
+                    "AT+SOH?\r\n",
+                    "AT+SOC?\r\n",
+                    "AT+ODO?\r\n",
+                    "AT+VBAT?\r\n",
+                    "AT+TBAT?\r\n"
+                ).forEach { enqueueCoalesced(it) }
+            }
+        }, 450, TimeUnit.MILLISECONDS)
 
         // Allow link/readLoop to settle (1.6s), then sync RTC clock every 60s
         timeFuture = scheduler.scheduleAtFixedRate({
@@ -437,8 +457,10 @@ class BtClassicManager(private val context: Context) {
             var best: PollEntry? = null
             var bestScore = 1.0
             for (entry in pollSchedule) {
-                if (bleBusy && entry.intervalMs > 1000L) continue
-                val interval = ((if (navBusy && entry.intervalMs >= 8000L) entry.intervalMs * 2L else entry.intervalMs) *
+                val isUnreceivedCbat = !cbatReceived && entry.cmd.startsWith("AT+CBAT")
+                if (bleBusy && entry.intervalMs > 1000L && !isUnreceivedCbat) continue
+                val baseInterval = if (isUnreceivedCbat) 3000L else entry.intervalMs
+                val interval = ((if (navBusy && baseInterval >= 8000L) baseInterval * 2L else baseInterval) *
                     if (bleBusy) 2L else 1L)
                 val score = (now - entry.lastSentMs).toDouble() / interval.toDouble()
                 if (score >= bestScore) {

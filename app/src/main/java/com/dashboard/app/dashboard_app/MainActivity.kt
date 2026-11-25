@@ -585,6 +585,10 @@ private fun MainTabContent(
             1 -> DiagnosisScreen(
                 state = state,
                 onRestoreOdo = { viewModel.restoreMotorOdo(it) },
+                onRefreshMidBattery = {
+                    viewModel.refreshMidBatteryTelemetry()
+                    onShowSnackbar("Mengirim ulang permintaan AT+CBAT, SOC, SOH ke MID…")
+                },
                 onSetInvertB2Current = {
                     viewModel.updateSettings(state.settings.copy(invertB2Current = it))
                 },

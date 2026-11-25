@@ -69,6 +69,7 @@ import kotlin.math.roundToInt
 fun DiagnosisScreen(
     state: DashboardUiState,
     onRestoreOdo: (Double) -> Unit,
+    onRefreshMidBattery: () -> Unit,
     onSetInvertB2Current: (Boolean) -> Unit,
     onSendEsp2Command: (String) -> Unit,
     onLogChargeSession: (startSoc: Double, endSoc: Double, energyWh: Double, durationMin: Int) -> Unit,
@@ -76,7 +77,7 @@ fun DiagnosisScreen(
 ) {
     val c = LocalCockpitColors.current
     var tabIndex by remember { mutableIntStateOf(0) }
-    var batTab by remember { mutableIntStateOf(0) }
+    var batTab by remember { mutableIntStateOf(0) } // 0=ORI/MID, 1=JK-BMS, 2=Baterai 2
     var sortLowFirst by remember { mutableStateOf(false) }
 
     Column(modifier = modifier.fillMaxSize()) {
@@ -94,7 +95,7 @@ fun DiagnosisScreen(
             Tab(
                 selected = tabIndex == 1,
                 onClick = { tabIndex = 1 },
-                text = { Text("Dual Baterai") },
+                text = { Text("Baterai & BMS") },
                 modifier = Modifier.testTag("diag_tab_battery")
             )
             Tab(
@@ -113,6 +114,7 @@ fun DiagnosisScreen(
                 onBatTabChange = { batTab = it },
                 sortLowFirst = sortLowFirst,
                 onToggleSort = { sortLowFirst = !sortLowFirst },
+                onRefreshMidBattery = onRefreshMidBattery,
                 onSetInvertB2Current = onSetInvertB2Current,
                 onSendEsp2Command = onSendEsp2Command,
                 onLogChargeSession = onLogChargeSession
@@ -215,7 +217,7 @@ private fun MotorDiagnosisTab(
                 ) {
                     TempCard("Inverter", m.tempInverterC, Modifier.weight(1f))
                     TempCard("Motor BLDC", m.tempMotorC, Modifier.weight(1f))
-                    TempCard("TBAT (MID)", m.tempBatteryC ?: eff.b1TempC, Modifier.weight(1f))
+                    TempCard("TBAT (MID)", m.tempBatteryC, Modifier.weight(1f))
                 }
                 Spacer(Modifier.height(12.dp))
                 Row(
@@ -288,11 +290,13 @@ private fun DualBatteryTab(
     onBatTabChange: (Int) -> Unit,
     sortLowFirst: Boolean,
     onToggleSort: () -> Unit,
+    onRefreshMidBattery: () -> Unit,
     onSetInvertB2Current: (Boolean) -> Unit,
     onSendEsp2Command: (String) -> Unit,
     onLogChargeSession: (startSoc: Double, endSoc: Double, energyWh: Double, durationMin: Int) -> Unit
 ) {
     val c = LocalCockpitColors.current
+    val m = state.motorData
     val jk = state.jkData
     val b2 = state.battery2Data
     val eff = state.effective
@@ -345,53 +349,137 @@ private fun DualBatteryTab(
                 SegmentedButton(
                     selected = batTab == 0,
                     onClick = { onBatTabChange(0) },
-                    shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
-                    modifier = Modifier.testTag("bat_segment_1")
+                    shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3),
+                    modifier = Modifier.testTag("bat_segment_ori")
                 ) {
-                    Text("Baterai 1 (JK/MID)")
+                    Text("ORI / MID")
                 }
                 SegmentedButton(
                     selected = batTab == 1,
                     onClick = { onBatTabChange(1) },
-                    shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                    shape = SegmentedButtonDefaults.itemShape(index = 1, count = 3),
+                    modifier = Modifier.testTag("bat_segment_jk")
+                ) {
+                    Text("JK-BMS")
+                }
+                SegmentedButton(
+                    selected = batTab == 2,
+                    onClick = { onBatTabChange(2) },
+                    shape = SegmentedButtonDefaults.itemShape(index = 2, count = 3),
                     modifier = Modifier.testTag("bat_segment_2")
                 ) {
-                    Text("Baterai 2 (ESP32 #2)")
+                    Text("Baterai 2")
                 }
             }
         }
 
-        if (batTab == 0) {
-            item {
-                CockpitCard {
-                    Text("RINGKASAN BATERAI 1", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
-                    Spacer(Modifier.height(10.dp))
-                    BmsGrid(
-                        listOf(
-                            "SOC" to "${eff.b1SocPct?.roundToInt()?.toString() ?: "—"}%",
-                            "SOH" to "${eff.b1SohPct?.roundToInt()?.toString() ?: "—"}%",
-                            "Tegangan" to "${eff.b1Vbat?.let { String.format(Locale.US, "%.2f", it) } ?: "—"} V",
-                            "Arus" to "${eff.b1Ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} A",
-                            "Delta Sel" to "${jk.deltaCellV?.let { String.format(Locale.US, "%.3f", it) } ?: "—"} V",
-                            "Siklus" to "${jk.cycles ?: state.motorData.cbatCycles ?: "—"}",
-                            "T1 / T2" to "${jk.temp1C?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} / ${jk.temp2C?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
-                            "MOSFET" to "${jk.tempMosC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C"
+        when (batTab) {
+            0 -> {
+                item {
+                    val midPowerW = if (m.vbat != null && m.ibat != null) -(m.vbat * m.ibat) else null
+                    CockpitCard {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("BATERAI ORI (MOTOR MID)", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                                Text(
+                                    "Sumber terpisah langsung dari AT+ MID • Prioritas Range: ${eff.b1SourceLabel}",
+                                    fontSize = 11.5.sp,
+                                    color = c.textMuted
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        BmsGrid(
+                            listOf(
+                                "SOC (MID)" to "${m.socPct?.roundToInt()?.toString() ?: "—"}%",
+                                "SOH (MID)" to "${m.sohPct?.roundToInt()?.toString() ?: "—"}%",
+                                "Tegangan (VBAT)" to "${m.vbat?.let { String.format(Locale.US, "%.2f", it) } ?: "—"} V",
+                                "Arus (IBAT)" to "${m.ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} A",
+                                "Daya (MID)" to "${midPowerW?.roundToInt()?.toString() ?: "—"} W",
+                                "Suhu (TBAT)" to "${m.tempBatteryC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
+                                "Siklus (AT+CBAT)" to "${m.cbatCycles?.toString() ?: "—"}",
+                                "Odometer (MID)" to "${m.odoKm?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} km"
+                            )
                         )
-                    )
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedButton(
+                            onClick = onRefreshMidBattery,
+                            enabled = state.motorConnState == com.dashboard.app.dashboard_app.model.ConnectionStateX.CONNECTED,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("refresh_mid_cbat_button")
+                        ) {
+                            Text(
+                                if (state.motorConnState == com.dashboard.app.dashboard_app.model.ConnectionStateX.CONNECTED) {
+                                    "Ambil Ulang Data MID (AT+CBAT, SOC, SOH)"
+                                } else {
+                                    "Hubungkan Motor MID untuk Query AT+CBAT"
+                                }
+                            )
+                        }
+                    }
                 }
             }
 
-            if (jk.cellVoltages.isNotEmpty()) {
+            1 -> {
                 item {
-                    CellVoltagesCard(
-                        title = "TEGANGAN SEL JK-BMS (${jk.cellCount}S)",
-                        cells = jk.cellVoltages,
-                        sortLowFirst = sortLowFirst,
-                        onToggleSort = onToggleSort
-                    )
+                    val jkPowerW = if (jk.vpack != null && jk.ibat != null) -(jk.vpack * jk.ibat) else null
+                    val balText = when (jk.balanceStatus) {
+                        0 -> "Idle"
+                        1 -> "Charging Balance"
+                        2 -> "Discharging Balance"
+                        else -> if (jk.balancingActive == true) "Aktif" else "—"
+                    }
+                    val ahText = if (jk.remainAh != null && jk.capacityAh != null) {
+                        "${String.format(Locale.US, "%.1f", jk.remainAh)} / ${String.format(Locale.US, "%.1f", jk.capacityAh)} Ah"
+                    } else if (jk.remainAh != null) {
+                        "${String.format(Locale.US, "%.1f", jk.remainAh)} Ah"
+                    } else "—"
+
+                    CockpitCard {
+                        Text("JK-BMS (SMART BMS BLE)", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                        Text(
+                            "Sumber terpisah dari MID • ${if (jk.cellCount > 0) "${jk.cellCount}S terdeteksi" else "Menunggu frame 300B"}",
+                            fontSize = 11.5.sp,
+                            color = c.textMuted
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        BmsGrid(
+                            listOf(
+                                "SOC (JK)" to "${jk.socPct?.roundToInt()?.toString() ?: "—"}%",
+                                "SOH (JK)" to "${jk.sohPct?.roundToInt()?.toString() ?: "—"}%",
+                                "Voltase Pack" to "${jk.vpack?.let { String.format(Locale.US, "%.2f", it) } ?: "—"} V",
+                                "Arus Pack" to "${jk.ibat?.let { String.format(Locale.US, "%.2f", it) } ?: "—"} A",
+                                "Daya (JK)" to "${jkPowerW?.roundToInt()?.toString() ?: "—"} W",
+                                "Siklus (JK)" to "${jk.cycles?.toString() ?: "—"}",
+                                "Sisa / Kapasitas" to ahText,
+                                "Balancing" to balText,
+                                "Delta Sel" to "${jk.deltaCellV?.let { String.format(Locale.US, "%.3f", it) } ?: "—"} V",
+                                "Jumlah Sel" to "${if (jk.cellCount > 0) "${jk.cellCount}S" else "—"}",
+                                "T1 / T2" to "${jk.temp1C?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} / ${jk.temp2C?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
+                                "MOSFET" to "${jk.tempMosC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C"
+                            )
+                        )
+                    }
+                }
+
+                if (jk.cellVoltages.isNotEmpty()) {
+                    item {
+                        CellVoltagesCard(
+                            title = "TEGANGAN SEL JK-BMS (${jk.cellCount}S)",
+                            cells = jk.cellVoltages,
+                            sortLowFirst = sortLowFirst,
+                            onToggleSort = onToggleSort
+                        )
+                    }
                 }
             }
-        } else {
+
+            else -> {
             item {
                 CockpitCard {
                     Text("RINGKASAN BATERAI 2 (ESP32 CAN / SIM)", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
@@ -447,6 +535,7 @@ private fun DualBatteryTab(
                     )
                 }
             }
+        }
         }
 
         // SOH History & Charging Logs Card

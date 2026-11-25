@@ -176,7 +176,7 @@ fun DeviceConnectSheet(
                 }
                 item {
                     val jkSub = buildString {
-                        append(state.jkConnName.ifEmpty { "Baterai 1 BLE" })
+                        append(state.jkConnName.ifEmpty { "Smart BMS BLE" })
                         if (state.jkConnState == ConnectionStateX.CONNECTED && state.jkRssiDbm != null) {
                             append(" (${state.jkRssiDbm} dBm)")
                         }
@@ -243,7 +243,7 @@ fun DeviceConnectSheet(
                             onClick = { priorityMenuExpanded = true },
                             modifier = Modifier.testTag("battery_priority_button")
                         ) {
-                            Text("Prioritas: ${state.settings.batteryPriority.label}")
+                            Text("Utama: ${state.settings.batteryPriority.label}")
                         }
                         DropdownMenu(
                             expanded = priorityMenuExpanded,
@@ -251,7 +251,7 @@ fun DeviceConnectSheet(
                         ) {
                             BatterySourcePriority.entries.forEach { prio ->
                                 DropdownMenuItem(
-                                    text = { Text("Prioritas: ${prio.label}") },
+                                    text = { Text("Sumber Range: ${prio.label}") },
                                     onClick = {
                                         priorityMenuExpanded = false
                                         onChangeBatteryPriority(prio)

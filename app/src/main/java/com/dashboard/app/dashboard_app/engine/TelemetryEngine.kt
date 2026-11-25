@@ -50,8 +50,11 @@ object TelemetryEngine {
     ): MotorData? {
         val line = rawLine.trim()
         if (line.isEmpty() || line.equals("OK", ignoreCase = true)) return null
-        val eqIdx = line.indexOf('=')
-        val colIdx = line.indexOf(':')
+        val cleanLine = if (line.contains("AT+", ignoreCase = true) && line.indexOf("+CBAT", ignoreCase = true) > 3) {
+            line.substring(line.indexOf("+CBAT", ignoreCase = true))
+        } else line
+        val eqIdx = cleanLine.indexOf('=')
+        val colIdx = cleanLine.indexOf(':')
         val sep = when {
             eqIdx > 0 && colIdx > 0 -> min(eqIdx, colIdx)
             eqIdx > 0 -> eqIdx
@@ -60,12 +63,12 @@ object TelemetryEngine {
         }
         if (sep <= 0) return null
 
-        val key = line.substring(0, sep)
+        val key = cleanLine.substring(0, sep)
             .trim()
             .uppercase(Locale.US)
             .removePrefix("AT+")
             .removePrefix("+")
-        val valStr = line.substring(sep + 1).trim().replace("\"", "")
+        val valStr = cleanLine.substring(sep + 1).trim().replace("\"", "")
         val numVal = valStr.toDoubleOrNull()
             ?: leadingNumberRegex.find(valStr)?.value?.toDoubleOrNull()
 
@@ -87,7 +90,7 @@ object TelemetryEngine {
             key.contains("SOH") && numVal != null ->
                 current.copy(sohPct = numVal.coerceIn(0.0, 100.0), lastUpdatedMs = nowMs)
             key.contains("CBAT") && numVal != null ->
-                current.copy(cbatCycles = numVal.roundToInt(), lastUpdatedMs = nowMs)
+                current.copy(cbatCycles = max(0, numVal.roundToInt()), lastUpdatedMs = nowMs)
             key.contains("ODO") && numVal != null -> {
                 if (numVal >= 0 && numVal < 400_000) {
                     onValidOdo?.invoke(numVal)
@@ -173,32 +176,58 @@ object TelemetryEngine {
             return if (v >= 0x80000000L) v - 0x100000000L else v
         }
 
-        val cells = mutableListOf<Double>()
-        for (i in 0 until 32) {
-            val mv = u16le(6 + i * 2)
-            if (mv in 1500..5000) {
-                cells.add(mv / 1000.0)
+        data class VariantDecoded(
+            val offset: Int,
+            val offset2: Int,
+            val cells: List<Double>,
+            val vpack: Double,
+            val ipack: Double
+        )
+
+        fun decodeVariant(offset: Int): VariantDecoded {
+            val maxCells = 24 + (offset / 2)
+            val list = mutableListOf<Double>()
+            for (i in 0 until maxCells) {
+                val v = u16le(6 + i * 2) * 0.001
+                if (v > 0.5 && v < 5.5) {
+                    list.add(v)
+                }
             }
+            val offset2 = offset * 2
+            val vpack = u32le(118 + offset2) * 0.001
+            val ipack = i32le(126 + offset2) * 0.001
+            return VariantDecoded(offset, offset2, list, vpack, ipack)
         }
 
-        val vpack24 = u32le(118) * 0.001
-        val vpack32 = u32le(134) * 0.001
-        val cellSum = cells.sum()
-        val use32Offset = abs(cellSum - vpack32) < abs(cellSum - vpack24)
-        val off = if (use32Offset) 16 else 0
+        val v24 = decodeVariant(0)
+        val v32 = decodeVariant(16)
+        val sum24 = v24.cells.sum()
+        val sum32 = v32.cells.sum()
+        val err24 = if (v24.vpack > 0.0) abs(sum24 - v24.vpack) / v24.vpack else 99.0
+        val err32 = if (v32.vpack > 0.0) abs(sum32 - v32.vpack) / v32.vpack else 99.0
+        val picked = if (err24 <= err32) v24 else v32
 
-        val vpack = u32le(118 + off) * 0.001
-        val ibat = i32le(126 + off) * 0.001
-        val temp1 = i16le(130 + off) * 0.1
-        val temp2 = i16le(132 + off) * 0.1
-        val tempMos = i16le(112 + off) * 0.1
-        val remainAh = u32le(142 + off) * 0.001
-        val capAh = u32le(146 + off) * 0.001
-        val cycles = u32le(150 + off).toInt()
-        val soc = (buf[141 + off].toInt() and 0xFF).toDouble().coerceIn(0.0, 100.0)
-        val sohRaw = buf[158 + off].toInt() and 0xFF
+        val offset = picked.offset
+        val offset2 = picked.offset2
+        val cells = picked.cells
+        val vpack = picked.vpack
+        val ibat = picked.ipack
+
+        val temp1 = i16le(130 + offset2) * 0.1
+        val temp2 = i16le(132 + offset2) * 0.1
+        val tempMos = if (offset == 16) {
+            i16le(112 + offset2) * 0.1
+        } else {
+            i16le(134 + offset2) * 0.1
+        }
+        val balStatus = buf[140 + offset2].toInt() and 0xFF
+        val balAction = balStatus != 0
+        val soc = (buf[141 + offset2].toInt() and 0xFF).toDouble().coerceIn(0.0, 100.0)
+        val remainAh = u32le(142 + offset2) * 0.001
+        val capAh = u32le(146 + offset2) * 0.001
+        val cycles = u32le(150 + offset2).toInt()
+        val sohRaw = buf[158 + offset2].toInt() and 0xFF
         val soh = if (sohRaw in 1..100) sohRaw.toDouble() else null
-        val balAction = buf[140 + off].toInt() != 0
 
         var minCell: Double? = null
         var maxCell: Double? = null
@@ -235,6 +264,7 @@ object TelemetryEngine {
             remainAh = remainAh,
             capacityAh = capAh,
             balancingActive = balAction,
+            balanceStatus = balStatus,
             lastUpdatedMs = nowMs
         )
     }
@@ -278,13 +308,15 @@ object TelemetryEngine {
         var b1Temp: Double? = null
         var b1Soh: Double? = null
 
+        // Keep Baterai ORI (Motor MID) and JK-BMS strictly separated — never mix
+        // fields across devices when computing the active Battery 1 physics source.
         if ((preferJk && jkAlive) || (!motorAlive && jkAlive)) {
             b1Source = "JK-BMS"
-            b1Soc = jk.socPct ?: motor.socPct
-            b1Vbat = jk.vpack ?: motor.vbat
-            b1Ibat = jk.ibat ?: motor.ibat
-            b1Temp = jk.temp1C ?: motor.tempBatteryC
-            b1Soh = jk.sohPct ?: motor.sohPct
+            b1Soc = jk.socPct
+            b1Vbat = jk.vpack
+            b1Ibat = jk.ibat
+            b1Temp = jk.temp1C
+            b1Soh = jk.sohPct
         } else if (motorAlive) {
             b1Source = "Motor MID"
             b1Soc = motor.socPct

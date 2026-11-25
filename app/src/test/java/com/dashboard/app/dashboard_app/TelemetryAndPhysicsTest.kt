@@ -74,6 +74,19 @@ class TelemetryAndPhysicsTest {
     }
 
     @Test
+    fun parsesMotorCbatVariants() {
+        var m = MotorData()
+        m = TelemetryEngine.parseMotorAtLine("+CBAT=42", m)!!
+        assertEquals(42, m.cbatCycles)
+        m = TelemetryEngine.parseMotorAtLine("AT+CBAT=\"105\"", m)!!
+        assertEquals(105, m.cbatCycles)
+        m = TelemetryEngine.parseMotorAtLine("AT+CBAT?+CBAT=77", m)!!
+        assertEquals(77, m.cbatCycles)
+        m = TelemetryEngine.parseMotorAtLine("+CBAT: 18 cycles", m)!!
+        assertEquals(18, m.cbatCycles)
+    }
+
+    @Test
     fun buildsAndParsesJkBms300ByteFrame() {
         val cmd = TelemetryEngine.buildJkCommandFrame(0x96)
         assertEquals(20, cmd.size)
@@ -82,41 +95,141 @@ class TelemetryAndPhysicsTest {
         assertEquals(0x90.toByte(), cmd[2])
         assertEquals(0xEB.toByte(), cmd[3])
 
-        val frame = ByteArray(300)
-        frame[0] = 0x55.toByte()
-        frame[1] = 0xAA.toByte()
-        frame[2] = 0xEB.toByte()
-        frame[3] = 0x90.toByte()
-        frame[4] = 0x02.toByte()
+        fun writeU32Le(buf: ByteArray, off: Int, value: Long) {
+            buf[off] = (value and 0xFF).toByte()
+            buf[off + 1] = ((value ushr 8) and 0xFF).toByte()
+            buf[off + 2] = ((value ushr 16) and 0xFF).toByte()
+            buf[off + 3] = ((value ushr 24) and 0xFF).toByte()
+        }
 
-        // 20 cells @ 3800 mV
+        fun writeI16Le(buf: ByteArray, off: Int, value: Int) {
+            buf[off] = (value and 0xFF).toByte()
+            buf[off + 1] = ((value ushr 8) and 0xFF).toByte()
+        }
+
+        fun finalizeFrame(buf: ByteArray) {
+            var crc = 0
+            for (i in 0 until 299) crc += buf[i].toInt() and 0xFF
+            buf[299] = (crc and 0xFF).toByte()
+        }
+
+        // 1. 24S frame (offset = 0, offset2 = 0)
+        val frame24 = ByteArray(300)
+        frame24[0] = 0x55.toByte()
+        frame24[1] = 0xAA.toByte()
+        frame24[2] = 0xEB.toByte()
+        frame24[3] = 0x90.toByte()
+        frame24[4] = 0x02.toByte()
         for (i in 0 until 20) {
-            frame[6 + i * 2] = (3800 and 0xFF).toByte()
-            frame[6 + i * 2 + 1] = ((3800 ushr 8) and 0xFF).toByte()
+            writeI16Le(frame24, 6 + i * 2, 3800)
         }
+        writeU32Le(frame24, 118, 76_000L) // vpack 76.0V
+        writeU32Le(frame24, 126, (-12_500L) and 0xFFFFFFFFL) // -12.5A
+        writeI16Le(frame24, 130, 315) // temp1 31.5C
+        writeI16Le(frame24, 132, 322) // temp2 32.2C
+        writeI16Le(frame24, 134, 386) // tempMos 38.6C (offset=0 -> 134)
+        frame24[140] = 1
+        frame24[141] = 82
+        writeU32Le(frame24, 142, 24_600L) // 24.6 Ah remain
+        writeU32Le(frame24, 146, 30_000L) // 30.0 Ah cap
+        writeU32Le(frame24, 150, 57L) // 57 cycles
+        frame24[158] = 98 // SOH 98%
+        finalizeFrame(frame24)
 
-        // 24S vpack = 76000 mV @ offset 118
-        val vpackMv = 76000
-        frame[118] = (vpackMv and 0xFF).toByte()
-        frame[119] = ((vpackMv ushr 8) and 0xFF).toByte()
-        frame[120] = ((vpackMv ushr 16) and 0xFF).toByte()
-        frame[121] = ((vpackMv ushr 24) and 0xFF).toByte()
+        val p24 = TelemetryEngine.parseJkBms300ByteFrame(frame24)
+        assertNotNull(p24)
+        assertEquals(20, p24!!.cellCount)
+        assertEquals(76.0, p24.vpack!!, 0.01)
+        assertEquals(-12.5, p24.ibat!!, 0.01)
+        assertEquals(31.5, p24.temp1C!!, 0.05)
+        assertEquals(32.2, p24.temp2C!!, 0.05)
+        assertEquals(38.6, p24.tempMosC!!, 0.05)
+        assertEquals(1, p24.balanceStatus)
+        assertEquals(82.0, p24.socPct!!, 0.01)
+        assertEquals(24.6, p24.remainAh!!, 0.01)
+        assertEquals(30.0, p24.capacityAh!!, 0.01)
+        assertEquals(57, p24.cycles)
+        assertEquals(98.0, p24.sohPct!!, 0.01)
 
-        // SOC = 82% @ 141
-        frame[141] = 82.toByte()
-
-        // CRC byte 299
-        var crc = 0
-        for (i in 0 until 299) {
-            crc += frame[i].toInt() and 0xFF
+        // 2. 32S / HW v11 frame (offset = 16, offset2 = 32)
+        val frame32 = ByteArray(300)
+        frame32[0] = 0x55.toByte()
+        frame32[1] = 0xAA.toByte()
+        frame32[2] = 0xEB.toByte()
+        frame32[3] = 0x90.toByte()
+        frame32[4] = 0x02.toByte()
+        for (i in 0 until 21) {
+            writeI16Le(frame32, 6 + i * 2, 3650)
         }
-        frame[299] = (crc and 0xFF).toByte()
+        val off2 = 32
+        writeI16Le(frame32, 112 + off2, 412) // tempMos 41.2C (offset=16 -> 112+32)
+        writeU32Le(frame32, 118 + off2, 76_650L) // vpack 76.65V
+        writeU32Le(frame32, 126 + off2, (-8_400L) and 0xFFFFFFFFL) // -8.4A
+        writeI16Le(frame32, 130 + off2, 294) // temp1 29.4C
+        writeI16Le(frame32, 132 + off2, 301) // temp2 30.1C
+        frame32[140 + off2] = 2 // discharging balance
+        frame32[141 + off2] = 64 // SOC 64%
+        writeU32Le(frame32, 142 + off2, 19_200L)
+        writeU32Le(frame32, 146 + off2, 30_000L)
+        writeU32Le(frame32, 150 + off2, 128L) // 128 cycles
+        frame32[158 + off2] = 94 // SOH 94%
+        finalizeFrame(frame32)
 
-        val parsed = TelemetryEngine.parseJkBms300ByteFrame(frame)
-        assertNotNull(parsed)
-        assertEquals(20, parsed!!.cellCount)
-        assertEquals(76.0, parsed.vpack!!, 0.01)
-        assertEquals(82.0, parsed.socPct!!, 0.01)
+        val p32 = TelemetryEngine.parseJkBms300ByteFrame(frame32)
+        assertNotNull(p32)
+        assertEquals(21, p32!!.cellCount)
+        assertEquals(76.65, p32.vpack!!, 0.01)
+        assertEquals(-8.4, p32.ibat!!, 0.01)
+        assertEquals(29.4, p32.temp1C!!, 0.05)
+        assertEquals(30.1, p32.temp2C!!, 0.05)
+        assertEquals(41.2, p32.tempMosC!!, 0.05)
+        assertEquals(2, p32.balanceStatus)
+        assertEquals(64.0, p32.socPct!!, 0.01)
+        assertEquals(128, p32.cycles)
+        assertEquals(94.0, p32.sohPct!!, 0.01)
+    }
+
+    @Test
+    fun keepsMidBatteryAndJkBmsStrictlySeparatedInComputeEffective() {
+        val now = 1_700_000_000_000L
+        val motor = MotorData(
+            vbat = 73.0,
+            ibat = -10.0,
+            socPct = 75.0,
+            sohPct = 95.0,
+            tempBatteryC = 34.0,
+            cbatCycles = 41,
+            lastUpdatedMs = now
+        )
+        // JK-BMS connected with sohPct = null, temp1C = 29.0
+        val jk = JkBmsData(
+            vpack = 74.2,
+            ibat = -9.5,
+            socPct = 81.0,
+            sohPct = null,
+            temp1C = 29.0,
+            cycles = 12,
+            lastUpdatedMs = now
+        )
+        val effJk = TelemetryEngine.computeEffective(
+            motor = motor,
+            motorState = ConnectionStateX.CONNECTED,
+            jk = jk,
+            jkState = ConnectionStateX.CONNECTED,
+            esp1 = Esp32Data(),
+            esp1State = ConnectionStateX.DISCONNECTED,
+            b2 = Battery2Data(),
+            esp2State = ConnectionStateX.DISCONNECTED,
+            gpsSpeedKmh = null,
+            trip = LiveTripMetrics(),
+            settings = AppSettings(batteryPriorityId = "jikong"),
+            nowMs = now
+        )
+        assertEquals("JK-BMS", effJk.b1SourceLabel)
+        assertEquals(81.0, effJk.b1SocPct!!, 0.01)
+        assertEquals(74.2, effJk.b1Vbat!!, 0.01)
+        assertEquals(29.0, effJk.b1TempC!!, 0.01)
+        assertNull(effJk.b1SohPct) // Must NOT fall back to Motor MID's 95.0%
     }
 
     @Test

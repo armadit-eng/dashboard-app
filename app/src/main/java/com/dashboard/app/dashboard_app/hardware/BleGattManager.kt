@@ -96,6 +96,9 @@ class BleGattManager(private val context: Context) {
 
     private var jkPollFuture: ScheduledFuture<*>? = null
     private val jkFrameBuf = mutableListOf<Byte>()
+    @Volatile
+    private var jkAwaitingResponse: Boolean = false
+    private var jkAwaitTimeoutRunnable: Runnable? = null
 
     private val esp1Rx = StringBuilder()
     private var esp1Cur = Esp32Data()
@@ -125,6 +128,8 @@ class BleGattManager(private val context: Context) {
     private val motorBleRx = StringBuilder()
     private var motorBlePollFuture: ScheduledFuture<*>? = null
     private var motorBleTimeFuture: ScheduledFuture<*>? = null
+    @Volatile
+    private var motorBleCbatReceived: Boolean = false
     private var rssiPollFuture: ScheduledFuture<*>? = null
 
     private val adapter: BluetoothAdapter?
@@ -305,36 +310,47 @@ class BleGattManager(private val context: Context) {
                 override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
                     if (slotGenerations[slot] != gen) return
                     val isNus = slot == "esp1" || slot == "esp2"
-                    val svc = if (isNus) {
-                        g.getService(NUS_SVC_UUID)
+                    var notifyCh: BluetoothGattCharacteristic? = null
+                    var writeCh: BluetoothGattCharacteristic? = null
+
+                    if (isNus) {
+                        val svc = g.getService(NUS_SVC_UUID)
+                        notifyCh = svc?.getCharacteristic(NUS_NOTIFY_UUID)
+                        writeCh = svc?.getCharacteristic(NUS_WRITE_UUID)
                     } else {
-                        g.getService(JK_SVC_UUID) ?: g.services.firstOrNull { s ->
-                            s.characteristics.any { (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 }
+                        // Some JK-BMS devices declare FFE0 twice where FFE1/FFF2 live on the second instance.
+                        for (s in g.services) {
+                            if (s.uuid == JK_SVC_UUID) {
+                                if (notifyCh == null) notifyCh = s.getCharacteristic(JK_NOTIFY_UUID)
+                                if (writeCh == null) writeCh = s.getCharacteristic(JK_WRITE_UUID)
+                                if (notifyCh != null && writeCh != null) break
+                            }
+                        }
+                        if (notifyCh == null) {
+                            val fallbackSvc = g.services.firstOrNull { s ->
+                                s.characteristics.any { (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 }
+                            }
+                            if (fallbackSvc != null) {
+                                notifyCh = fallbackSvc.getCharacteristic(JK_NOTIFY_UUID) ?: fallbackSvc.characteristics.firstOrNull {
+                                    (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
+                                }
+                                writeCh = writeCh ?: fallbackSvc.getCharacteristic(JK_WRITE_UUID) ?: notifyCh ?: fallbackSvc.characteristics.firstOrNull {
+                                    (it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
+                                }
+                            }
+                        } else if (writeCh == null) {
+                            writeCh = notifyCh
                         }
                     }
-                    if (svc == null) {
+
+                    if (notifyCh == null) {
                         clearConnectTimeout(slot)
                         BleConnectGate.release(gateKey)
                         mainHandler.post {
-                            onLog?.invoke(gateKey, "Layanan GATT tidak ditemukan.", true)
+                            onLog?.invoke(gateKey, "Layanan GATT / characteristic notify tidak ditemukan.", true)
                         }
                         closeSlotOnly(slot, emitDisconnect = true)
                         return
-                    }
-
-                    val notifyCh = if (isNus) {
-                        svc.getCharacteristic(NUS_NOTIFY_UUID)
-                    } else {
-                        svc.getCharacteristic(JK_NOTIFY_UUID) ?: svc.characteristics.firstOrNull {
-                            (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
-                        }
-                    }
-                    val writeCh = if (isNus) {
-                        svc.getCharacteristic(NUS_WRITE_UUID)
-                    } else {
-                        svc.getCharacteristic(JK_WRITE_UUID) ?: notifyCh ?: svc.characteristics.firstOrNull {
-                            (it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
-                        }
                     }
                     if (writeCh != null) writeChars[slot] = writeCh
 
@@ -451,14 +467,45 @@ class BleGattManager(private val context: Context) {
         mainHandler.postDelayed(task, delayMs)
     }
 
+    private fun armJkAwaitGuard() {
+        jkAwaitingResponse = true
+        jkAwaitTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        val r = Runnable {
+            if (jkAwaitingResponse) {
+                jkAwaitingResponse = false
+                synchronized(jkFrameBuf) { jkFrameBuf.clear() }
+            }
+        }
+        jkAwaitTimeoutRunnable = r
+        mainHandler.postDelayed(r, 3000L)
+    }
+
+    private fun clearJkAwaitGuard() {
+        jkAwaitingResponse = false
+        jkAwaitTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        jkAwaitTimeoutRunnable = null
+    }
+
     private fun startJkPolling() {
         jkPollFuture?.cancel(false)
+        clearJkAwaitGuard()
+        synchronized(jkFrameBuf) { jkFrameBuf.clear() }
+
+        // Mandatory JK-BMS handshake: 0x97 (Device Info) first, wait 1500ms so its
+        // 300-byte settings response finishes before requesting 0x96 (Cell Info).
         scheduler.schedule({
-            writeSlot("jk", TelemetryEngine.buildJkCommandFrame(0x97))
+            if (gatts["jk"] != null) {
+                armJkAwaitGuard()
+                writeSlot("jk", TelemetryEngine.buildJkCommandFrame(0x97), noResponse = true)
+            }
         }, 200, TimeUnit.MILLISECONDS)
+
         jkPollFuture = scheduler.scheduleAtFixedRate({
-            writeSlot("jk", TelemetryEngine.buildJkCommandFrame(0x96))
-        }, 650, 2500, TimeUnit.MILLISECONDS)
+            if (gatts["jk"] == null) return@scheduleAtFixedRate
+            if (jkAwaitingResponse) return@scheduleAtFixedRate
+            armJkAwaitGuard()
+            writeSlot("jk", TelemetryEngine.buildJkCommandFrame(0x96), noResponse = true)
+        }, 1700, 2500, TimeUnit.MILLISECONDS)
     }
 
     private fun startRssiPolling() {
@@ -484,11 +531,26 @@ class BleGattManager(private val context: Context) {
     private fun startMotorBlePolling() {
         motorBlePollFuture?.cancel(false)
         motorBleTimeFuture?.cancel(false)
+        motorBleCbatReceived = false
         motorBleSchedule.forEach { it.lastSentMs = 0L }
+
+        val startupCmds = listOf(
+            "AT+CBAT?\r\n",
+            "AT+SOH?\r\n",
+            "AT+SOC?\r\n",
+            "AT+ODO?\r\n",
+            "AT+VBAT?\r\n",
+            "AT+TBAT?\r\n"
+        )
+        startupCmds.forEachIndexed { idx, cmd ->
+            scheduler.schedule({
+                if (gatts["motor"] != null) writeMotorBle(cmd)
+            }, 450L + idx * 170L, TimeUnit.MILLISECONDS)
+        }
 
         motorBleTimeFuture = scheduler.scheduleAtFixedRate({
             if (gatts["motor"] != null) sendMotorBleTimeNow()
-        }, 1600, 60_000, TimeUnit.MILLISECONDS)
+        }, 1800, 60_000, TimeUnit.MILLISECONDS)
 
         motorBlePollFuture = scheduler.scheduleAtFixedRate({
             if (gatts["motor"] == null || isMotorBleMapsSending) return@scheduleAtFixedRate
@@ -497,8 +559,10 @@ class BleGattManager(private val context: Context) {
             var best: PollEntry? = null
             var bestScore = 1.0
             for (entry in motorBleSchedule) {
-                if (bleBusy && entry.intervalMs > 1000L) continue
-                val interval = entry.intervalMs * if (bleBusy) 2L else 1L
+                val isUnreceivedCbat = !motorBleCbatReceived && entry.cmd.startsWith("AT+CBAT")
+                if (bleBusy && entry.intervalMs > 1000L && !isUnreceivedCbat) continue
+                val baseInterval = if (isUnreceivedCbat) 3000L else entry.intervalMs
+                val interval = baseInterval * if (bleBusy) 2L else 1L
                 val score = (now - entry.lastSentMs).toDouble() / interval.toDouble()
                 if (score >= bestScore) {
                     best = entry
@@ -518,38 +582,61 @@ class BleGattManager(private val context: Context) {
             "esp1" -> handleLineStream(esp1Rx, bytes) { parseEsp1Line(it) }
             "esp2" -> handleLineStream(esp2Rx, bytes) { parseEsp2Line(it) }
             "motor" -> handleLineStream(motorBleRx, bytes) { line ->
+                if (!motorBleCbatReceived && line.contains("CBAT", ignoreCase = true) && line.any { it.isDigit() }) {
+                    motorBleCbatReceived = true
+                }
                 mainHandler.post { onMotorBleLine?.invoke(line) }
             }
         }
     }
 
+    private fun findJkHeader(buf: List<Byte>): Int {
+        for (i in 0..(buf.size - 4)) {
+            if ((buf[i].toInt() and 0xFF) == 0x55 &&
+                (buf[i + 1].toInt() and 0xFF) == 0xAA &&
+                (buf[i + 2].toInt() and 0xFF) == 0xEB &&
+                (buf[i + 3].toInt() and 0xFF) == 0x90
+            ) {
+                return i
+            }
+        }
+        return -1
+    }
+
     private fun onJkBytes(chunk: ByteArray) {
         synchronized(jkFrameBuf) {
-            if (chunk.size >= 4 &&
-                (chunk[0].toInt() and 0xFF) == 0x55 &&
-                (chunk[1].toInt() and 0xFF) == 0xAA &&
-                (chunk[2].toInt() and 0xFF) == 0xEB &&
-                (chunk[3].toInt() and 0xFF) == 0x90
-            ) {
-                jkFrameBuf.clear()
-            }
             chunk.forEach { jkFrameBuf.add(it) }
-            if (jkFrameBuf.size >= 300) {
-                val frame = jkFrameBuf.subList(0, 300).toByteArray()
-                jkFrameBuf.clear()
-                val parsed = TelemetryEngine.parseJkBms300ByteFrame(
-                    frame,
-                    onError = { err -> mainHandler.post { onLog?.invoke("JKBMS", err, true) } }
-                )
-                if (parsed != null) {
-                    mainHandler.post { onJkData?.invoke(parsed) }
+            val hdrIdx = findJkHeader(jkFrameBuf)
+            if (hdrIdx < 0) {
+                if (jkFrameBuf.size > 600) {
+                    jkFrameBuf.clear()
+                    mainHandler.post {
+                        onLog?.invoke("JKBMS", "Header 55 AA EB 90 tidak ditemukan dalam 600 byte — reset buffer.", true)
+                    }
                 }
+                return
+            }
+            if (hdrIdx > 0) {
+                jkFrameBuf.subList(0, hdrIdx).clear()
+            }
+            if (jkFrameBuf.size < 300) return
+
+            val frame = jkFrameBuf.subList(0, 300).toByteArray()
+            jkFrameBuf.subList(0, 300).clear()
+            clearJkAwaitGuard()
+
+            val parsed = TelemetryEngine.parseJkBms300ByteFrame(
+                frame,
+                onError = { err -> mainHandler.post { onLog?.invoke("JKBMS", err, true) } }
+            )
+            if (parsed != null) {
+                mainHandler.post { onJkData?.invoke(parsed) }
             }
         }
     }
 
     private fun handleLineStream(sb: StringBuilder, bytes: ByteArray, onLine: (String) -> Unit) {
-        val text = String(bytes, Charsets.UTF_8)
+        val text = String(bytes, Charsets.UTF_8).replace('\r', '\n')
         synchronized(sb) {
             sb.append(text)
             while (true) {
@@ -761,6 +848,7 @@ class BleGattManager(private val context: Context) {
         if (slot == "jk") {
             jkPollFuture?.cancel(false)
             jkPollFuture = null
+            clearJkAwaitGuard()
             synchronized(jkFrameBuf) { jkFrameBuf.clear() }
         } else if (slot == "motor") {
             motorBlePollFuture?.cancel(false)

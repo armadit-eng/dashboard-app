@@ -362,11 +362,22 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun onMotorConnected() {
         idleDrainCheckedOnConnect = false
+        syncBackgroundServiceState()
         val st = _uiState.value
         if (st.settings.mapsAutoStream && !st.screenMirrorActive && !st.midStreaming) {
-            startMidStreaming()
+            viewModelScope.launch {
+                // Give startup AT+CBAT?/AT+SOH?/AT+ODO? queries time to settle before AT+MAPS frames
+                delay(2200L)
+                val cur = _uiState.value
+                if (cur.motorConnState == ConnectionStateX.CONNECTED &&
+                    cur.settings.mapsAutoStream &&
+                    !cur.screenMirrorActive &&
+                    !cur.midStreaming
+                ) {
+                    startMidStreaming()
+                }
+            }
         }
-        syncBackgroundServiceState()
     }
 
     private fun wireHardwareCallbacks() {
@@ -742,7 +753,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                             timestampMs = now,
                             sohPct = curSoh,
                             odoKm = eff.odoKm,
-                            cycles = cur.jkData.cycles ?: cur.motorData.cbatCycles
+                            cycles = if (eff.b1SourceLabel == "JK-BMS") cur.jkData.cycles else cur.motorData.cbatCycles
                         )
                         val nextSohList = (cur.sohHistory + sample).takeLast(30)
                         _uiState.update { it.copy(sohHistory = nextSohList) }
@@ -1044,6 +1055,17 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     fun restoreMotorOdo(odoKm: Double) {
         sendMotorCommand("AT+ODO=\"${Math.round(odoKm)}\"")
         updateSettings(_uiState.value.settings.copy(odoBackupKm = odoKm))
+    }
+
+    fun refreshMidBatteryTelemetry() {
+        if (_uiState.value.motorConnState != ConnectionStateX.CONNECTED) return
+        viewModelScope.launch {
+            val cmds = listOf("AT+CBAT?", "AT+SOH?", "AT+SOC?", "AT+VBAT?", "AT+IBAT?", "AT+TBAT?")
+            cmds.forEach { cmd ->
+                sendMotorCommand(cmd)
+                delay(140L)
+            }
+        }
     }
 
     fun connectJkBms(address: String) {

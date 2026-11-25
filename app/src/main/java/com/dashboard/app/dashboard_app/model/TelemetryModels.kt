@@ -127,6 +127,7 @@ data class JkBmsData(
     val remainAh: Double? = null,
     val capacityAh: Double? = null,
     val balancingActive: Boolean? = null,
+    val balanceStatus: Int? = null,
     val lastUpdatedMs: Long = 0L
 )
 
