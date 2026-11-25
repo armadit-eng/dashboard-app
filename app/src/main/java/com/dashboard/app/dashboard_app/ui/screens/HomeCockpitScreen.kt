@@ -214,7 +214,7 @@ fun HomeCockpitScreen(
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "Halo, ${state.settings.riderName}",
-                            style = MaterialTheme.typography.headlineSmall,
+                            style = MaterialTheme.typography.titleLarge,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -232,13 +232,14 @@ fun HomeCockpitScreen(
                         state.esp2ConnState == ConnectionStateX.CONNECTED
                     FilledTonalButton(
                         onClick = onOpenDeviceSheet,
+                        contentPadding = PaddingValues(horizontal = 12.dp),
                         modifier = Modifier
-                            .height(48.dp)
+                            .height(40.dp)
                             .testTag("open_device_sheet_button")
                     ) {
-                        Icon(Icons.Rounded.Bluetooth, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text(if (anyConnected) "Terhubung" else "Hubung")
+                        Icon(Icons.Rounded.Bluetooth, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (anyConnected) "Terhubung" else "Hubung", fontSize = 13.sp, maxLines = 1, softWrap = false)
                     }
                 }
             }
@@ -353,25 +354,31 @@ fun HomeCockpitScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("ENERGI & JARAK TEMPUH", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
-                                Spacer(Modifier.width(8.dp))
-                                Surface(
-                                    shape = CircleShape,
-                                    color = chgColor.copy(alpha = 0.14f)
-                                ) {
-                                    Text(
-                                        chg.label,
-                                        fontSize = 10.5.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = chgColor,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
-                                    )
-                                }
+                            Text(
+                                "ENERGI & JARAK TEMPUH",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = c.textMuted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Surface(
+                                shape = CircleShape,
+                                color = chgColor.copy(alpha = 0.14f)
+                            ) {
+                                Text(
+                                    chg.label,
+                                    fontSize = 10.5.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = chgColor,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                )
                             }
                             Spacer(Modifier.height(6.dp))
                             Text(
-                                text = "${String.format(Locale.US, "%.1f", eff.rangeKm)} km",
+                                text = eff.rangeKm?.let { "${String.format(Locale.US, "%.1f", it)} km" } ?: "— km",
                                 style = MaterialTheme.typography.displayLarge.copy(fontSize = 36.sp),
                                 color = c.accent
                             )

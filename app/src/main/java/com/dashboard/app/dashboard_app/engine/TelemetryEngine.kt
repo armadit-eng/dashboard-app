@@ -364,7 +364,8 @@ object TelemetryEngine {
             }
         }
 
-        val rangeKm = if (blendedWhKm > 1.0) max(0.0, totalCapWh / blendedWhKm) else 0.0
+        val hasSoc = b1Soc != null || b2Soc != null
+        val rangeKm: Double? = if (hasSoc && blendedWhKm > 1.0) max(0.0, totalCapWh / blendedWhKm) else null
 
         var chargeEtaHours: Double? = null
         if (isCharging && combinedPowerW != null && combinedPowerW < -20.0) {
@@ -690,7 +691,7 @@ object TelemetryEngine {
                 if (etaLine.isNotEmpty()) out.add(etaLine)
             }
         }
-        if (slots.showRange) out.add("RNG ${String.format(Locale.US, "%.1f", eff.rangeKm)} km")
+        if (slots.showRange) out.add(if (eff.rangeKm != null) "RNG ${String.format(Locale.US, "%.1f", eff.rangeKm)} km" else "RNG -- km")
         if (slots.showTrip) out.add("TRP ${String.format(Locale.US, "%.1f", trip.distanceKm)} km")
         if (slots.showEnergy) out.add("ENG ${trip.energyWh.roundToInt()} Wh")
         if (slots.showEfficiency) out.add("EFF ${eff.blendedWhPerKm.roundToInt()}Wh/km")

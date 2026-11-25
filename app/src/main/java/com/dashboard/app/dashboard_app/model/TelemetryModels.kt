@@ -244,7 +244,7 @@ data class EffectiveTelemetry(
     val avgVoltageV: Double? = null,
     val isCharging: Boolean = false,
     val isRegen: Boolean = false,
-    val rangeKm: Double = 0.0,
+    val rangeKm: Double? = null,
     val blendedWhPerKm: Double = 28.0,
     val totalAvailableWh: Double = 0.0,
     val chargeEtaHours: Double? = null,

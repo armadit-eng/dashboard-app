@@ -763,7 +763,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 if (cur.motorConnState == ConnectionStateX.CONNECTED) {
                     val nowSec = now / 1000L
                     if (nowSec % 2L == 0L) {
-                        sendMotorTripRange(eff.rangeKm)
+                        // Jangan kirim jarak 0.0 palsu ke MID saat data baterai belum ada
+                        eff.rangeKm?.let { sendMotorTripRange(it) }
                     }
                     if ((nowSec - atNavLastSentSec) >= cur.settings.atNavSlots.intervalSec) {
                         atNavLastSentSec = nowSec

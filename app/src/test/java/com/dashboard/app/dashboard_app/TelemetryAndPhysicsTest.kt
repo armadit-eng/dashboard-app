@@ -173,6 +173,30 @@ class TelemetryAndPhysicsTest {
     }
 
     @Test
+    fun rangeIsNullWithoutBatteryDataAndPositiveWithIt() {
+        val now = 1_700_000_000_000L
+        fun eff(motor: MotorData, state: ConnectionStateX) = TelemetryEngine.computeEffective(
+            motor = motor,
+            motorState = state,
+            jk = JkBmsData(),
+            jkState = ConnectionStateX.DISCONNECTED,
+            esp1 = Esp32Data(),
+            esp1State = ConnectionStateX.DISCONNECTED,
+            b2 = Battery2Data(),
+            esp2State = ConnectionStateX.DISCONNECTED,
+            gpsSpeedKmh = null,
+            trip = LiveTripMetrics(),
+            settings = AppSettings(),
+            nowMs = now
+        )
+
+        assertNull(eff(MotorData(), ConnectionStateX.DISCONNECTED).rangeKm)
+
+        val withSoc = eff(MotorData(socPct = 80.0, vbat = 72.0, lastUpdatedMs = now), ConnectionStateX.CONNECTED)
+        assertTrue((withSoc.rangeKm ?: 0.0) > 0.0)
+    }
+
+    @Test
     fun parsesGoogleMapsCoordsAndComputesElevationEnergy() {
         val gp = RoutePhysics.parseCoordinatesOrGoogleMapsUrl(
             "https://maps.google.com/?q=@-6.917464,107.619125,15z"

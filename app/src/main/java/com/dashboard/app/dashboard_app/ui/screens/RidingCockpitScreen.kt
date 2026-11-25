@@ -264,7 +264,7 @@ fun RidingCockpitScreen(
                     MetricTile(
                         title = "BATERAI",
                         value = "${eff.combinedSocPct?.roundToInt()?.toString() ?: "—"}%",
-                        sub = "Sisa ${String.format(Locale.US, "%.1f", eff.rangeKm)} km",
+                        sub = "Sisa ${eff.rangeKm?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} km",
                         color = if ((eff.combinedSocPct ?: 50.0) < 20.0) c.danger else c.accent,
                         modifier = Modifier.weight(1f)
                     )
