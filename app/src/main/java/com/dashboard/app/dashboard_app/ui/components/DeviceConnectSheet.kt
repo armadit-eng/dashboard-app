@@ -83,7 +83,6 @@ fun DeviceConnectSheet(
     val c = LocalCockpitColors.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var selectedSlot by remember { mutableIntStateOf(0) } // 0=Motor, 1=JK-BMS, 2=ESP1, 3=ESP2
-    var preferBleMotor by remember { mutableStateOf(false) }
     var showSerialLog by remember { mutableStateOf(false) }
     var priorityMenuExpanded by remember { mutableStateOf(false) }
 
@@ -93,8 +92,8 @@ fun DeviceConnectSheet(
 
     val devices = remember(selectedSlot, state.pairedBtDevices, state.scannedBleDevices) {
         if (selectedSlot == 0) {
-            val pairedAddrs = state.pairedBtDevices.map { it.address }.toSet()
-            state.pairedBtDevices + state.scannedBleDevices.filterNot { it.address in pairedAddrs }
+            // MID dihubungkan lewat Classic SPP: hanya perangkat yang sudah ter-pair yang relevan.
+            state.pairedBtDevices
         } else {
             state.scannedBleDevices
         }
@@ -233,17 +232,10 @@ fun DeviceConnectSheet(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     FilterChip(
-                        selected = !preferBleMotor,
-                        onClick = { preferBleMotor = false },
+                        selected = true,
+                        onClick = { },
                         label = { Text("Classic SPP") },
                         modifier = Modifier.testTag("motor_spp_chip")
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    FilterChip(
-                        selected = preferBleMotor,
-                        onClick = { preferBleMotor = true },
-                        label = { Text("BLE GATT") },
-                        modifier = Modifier.testTag("motor_ble_chip")
                     )
                     Spacer(Modifier.weight(1f))
                     Box {
@@ -304,7 +296,9 @@ fun DeviceConnectSheet(
                         )
                         Spacer(Modifier.height(10.dp))
                         Text(
-                            text = if (state.isScanningBle) {
+                            text = if (selectedSlot == 0) {
+                                "Belum ada MID yang ter-pair.\nPair dulu di Pengaturan Bluetooth Android, lalu buka lagi."
+                            } else if (state.isScanningBle) {
                                 "Memindai perangkat di sekitar…"
                             } else {
                                 "Belum ada perangkat ditemukan.\nPastikan Bluetooth & Lokasi aktif."
@@ -363,7 +357,7 @@ fun DeviceConnectSheet(
                                 Button(
                                     onClick = {
                                         when (selectedSlot) {
-                                            0 -> onConnectMotor(d.address, preferBleMotor || d.isBle)
+                                            0 -> onConnectMotor(d.address, false)
                                             1 -> onConnectJkBms(d.address)
                                             2 -> onConnectEspSlot(1, d.address)
                                             3 -> onConnectEspSlot(2, d.address)

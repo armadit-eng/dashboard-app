@@ -427,17 +427,21 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 if (st.motorConnState != ConnectionStateX.CONNECTED) return@launch
                 if (!st.motorViaBle && btClassic.isMapsSending) return@launch
                 if (st.motorViaBle) {
-                    ble.sendMotorBleMapsFrame(
+                    val sent = ble.sendMotorBleMapsFrame(
                         b64,
                         chunkSize = st.settings.mapsLeChunkSize,
                         delayMs = st.settings.mapsLeDelayMs
                     )
                     _uiState.update {
-                        it.copy(
-                            mapsFramesSent = it.mapsFramesSent + 1,
-                            mapsLastChars = b64.length,
-                            mapsStatus = "Mirror OK (BLE)"
-                        )
+                        if (sent) {
+                            it.copy(
+                                mapsFramesSent = it.mapsFramesSent + 1,
+                                mapsLastChars = b64.length,
+                                mapsStatus = "Mirror OK (BLE)"
+                            )
+                        } else {
+                            it.copy(mapsStatus = "Mirror gagal kirim via BLE (lihat log)")
+                        }
                     }
                 } else {
                     val ms = btClassic.sendMapsFrame(b64)
@@ -936,10 +940,17 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun attemptAutoReconnect() {
-        loadBondedAndScanBle()
         val savedAddr = _uiState.value.settings.savedMotorAddress
-        if (!savedAddr.isNullOrBlank()) {
-            connectMotor(savedAddr)
+        if (savedAddr.isNullOrBlank()) {
+            loadBondedAndScanBle()
+            return
+        }
+        // Pemindaian BLE saat RFCOMM sedang connect sering membuat SPP gagal: tunda dulu.
+        _uiState.update { it.copy(pairedBtDevices = btClassic.getBondedDevices()) }
+        connectMotor(savedAddr)
+        viewModelScope.launch {
+            delay(15_000L)
+            ble.startScan(timeoutMs = 7000L)
         }
     }
 
@@ -949,6 +960,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         ble.startScan(timeoutMs = 7000L)
     }
 
+    /** MID selalu dihubungkan lewat Classic SPP (BLE terlalu lambat untuk frame AT+MAPS). */
+    @Suppress("UNUSED_PARAMETER")
     fun connectMotor(address: String, preferBle: Boolean = false) {
         val addr = address.trim()
         if (addr.isEmpty()) return
@@ -956,28 +969,36 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             disconnectMotor()
             _uiState.update {
                 it.copy(
-                    motorViaBle = preferBle,
+                    motorViaBle = false,
                     motorConnState = ConnectionStateX.CONNECTING,
                     motorConnName = addr
                 ).recomputeDerived()
             }
-            if (!preferBle) {
-                val ok = btClassic.connect(addr)
-                if (ok) {
-                    val cur = _uiState.value
-                    updateSettings(
-                        cur.settings.copy(
-                            savedMotorAddress = addr,
-                            savedMotorName = cur.motorConnName.ifBlank { addr }
-                        )
-                    )
-                    return@launch
-                }
-                addLog("MOTOR", "SPP gagal, mencoba fallback BLE…", true)
+            var ok = btClassic.connect(addr)
+            if (!ok) {
+                addLog("MOTOR", "SPP gagal, mencoba ulang sekali…", false)
+                delay(1_500L)
+                ok = btClassic.connect(addr)
             }
-            _uiState.update { it.copy(motorViaBle = true) }
-            ble.connectMotorBle(addr)
-            updateSettings(_uiState.value.settings.copy(savedMotorAddress = addr))
+            if (ok) {
+                val cur = _uiState.value
+                updateSettings(
+                    cur.settings.copy(
+                        savedMotorAddress = addr,
+                        savedMotorName = cur.motorConnName.ifBlank { addr }
+                    )
+                )
+                return@launch
+            }
+            addLog(
+                "MOTOR",
+                "SPP gagal. Pastikan MID sudah dipasangkan (pair) di Pengaturan Bluetooth Android, " +
+                    "dan tidak sedang terhubung ke perangkat lain, lalu coba lagi.",
+                true
+            )
+            _uiState.update {
+                it.copy(mapsStatus = "SPP gagal: pair MID di Pengaturan Bluetooth lalu hubungkan ulang")
+            }
         }
     }
 
@@ -1788,19 +1809,23 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         try {
             if (st.motorViaBle) {
                 val t0 = System.currentTimeMillis()
-                ble.sendMotorBleMapsFrame(
+                val sent = ble.sendMotorBleMapsFrame(
                     b64,
                     chunkSize = st.settings.mapsLeChunkSize,
                     delayMs = st.settings.mapsLeDelayMs
                 )
                 val dt = (System.currentTimeMillis() - t0).toInt()
                 _uiState.update {
-                    it.copy(
-                        mapsFramesSent = it.mapsFramesSent + 1,
-                        mapsLastMs = dt,
-                        mapsLastChars = b64.length,
-                        mapsStatus = "OK (BLE)"
-                    )
+                    if (sent) {
+                        it.copy(
+                            mapsFramesSent = it.mapsFramesSent + 1,
+                            mapsLastMs = dt,
+                            mapsLastChars = b64.length,
+                            mapsStatus = "OK (BLE)"
+                        )
+                    } else {
+                        it.copy(mapsStatus = "Gagal kirim via BLE (lihat log Diagnosti)")
+                    }
                 }
             } else {
                 val ms = btClassic.sendMapsFrame(b64)

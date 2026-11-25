@@ -103,6 +103,14 @@ class BtClassicManager(private val context: Context) {
 
     fun isBluetoothEnabled(): Boolean = adapter?.isEnabled == true
 
+    /** True hanya bila perangkat diketahui BLE-only (tidak punya Classic/SPP). */
+    @SuppressLint("MissingPermission")
+    fun isBleOnly(address: String): Boolean = try {
+        adapter?.getRemoteDevice(address)?.type == BluetoothDevice.DEVICE_TYPE_LE
+    } catch (_: Exception) {
+        false
+    }
+
     @SuppressLint("MissingPermission")
     fun getBondedDevices(): List<DiscoveredDeviceX> {
         val bt = adapter ?: return emptyList()

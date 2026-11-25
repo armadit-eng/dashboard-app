@@ -21,13 +21,16 @@ import com.dashboard.app.dashboard_app.model.ConnectionStateX
 import com.dashboard.app.dashboard_app.model.DiscoveredDeviceX
 import com.dashboard.app.dashboard_app.model.Esp32Data
 import com.dashboard.app.dashboard_app.model.JkBmsData
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.util.Calendar
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
 class BleGattManager(private val context: Context) {
@@ -72,6 +75,12 @@ class BleGattManager(private val context: Context) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
+
+    /** MTU hasil negosiasi per slot (default ATT = 23 bila belum/tidak berhasil dinegosiasi). */
+    private val slotMtu = ConcurrentHashMap<String, Int>()
+
+    /** Dilepas tiap onCharacteristicWrite slot motor: kendali alur agar chunk tidak saling menimpa. */
+    private val motorWriteSem = Semaphore(0)
 
     private var scanCb: ScanCallback? = null
     private val foundMap = LinkedHashMap<String, DiscoveredDeviceX>()
@@ -286,6 +295,7 @@ class BleGattManager(private val context: Context) {
 
                 override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
                     if (slotGenerations[slot] != gen) return
+                    if (status == BluetoothGatt.GATT_SUCCESS) slotMtu[slot] = mtu
                     if (!discovered) {
                         discovered = true
                         g.discoverServices()
@@ -348,6 +358,14 @@ class BleGattManager(private val context: Context) {
                     if (!waitingCccd) {
                         finishSetup(slot, gateKey, devName)
                     }
+                }
+
+                override fun onCharacteristicWrite(
+                    g: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    status: Int
+                ) {
+                    if (slot == "motor") motorWriteSem.release()
                 }
 
                 override fun onDescriptorWrite(
@@ -640,25 +658,65 @@ class BleGattManager(private val context: Context) {
     fun writeMotorBle(text: String): Boolean =
         writeSlot("motor", text.toByteArray(Charsets.UTF_8))
 
+    /**
+     * Kirim frame AT+MAPS lewat BLE. Mengembalikan true hanya bila SEMUA potongan diterima stack BLE.
+     * Perbaikan: chunk dibatasi MTU-3 (sebelumnya bisa terpotong diam-diam), hasil tiap tulis dicek
+     * dan di-retry bila stack sibuk, dan menunggu onCharacteristicWrite sebelum potongan berikutnya.
+     */
     suspend fun sendMotorBleMapsFrame(
         b64: String,
         chunkSize: Int = 100,
         delayMs: Int = 30
-    ) {
-        if (isMotorBleMapsSending) return
+    ): Boolean {
+        if (isMotorBleMapsSending) return false
         isMotorBleMapsSending = true
         try {
-            val cs = chunkSize.coerceIn(20, 400)
-            writeSlot("motor", "AT+MAPS=\"".toByteArray(Charsets.UTF_8), noResponse = true)
-            delay(45)
-            var i = 0
-            while (i < b64.length) {
-                val end = (i + cs).coerceAtMost(b64.length)
-                writeSlot("motor", b64.substring(i, end).toByteArray(Charsets.UTF_8), noResponse = true)
-                if (delayMs > 0) delay(delayMs.toLong())
-                i = end
+            val mtu = slotMtu["motor"] ?: 23
+            val maxPayload = (mtu - 3).coerceAtLeast(20)
+            val cs = chunkSize.coerceIn(20, 400).coerceAtMost(maxPayload)
+            var ackWorks = true
+
+            suspend fun put(bytes: ByteArray): Boolean {
+                repeat(40) {
+                    motorWriteSem.drainPermits()
+                    if (writeSlot("motor", bytes, noResponse = true)) {
+                        if (ackWorks) {
+                            val got = withContext(Dispatchers.IO) {
+                                motorWriteSem.tryAcquire(150, TimeUnit.MILLISECONDS)
+                            }
+                            // Bila callback tak pernah datang di perangkat ini, andalkan delayMs saja.
+                            if (!got) ackWorks = false
+                        }
+                        return true
+                    }
+                    delay(15)
+                }
+                return false
             }
-            writeSlot("motor", "\"\r\n".toByteArray(Charsets.UTF_8), noResponse = true)
+
+            var ok = put("AT+MAPS=\"".toByteArray(Charsets.UTF_8))
+            if (ok) {
+                delay(45)
+                var i = 0
+                while (i < b64.length) {
+                    val end = (i + cs).coerceAtMost(b64.length)
+                    if (!put(b64.substring(i, end).toByteArray(Charsets.UTF_8))) {
+                        ok = false
+                        break
+                    }
+                    if (delayMs > 0) delay(delayMs.toLong())
+                    i = end
+                }
+            }
+            if (ok) ok = put("\"\r\n".toByteArray(Charsets.UTF_8))
+            if (!ok) {
+                // Tutup frame yang setengah terkirim supaya MID tidak menggabungkannya dengan frame berikut.
+                writeSlot("motor", "\"\r\n".toByteArray(Charsets.UTF_8), noResponse = true)
+                mainHandler.post {
+                    onLog?.invoke("MOTOR", "AT+MAPS via BLE gagal: stack BLE menolak potongan data (MTU=$mtu, chunk=$cs).", true)
+                }
+            }
+            return ok
         } finally {
             isMotorBleMapsSending = false
         }
@@ -717,6 +775,7 @@ class BleGattManager(private val context: Context) {
             synchronized(esp2Rx) { esp2Rx.clear() }
         }
         writeChars.remove(slot)
+        slotMtu.remove(slot)
         val g = gatts.remove(slot)
         try {
             g?.disconnect()
