@@ -385,8 +385,13 @@ class TelemetryAndPhysicsTest {
     fun resolvesCartoTileKeyAndDetectsShortUrls() {
         val noKey = TileCacheService.resolveTileUrl(MapStyleOption.DARK_CARTO.tileUrlTemplate, 15, 100, 200, "")
         assertFalse(noKey.contains("?key="))
-        val withKey = TileCacheService.resolveTileUrl(MapStyleOption.CARTO_VOYAGER.tileUrlTemplate, 15, 100, 200, "test_carto_key")
+        assertTrue(noKey.contains("/rastertiles/dark_all/"))
+        val withKey = TileCacheService.resolveTileUrl(MapStyleOption.CARTO_VOYAGER.tileUrlTemplate, 15, 100, 200, " ?key=test_carto_key ")
         assertTrue(withKey.endsWith("?key=test_carto_key"))
+        assertEquals(MapStyleOption.OSM_STANDARD, AppSettings().let { MapStyleOption.fromId(it.mapStyleId) })
+        assertTrue(MapStyleOption.DARK_OSM.isDarkBase)
+        assertTrue(MapStyleOption.DARK_OSM.applyDarkFilter)
+        assertFalse(MapStyleOption.DARK_OSM.usesCartoKey)
 
         assertTrue(RemoteApisService.isMapsShortUrl("https://maps.app.goo.gl/AbCd123"))
         assertFalse(RemoteApisService.isMapsShortUrl("Jl. Sudirman Jakarta"))

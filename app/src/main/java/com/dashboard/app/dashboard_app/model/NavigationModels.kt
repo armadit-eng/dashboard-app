@@ -9,12 +9,21 @@ enum class MapStyleOption(
     val label: String,
     val tileUrlTemplate: String,
     val isDarkBase: Boolean = false,
-    val usesCartoKey: Boolean = false
+    val usesCartoKey: Boolean = false,
+    val applyDarkFilter: Boolean = false
 ) {
     OSM_STANDARD(
         id = "osm",
         label = "OSM Standar",
         tileUrlTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    ),
+    DARK_OSM(
+        id = "dark_osm",
+        label = "OSM Gelap (Tanpa API Key)",
+        tileUrlTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        isDarkBase = true,
+        usesCartoKey = false,
+        applyDarkFilter = true
     ),
     OSM_HOT(
         id = "osm_hot",
@@ -24,20 +33,20 @@ enum class MapStyleOption(
     DARK_CARTO(
         id = "dark",
         label = "Carto Dark Matter",
-        tileUrlTemplate = "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png{keyQs}",
+        tileUrlTemplate = "https://basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}.png{keyQs}",
         isDarkBase = true,
         usesCartoKey = true
     ),
     CARTO_VOYAGER(
         id = "carto_voyager",
         label = "Carto Voyager",
-        tileUrlTemplate = "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png{keyQs}",
+        tileUrlTemplate = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png{keyQs}",
         usesCartoKey = true
     ),
     CARTO_POSITRON(
         id = "carto_positron",
         label = "Carto Positron",
-        tileUrlTemplate = "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png{keyQs}",
+        tileUrlTemplate = "https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png{keyQs}",
         usesCartoKey = true
     ),
     SATELLITE(
@@ -54,7 +63,7 @@ enum class MapStyleOption(
 
     companion object {
         fun fromId(id: String?): MapStyleOption =
-            entries.firstOrNull { it.id == id } ?: DARK_CARTO
+            entries.firstOrNull { it.id == id } ?: OSM_STANDARD
     }
 }
 

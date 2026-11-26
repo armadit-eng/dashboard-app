@@ -219,14 +219,26 @@ fun NfsRadarMinimap(
         label = "pulsePhase"
     )
 
-    // Prefer dark high-contrast map tiles for authentic NFS Most Wanted radar look
-    val effectiveStyle = remember(mapStyle) {
-        if (mapStyle.isDarkBase) mapStyle else MapStyleOption.DARK_CARTO
+    var tileTrigger by remember(mapStyle.id, cartoApiKey) { mutableIntStateOf(0) }
+    var cartoFailedForRadar by remember(mapStyle.id, cartoApiKey) { mutableStateOf(false) }
+
+    // Use the user's working map style; if Carto is selected without a working key,
+    // automatically fall back to DARK_OSM (free OpenStreetMap tiles with NFS dark radar filter).
+    val effectiveStyle = remember(mapStyle, cartoApiKey, cartoFailedForRadar) {
+        if (mapStyle.usesCartoKey && (TileCacheService.cleanCartoApiKey(cartoApiKey).isEmpty() || cartoFailedForRadar)) {
+            MapStyleOption.DARK_OSM
+        } else {
+            mapStyle
+        }
+    }
+    val radarColorFilter = remember(effectiveStyle) {
+        if (!effectiveStyle.isDarkBase || effectiveStyle.applyDarkFilter) {
+            TileCacheService.darkMapColorFilter(desaturate = true)
+        } else null
     }
 
     val tileBitmaps = remember(effectiveStyle.id, cartoApiKey) { mutableStateMapOf<String, ImageBitmap>() }
     val inFlightKeys = remember(effectiveStyle.id, cartoApiKey) { mutableSetOf<String>() }
-    var tileTrigger by remember { mutableIntStateOf(0) }
 
     val tileIntZ = activeZoom.roundToInt().coerceIn(14, 18)
     val scaleFactor = 2.0.pow(activeZoom - tileIntZ)
@@ -275,6 +287,8 @@ fun NfsRadarMinimap(
                                 if (bmp != null) {
                                     tileBitmaps[key] = bmp
                                     tileTrigger++
+                                } else if (effectiveStyle.usesCartoKey && TileCacheService.lastErrorForStyle(effectiveStyle.id) != null) {
+                                    cartoFailedForRadar = true
                                 }
                             } finally {
                                 inFlightKeys.remove(key)
@@ -364,7 +378,8 @@ fun NfsRadarMinimap(
                                         drawImage(
                                             image = bmp,
                                             dstOffset = IntOffset(sx, sy),
-                                            dstSize = IntSize(tileSizeInt, tileSizeInt)
+                                            dstSize = IntSize(tileSizeInt, tileSizeInt),
+                                            colorFilter = radarColorFilter
                                         )
                                     } else {
                                         val fallback = TileCacheService.findFallbackImageBitmap(
@@ -381,7 +396,8 @@ fun NfsRadarMinimap(
                                                 srcOffset = IntOffset(slice.srcX, slice.srcY),
                                                 srcSize = IntSize(slice.srcW, slice.srcH),
                                                 dstOffset = IntOffset(sx, sy),
-                                                dstSize = IntSize(tileSizeInt, tileSizeInt)
+                                                dstSize = IntSize(tileSizeInt, tileSizeInt),
+                                                colorFilter = radarColorFilter
                                             )
                                         }
                                     }

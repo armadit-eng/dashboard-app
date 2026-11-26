@@ -53,6 +53,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,6 +61,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -75,6 +77,7 @@ import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
 import com.dashboard.app.dashboard_app.ui.theme.kAccentPalettes
 import com.dashboard.app.dashboard_app.ui.theme.kGarageLiveries
 import com.dashboard.app.dashboard_app.viewmodel.DashboardUiState
+import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -97,6 +100,8 @@ fun GarageAccountScreen(
     modifier: Modifier = Modifier
 ) {
     val c = LocalCockpitColors.current
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val s = state.settings
     val esp1 = state.esp1Data
     val esp1Ok = state.esp1ConnState == ConnectionStateX.CONNECTED
@@ -584,14 +589,20 @@ fun GarageAccountScreen(
                 Spacer(Modifier.height(10.dp))
                 Button(
                     onClick = {
-                        TileCacheService.evictMemoryCache()
-                        onUpdateSettings(
-                            s.copy(
-                                cartoApiKey = cartoKeyDraft.trim(),
-                                ocmApiKey = ocmKeyDraft.trim()
+                        val cleanedCarto = TileCacheService.cleanCartoApiKey(cartoKeyDraft)
+                        scope.launch {
+                            TileCacheService.clearStyles(
+                                context,
+                                listOf("dark", "carto_voyager", "carto_positron")
                             )
-                        )
-                        onShowMessage("API key peta & SPKLU tersimpan.")
+                            onUpdateSettings(
+                                s.copy(
+                                    cartoApiKey = cleanedCarto,
+                                    ocmApiKey = ocmKeyDraft.trim()
+                                )
+                            )
+                            onShowMessage("API key peta & SPKLU tersimpan.")
+                        }
                     },
                     modifier = Modifier
                         .fillMaxWidth()

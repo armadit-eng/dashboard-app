@@ -355,8 +355,11 @@ object OfflineMapPackageService {
 
         var tileCount = 0
         if (includeTiles) {
-            val tileStyle = if (styleOption == MapStyleOption.OSM_STANDARD || styleOption == MapStyleOption.SATELLITE) {
-                MapStyleOption.CARTO_VOYAGER
+            val tileStyle = if (styleOption == MapStyleOption.OSM_STANDARD ||
+                styleOption == MapStyleOption.DARK_OSM ||
+                styleOption == MapStyleOption.SATELLITE
+            ) {
+                if (cartoApiKey.isNotBlank()) MapStyleOption.CARTO_VOYAGER else MapStyleOption.OSM_HOT
             } else {
                 styleOption
             }

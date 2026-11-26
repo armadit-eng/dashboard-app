@@ -69,7 +69,7 @@ data class AppSettings(
     val autoReconnect: Boolean = true,
     val voiceNavEnabled: Boolean = true,
     val hillAlertVoice: Boolean = true,
-    val mapStyleId: String = "dark",
+    val mapStyleId: String = "osm",
     val dataSaverMap: Boolean = false,
     val mapsLayout: String = "split",
     val mapsRiderPos: String = "low",

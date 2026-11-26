@@ -601,10 +601,11 @@ fun NavigationScreen(
                     Text("Gaya Peta & Peta Offline", style = MaterialTheme.typography.headlineSmall)
                 }
                 items(MapStyleOption.entries) { opt ->
+                    val styleErr = if (opt.usesCartoKey) TileCacheService.lastErrorForStyle(opt.id) else null
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(48.dp)
+                            .height(52.dp)
                             .clickable {
                                 onUpdateSettings(state.settings.copy(mapStyleId = opt.id))
                             },
@@ -614,7 +615,19 @@ fun NavigationScreen(
                             Text(opt.label)
                             if (opt.usesCartoKey) {
                                 Text(
-                                    if (state.settings.cartoApiKey.isNotBlank()) "CARTO • API Key aktif" else "CARTO Basemaps",
+                                    text = when {
+                                        styleErr != null -> styleErr
+                                        state.settings.cartoApiKey.isNotBlank() -> "CARTO • API Key aktif"
+                                        else -> "CARTO Basemaps (butuh API Key)"
+                                    },
+                                    fontSize = 11.sp,
+                                    color = if (styleErr != null) c.danger else c.textMuted,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            } else if (opt == MapStyleOption.DARK_OSM) {
+                                Text(
+                                    "Mode gelap OpenStreetMap tanpa API Key",
                                     fontSize = 11.sp,
                                     color = c.textMuted
                                 )
@@ -627,7 +640,7 @@ fun NavigationScreen(
                 }
                 item {
                     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = c.borderSubtle)
-                    Text("Carto API Key (Opsional untuk kuota tinggi)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Carto Basemaps API Key (carto.com/basemaps-api-key)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(6.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -645,8 +658,14 @@ fun NavigationScreen(
                         )
                         Button(
                             onClick = {
-                                TileCacheService.evictMemoryCache()
-                                onUpdateSettings(state.settings.copy(cartoApiKey = cartoKeyDraft.trim()))
+                                val cleaned = TileCacheService.cleanCartoApiKey(cartoKeyDraft)
+                                scope.launch {
+                                    TileCacheService.clearStyles(
+                                        context,
+                                        listOf("dark", "carto_voyager", "carto_positron")
+                                    )
+                                    onUpdateSettings(state.settings.copy(cartoApiKey = cleaned))
+                                }
                             },
                             modifier = Modifier
                                 .height(48.dp)

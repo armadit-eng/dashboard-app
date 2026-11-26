@@ -1,9 +1,13 @@
 package com.dashboard.app.dashboard_app.service
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.os.Build
 import android.util.LruCache
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import kotlinx.coroutines.Dispatchers
@@ -18,6 +22,8 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -48,14 +54,25 @@ object TileCacheService {
     private val memCache = LruCache<String, Bitmap>(240)
     private val imageMemCache = LruCache<String, ImageBitmap>(240)
     private val networkPermits = Semaphore(6)
+    private val lastStyleErrors = ConcurrentHashMap<String, String>()
+
+    @Volatile
+    private var cachedCertSha1Hex: String? = null
 
     private fun rootDir(context: Context): File = File(context.filesDir, "tile_cache")
 
     private fun tileFile(context: Context, styleId: String, z: Int, x: Int, y: Int): File =
         File(rootDir(context), "$styleId/$z/$x/$y.tile")
 
+    fun cleanCartoApiKey(cartoApiKey: String): String =
+        cartoApiKey.trim()
+            .removePrefix("?")
+            .removePrefix("&")
+            .replaceFirst(Regex("^(api_)?key=", RegexOption.IGNORE_CASE), "")
+            .trim()
+
     fun resolveTileUrl(urlTemplate: String, z: Int, x: Int, y: Int, cartoApiKey: String = ""): String {
-        val cleanKey = cartoApiKey.trim()
+        val cleanKey = cleanCartoApiKey(cartoApiKey)
         val keyQs = if (cleanKey.isNotEmpty()) "?key=${URLEncoder.encode(cleanKey, "UTF-8")}" else ""
         return urlTemplate
             .replace("{z}", z.toString())
@@ -64,9 +81,46 @@ object TileCacheService {
             .replace("{keyQs}", keyQs)
     }
 
+    fun lastErrorForStyle(styleId: String): String? = lastStyleErrors[styleId]
+
+    fun clearStyleErrors() {
+        lastStyleErrors.clear()
+    }
+
+    /**
+     * Hue-preserving lightness inversion (CSS invert(100%) + hue-rotate(180deg))
+     * with subtle dark-slate contrast tuning so standard OSM/Topo tiles render as
+     * a crisp dark map without distorting water/road hues.
+     */
+    fun darkMapColorFilter(desaturate: Boolean = false): ColorFilter {
+        val satBoost = if (desaturate) 0.85f else 0.94f
+        val matrix = ColorMatrix(
+            floatArrayOf(
+                0.574f * satBoost, -1.430f * satBoost, -0.144f * satBoost, 0f, 248f,
+                -0.426f * satBoost, -0.430f * satBoost, -0.144f * satBoost, 0f, 251f,
+                -0.426f * satBoost, -1.430f * satBoost, 0.856f * satBoost, 0f, 255f,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+        return ColorFilter.colorMatrix(matrix)
+    }
+
     fun evictMemoryCache() {
         memCache.evictAll()
         imageMemCache.evictAll()
+        lastStyleErrors.clear()
+    }
+
+    suspend fun clearStyles(context: Context, styleIds: Collection<String>) = withContext(Dispatchers.IO) {
+        memCache.evictAll()
+        imageMemCache.evictAll()
+        styleIds.forEach { id ->
+            lastStyleErrors.remove(id)
+            runCatching {
+                val dir = File(rootDir(context), id)
+                if (dir.exists()) dir.deleteRecursively()
+            }
+        }
     }
 
     fun getCachedMemBitmap(styleId: String, z: Int, x: Int, y: Int): Bitmap? {
@@ -145,7 +199,7 @@ object TileCacheService {
     }
 
     private val FALLBACK_OFFLINE_STYLES = listOf(
-        "carto_voyager", "osm", "dark", "topo", "osm_hot", "carto_positron", "sat"
+        "osm", "dark_osm", "osm_hot", "topo", "sat", "carto_voyager", "dark", "carto_positron"
     )
 
     suspend fun getTileAndroidBitmap(
@@ -183,7 +237,7 @@ object TileCacheService {
             }
             networkPermits.withPermit {
                 val url = resolveTileUrl(urlTemplate, z, x, y, cartoApiKey)
-                val fetched = fetchBytes(url) ?: return@withPermit null
+                val fetched = fetchBytes(context, styleId, url) ?: return@withPermit null
                 saveBytes(f, fetched)
                 fetched
             }
@@ -216,20 +270,67 @@ object TileCacheService {
         return imageMemCache.get(key) ?: bmp.asImageBitmap().also { imageMemCache.put(key, it) }
     }
 
-    private fun fetchBytes(urlStr: String): ByteArray? {
+    private fun signingCertSha1Hex(context: Context): String? {
+        cachedCertSha1Hex?.let { return it }
+        return runCatching {
+            val pm = context.packageManager
+            val sigBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val info = pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+                info.signingInfo?.apkContentsSigners?.firstOrNull()?.toByteArray()
+            } else {
+                @Suppress("DEPRECATION")
+                val info = pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNATURES)
+                @Suppress("DEPRECATION")
+                info.signatures?.firstOrNull()?.toByteArray()
+            } ?: return@runCatching null
+            val digest = MessageDigest.getInstance("SHA-1").digest(sigBytes)
+            val hex = digest.joinToString("") { "%02X".format(it) }
+            cachedCertSha1Hex = hex
+            hex
+        }.getOrNull()
+    }
+
+    private fun fetchBytes(context: Context?, styleId: String?, urlStr: String): ByteArray? {
         var conn: HttpURLConnection? = null
         return try {
             conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = 12_000
                 readTimeout = 12_000
-                setRequestProperty("User-Agent", "com.dashboard.app.dashboard_app")
+                setRequestProperty("User-Agent", "GesitsDashboard/1.0 (Android; Linux)")
+                setRequestProperty("Accept", "image/png,image/jpeg,image/*;q=0.8")
+                if (context != null && urlStr.contains("cartocdn.com", ignoreCase = true)) {
+                    setRequestProperty("X-Android-Package", context.packageName)
+                    signingCertSha1Hex(context)?.let { sha1 ->
+                        setRequestProperty("X-Android-Cert", sha1)
+                    }
+                }
             }
-            if (conn.responseCode == HttpURLConnection.HTTP_OK) {
+            val code = conn.responseCode
+            if (code == HttpURLConnection.HTTP_OK) {
                 val data = conn.inputStream.use { it.readBytes() }
-                if (data.isNotEmpty()) data else null
-            } else null
-        } catch (_: Exception) {
+                if (data.isNotEmpty()) {
+                    if (styleId != null) lastStyleErrors.remove(styleId)
+                    data
+                } else {
+                    if (styleId != null) lastStyleErrors[styleId] = "Respon tile kosong"
+                    null
+                }
+            } else {
+                if (styleId != null) {
+                    lastStyleErrors[styleId] = when (code) {
+                        401, 403 -> "HTTP $code — Pastikan memakai CARTO Basemaps API Key yang aktif"
+                        404 -> "HTTP 404 — URL tile tidak tersedia"
+                        429 -> "HTTP 429 — Batas kuota tile tercapai"
+                        else -> "HTTP $code"
+                    }
+                }
+                null
+            }
+        } catch (e: Exception) {
+            if (styleId != null) {
+                lastStyleErrors[styleId] = e.message?.take(60) ?: "Koneksi tile gagal"
+            }
             null
         } finally {
             conn?.disconnect()
@@ -307,7 +408,7 @@ object TileCacheService {
                         val f = tileFile(context, styleId, t.z, t.x, t.y)
                         if (f.exists() && f.length() > 0L) return@async true
                         val url = resolveTileUrl(urlTemplate, t.z, t.x, t.y, cartoApiKey)
-                        val bytes = fetchBytes(url) ?: return@async false
+                        val bytes = fetchBytes(context, styleId, url) ?: return@async false
                         saveBytes(f, bytes)
                         true
                     }
@@ -337,6 +438,8 @@ object TileCacheService {
 
     suspend fun clear(context: Context) = withContext(Dispatchers.IO) {
         memCache.evictAll()
+        imageMemCache.evictAll()
+        lastStyleErrors.clear()
         try {
             val root = rootDir(context)
             if (root.exists()) root.deleteRecursively()

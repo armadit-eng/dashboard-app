@@ -21,8 +21,10 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.ElectricMoped
@@ -185,7 +187,10 @@ fun SlippyMapView(
 
     val tileBitmaps = remember(style.id, cartoApiKey) { mutableStateMapOf<String, ImageBitmap>() }
     val inFlightKeys = remember(style.id, cartoApiKey) { mutableSetOf<String>() }
-    var tileTrigger by remember { mutableIntStateOf(0) }
+    var tileTrigger by remember(style.id, cartoApiKey) { mutableIntStateOf(0) }
+    val tileColorFilter = remember(style.applyDarkFilter) {
+        if (style.applyDarkFilter) TileCacheService.darkMapColorFilter() else null
+    }
 
     val customMarkerBitmap = remember(customMarkerPath) {
         if (customMarkerPath.isNotEmpty() && File(customMarkerPath).exists()) {
@@ -256,6 +261,8 @@ fun SlippyMapView(
                             )
                             if (bmp != null) {
                                 tileBitmaps[key] = bmp
+                                tileTrigger++
+                            } else if (TileCacheService.lastErrorForStyle(style.id) != null) {
                                 tileTrigger++
                             }
                         } finally {
@@ -474,7 +481,8 @@ fun SlippyMapView(
                         drawImage(
                             image = bmp,
                             dstOffset = IntOffset(sx, sy),
-                            dstSize = IntSize(tileSizeInt, tileSizeInt)
+                            dstSize = IntSize(tileSizeInt, tileSizeInt),
+                            colorFilter = tileColorFilter
                         )
                     } else {
                         val parentFallback = TileCacheService.findFallbackImageBitmap(
@@ -491,7 +499,8 @@ fun SlippyMapView(
                                 srcOffset = IntOffset(slice.srcX, slice.srcY),
                                 srcSize = IntSize(slice.srcW, slice.srcH),
                                 dstOffset = IntOffset(sx, sy),
-                                dstSize = IntSize(tileSizeInt, tileSizeInt)
+                                dstSize = IntSize(tileSizeInt, tileSizeInt),
+                                colorFilter = tileColorFilter
                             )
                         } else {
                             // Try 2x2 child tiles at z+1 when zooming out before parent loads
@@ -521,7 +530,8 @@ fun SlippyMapView(
                                             drawImage(
                                                 image = childBmp,
                                                 dstOffset = IntOffset(sx + col * halfW, sy + row * halfH),
-                                                dstSize = IntSize(dstW.coerceAtLeast(1), dstH.coerceAtLeast(1))
+                                                dstSize = IntSize(dstW.coerceAtLeast(1), dstH.coerceAtLeast(1)),
+                                                colorFilter = tileColorFilter
                                             )
                                         }
                                     }
@@ -724,6 +734,27 @@ fun SlippyMapView(
                     contentDescription = "Posisi Pengendara",
                     tint = c.accent,
                     modifier = Modifier.size(34.dp)
+                )
+            }
+        }
+
+        val currentTileError = if (tileTrigger >= 0 && style.usesCartoKey && tileBitmaps.isEmpty()) {
+            TileCacheService.lastErrorForStyle(style.id)
+        } else null
+        if (currentTileError != null) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = Color(0xD81E1B18),
+                border = BorderStroke(1.dp, c.warning.copy(alpha = 0.7f)),
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(horizontal = 24.dp)
+            ) {
+                Text(
+                    text = "Tile ${style.label} gagal dimuat ($currentTileError). Buka Gaya Peta untuk memilih OSM Gelap atau perbarui Carto Basemaps Key.",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                 )
             }
         }

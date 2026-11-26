@@ -150,10 +150,18 @@ fun OfflineMapSection(
             Column(modifier = Modifier.weight(1f)) {
                 Text("Sertakan Tile Peta (Zoom 11–16)", fontSize = 13.sp)
                 Text(
-                    if (styleOption == MapStyleOption.OSM_STANDARD || styleOption == MapStyleOption.SATELLITE)
-                        "Otomatis unduh tile Carto Voyager untuk tampilan peta offline"
-                    else
-                        "Mengunduh tile ${styleOption.label} bersama data jalan",
+                    if (styleOption == MapStyleOption.OSM_STANDARD ||
+                        styleOption == MapStyleOption.DARK_OSM ||
+                        styleOption == MapStyleOption.SATELLITE
+                    ) {
+                        if (cartoApiKey.isNotBlank()) {
+                            "Otomatis unduh tile Carto Voyager untuk tampilan peta offline"
+                        } else {
+                            "Otomatis unduh tile OSM Humanitarian untuk tampilan peta offline"
+                        }
+                    } else {
+                        "Mengunduh tile ${styleOption.label} bersama data jalan"
+                    },
                     fontSize = 11.sp,
                     color = c.textMuted
                 )
