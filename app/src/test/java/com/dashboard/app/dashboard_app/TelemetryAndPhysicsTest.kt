@@ -24,6 +24,10 @@ import com.dashboard.app.dashboard_app.model.TripRecord
 import com.dashboard.app.dashboard_app.service.RemoteApisService
 import com.dashboard.app.dashboard_app.service.SpkluImportParser
 import com.dashboard.app.dashboard_app.service.TileCacheService
+import android.view.Surface
+import androidx.compose.ui.geometry.Offset
+import com.dashboard.app.dashboard_app.hardware.MotovlogMediaHelper
+import com.dashboard.app.dashboard_app.ui.components.NfsRadarMath
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -1189,5 +1193,58 @@ class TelemetryAndPhysicsTest {
         assertEquals(77.0, effBms.b1Vbat!!, 0.01)
         assertEquals(42.5, effBms.speedKmh!!, 0.01)
         assertEquals(3200, effBms.rpm)
+    }
+
+    @Test
+    fun buildsGalleryMotovlogMediaPathsAndOrientationHint() {
+        val name = MotovlogMediaHelper.buildVideoFileName(1_700_000_000_000L)
+        assertTrue(name.startsWith("Motovlog_"))
+        assertTrue(name.endsWith(".mp4"))
+
+        val relPath = MotovlogMediaHelper.buildGalleryRelativePath()
+        assertTrue(relPath.contains(MotovlogMediaHelper.GALLERY_SUBFOLDER))
+        assertFalse(relPath.contains("Android/data"))
+
+        assertEquals(90, MotovlogMediaHelper.computeVideoOrientationHint(90, Surface.ROTATION_0))
+        assertEquals(0, MotovlogMediaHelper.computeVideoOrientationHint(90, Surface.ROTATION_90))
+        assertEquals(180, MotovlogMediaHelper.computeVideoOrientationHint(90, Surface.ROTATION_270))
+    }
+
+    @Test
+    fun computesNfsRadarRotationAndRimClamping() {
+        // Shortest wrap clockwise (355 -> 5 = +10 -> 365) and counter-clockwise (5 -> 355 = -10 -> -5)
+        assertEquals(365f, NfsRadarMath.shortestUnwrappedAngleDeg(355f, 5f), 0.01f)
+        assertEquals(-5f, NfsRadarMath.shortestUnwrappedAngleDeg(5f, 355f), 0.01f)
+
+        val origin = GeoPointX(-6.2000, 106.8000)
+        val northEast = GeoPointX(-6.1980, 106.8020)
+        val off = NfsRadarMath.geoToRadarOffsetPx(
+            point = northEast,
+            center = origin,
+            zoom = 16.0,
+            baseTilePx = 256.0
+        )
+        assertTrue(off.x > 0f)
+        assertTrue(off.y < 0f)
+
+        // Nearby target remains inside rim
+        val (inside, clampedInside) = NfsRadarMath.projectAndClampToRadarRim(
+            northUpOffset = Offset(30f, -40f),
+            rotationDeg = 0f,
+            maxRimRadiusPx = 120f
+        )
+        assertFalse(clampedInside)
+        assertEquals(30f, inside.x, 0.01f)
+        assertEquals(-40f, inside.y, 0.01f)
+
+        // Distant target clamps cleanly to rim radius while preserving angle
+        val (rimPt, clampedRim) = NfsRadarMath.projectAndClampToRadarRim(
+            northUpOffset = Offset(0f, -600f),
+            rotationDeg = -90f, // heading East: North (-Y) rotates to left (-X)
+            maxRimRadiusPx = 120f
+        )
+        assertTrue(clampedRim)
+        assertEquals(-120f, rimPt.x, 0.1f)
+        assertEquals(0f, rimPt.y, 0.1f)
     }
 }

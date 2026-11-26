@@ -517,7 +517,8 @@ private fun DashboardRootApp(
         composable<RouteMotovlogCam> {
             MotovlogCamScreen(
                 state = state,
-                onClose = { navController.popBackStack() }
+                onClose = { navController.popBackStack() },
+                onEnsureGps = { viewModel.startGpsAndWatchdog() }
             )
         }
     }
