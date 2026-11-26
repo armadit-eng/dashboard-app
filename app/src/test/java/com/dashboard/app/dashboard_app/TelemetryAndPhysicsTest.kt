@@ -8,8 +8,11 @@ import com.dashboard.app.dashboard_app.engine.RoutePhysics
 import com.dashboard.app.dashboard_app.engine.TelemetryEngine
 import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.Battery2Data
+import com.dashboard.app.dashboard_app.model.BmsProtocol
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.ControllerProtocol
 import com.dashboard.app.dashboard_app.model.Esp32Data
+import com.dashboard.app.dashboard_app.model.FardriverData
 import com.dashboard.app.dashboard_app.model.GeoPointX
 import com.dashboard.app.dashboard_app.model.JkBmsData
 import com.dashboard.app.dashboard_app.model.LiveTripMetrics
@@ -820,5 +823,371 @@ class TelemetryAndPhysicsTest {
             assertEquals(110.364567, reparsed[0].lng, 0.0001)
             assertTrue(reparsed[0].isMolisFriendly)
         }
+    }
+
+    @Test
+    fun parsesFardriver16ByteFramesAndComputesSpeed() {
+        fun u16Le(buf: ByteArray, off: Int, v: Int) {
+            buf[off] = (v and 0xFF).toByte()
+            buf[off + 1] = ((v ushr 8) and 0xFF).toByte()
+        }
+
+        // Frame 0 -> flashAddr 0xE2 (RPM, gear, hall, iq, id, errFlags)
+        val fE2 = ByteArray(16)
+        fE2[0] = 0xAA.toByte()
+        fE2[1] = 0
+        fE2[3] = 5 // hallPosition
+        fE2[4] = 2 // gear SPORT
+        u16Le(fE2, 5, 4000) // raw electrical RPM -> 200 mech RPM at 20 polePairs
+        fE2[7] = 0x04 // errorFlags
+        u16Le(fE2, 8, 100) // iq = 25.0 A at 0.25 scale
+        u16Le(fE2, 10, (-20) and 0xFFFF) // id = -5.0 A at 0.25 scale
+
+        var fd = TelemetryEngine.parseFardriver16ByteFrame(
+            buf = fE2,
+            current = FardriverData(),
+            polePairs = 20,
+            wheelCircMm = 1580,
+            currentScale = 0.25
+        )
+        assertNotNull(fd)
+        assertEquals(5, fd!!.hallPosition)
+        assertEquals(2, fd.gear)
+        assertEquals(4000, fd.rpm)
+        assertEquals(18.96, fd.speedKmh!!, 0.02)
+        assertEquals(0x04, fd.errorFlags)
+        assertEquals(25.0, fd.iqCurrentA!!, 0.01)
+        assertEquals(-5.0, fd.idCurrentA!!, 0.01)
+
+        // Frame 1 -> flashAddr 0xE8 (voltage, lineCurrent, modRatio, workState, throttle)
+        val fE8 = ByteArray(16)
+        fE8[0] = 0xAA.toByte()
+        fE8[1] = 1
+        u16Le(fE8, 2, 735) // 73.5 V
+        u16Le(fE8, 4, 120) // 30.0 A at 0.25 scale
+        fE8[6] = 180.toByte()
+        fE8[8] = 3
+        fE8[13] = 255.toByte() // 100% throttle
+        fd = TelemetryEngine.parseFardriver16ByteFrame(fE8, fd, polePairs = 20, wheelCircMm = 1580, currentScale = 0.25)!!
+        assertEquals(73.5, fd.voltageV!!, 0.01)
+        assertEquals(30.0, fd.lineCurrentA!!, 0.01)
+        assertEquals(180, fd.modRatio)
+        assertEquals(3, fd.workState)
+        assertEquals(100.0, fd.throttlePct!!, 0.01)
+
+        // Frame 4 -> flashAddr 0x06 (MOSFET temp)
+        val f06 = ByteArray(16)
+        f06[0] = 0xAA.toByte()
+        f06[1] = 4
+        f06[3] = 44
+        fd = TelemetryEngine.parseFardriver16ByteFrame(f06, fd)!!
+        assertEquals(44.0, fd.mosTempC!!, 0.01)
+
+        // Frame 52 -> flashAddr 0xDC (motor temp)
+        val fDc = ByteArray(16)
+        fDc[0] = 0xAA.toByte()
+        fDc[1] = 52
+        fDc[2] = 68
+        fd = TelemetryEngine.parseFardriver16ByteFrame(fDc, fd)!!
+        assertEquals(68.0, fd.motorTempC!!, 0.01)
+        assertEquals(4, fd.framesCount)
+    }
+
+    @Test
+    fun parsesAntBms140ByteFrame() {
+        fun u16Be(buf: ByteArray, off: Int, v: Int) {
+            buf[off] = ((v ushr 8) and 0xFF).toByte()
+            buf[off + 1] = (v and 0xFF).toByte()
+        }
+        fun u32Be(buf: ByteArray, off: Int, v: Long) {
+            buf[off] = ((v ushr 24) and 0xFF).toByte()
+            buf[off + 1] = ((v ushr 16) and 0xFF).toByte()
+            buf[off + 2] = ((v ushr 8) and 0xFF).toByte()
+            buf[off + 3] = (v and 0xFF).toByte()
+        }
+
+        val frame = ByteArray(140)
+        frame[0] = 0xAA.toByte()
+        frame[1] = 0x55
+        frame[2] = 0xAA.toByte()
+        frame[3] = 0xFF.toByte()
+        u16Be(frame, 4, 770) // 77.0 V
+        for (i in 0 until 20) {
+            u16Be(frame, 6 + i * 2, 3850) // 3.850 V
+        }
+        u32Be(frame, 70, (-155L) and 0xFFFFFFFFL) // -15.5 A
+        frame[74] = 86 // SOC 86%
+        u32Be(frame, 75, 30_000L) // 30.0 Ah
+        u32Be(frame, 79, 25_800L) // 25.8 Ah
+        u32Be(frame, 83, 450_000L) // 450.0 Ah cycle -> 15 cycles
+        u16Be(frame, 91, 37) // MOS 37C
+        u16Be(frame, 95, 31) // T1 31C
+        u16Be(frame, 97, 33) // T2 33C
+        frame[103] = 1 // CHG ON
+        frame[104] = 1 // DSG ON
+        frame[105] = 1 // Balancing ON
+
+        val parsed = TelemetryEngine.parseAntBms140ByteFrame(frame)
+        assertNotNull(parsed)
+        assertEquals(BmsProtocol.ANT.shortLabel, parsed!!.protocolLabel)
+        assertEquals(77.0, parsed.vpack!!, 0.01)
+        assertEquals(-15.5, parsed.ibat!!, 0.01)
+        assertEquals(86.0, parsed.socPct!!, 0.01)
+        assertEquals(20, parsed.cellCount)
+        assertEquals(30.0, parsed.capacityAh!!, 0.01)
+        assertEquals(25.8, parsed.remainAh!!, 0.01)
+        assertEquals(15, parsed.cycles)
+        assertEquals(37.0, parsed.tempMosC!!, 0.01)
+        assertEquals(31.0, parsed.temp1C!!, 0.01)
+        assertEquals(33.0, parsed.temp2C!!, 0.01)
+        assertTrue(parsed.mosChargeOn == true)
+        assertTrue(parsed.mosDischargeOn == true)
+        assertTrue(parsed.balancingActive == true)
+    }
+
+    @Test
+    fun parsesDaly13ByteFrames() {
+        val cmd90 = TelemetryEngine.buildDalyCommandFrame(0x90)
+        assertEquals(13, cmd90.size)
+        assertEquals(0xA5.toByte(), cmd90[0])
+        assertEquals(0x40.toByte(), cmd90[1])
+        assertEquals(0x90.toByte(), cmd90[2])
+        assertEquals(((0xA5 + 0x40 + 0x90 + 0x08) and 0xFF).toByte(), cmd90[12])
+
+        fun makeDalyRx(cmd: Int, fill: (ByteArray) -> Unit): ByteArray {
+            val f = ByteArray(13)
+            f[0] = 0xA5.toByte()
+            f[1] = 0x01
+            f[2] = (cmd and 0xFF).toByte()
+            f[3] = 0x08
+            fill(f)
+            var sum = 0
+            for (i in 0 until 12) sum += f[i].toInt() and 0xFF
+            f[12] = (sum and 0xFF).toByte()
+            return f
+        }
+        fun u16Be(buf: ByteArray, off: Int, v: Int) {
+            buf[off] = ((v ushr 8) and 0xFF).toByte()
+            buf[off + 1] = (v and 0xFF).toByte()
+        }
+
+        val cellAcc = mutableMapOf<Int, Double>()
+        var bms = JkBmsData()
+
+        // 0x90: 74.2V, -12.5A (raw 29875), 78.5% SOC
+        bms = TelemetryEngine.parseDaly13ByteFrame(makeDalyRx(0x90) {
+            u16Be(it, 4, 742)
+            u16Be(it, 8, 29875)
+            u16Be(it, 10, 785)
+        }, bms, cellAcc)!!
+        assertEquals(BmsProtocol.DALY.shortLabel, bms.protocolLabel)
+        assertEquals(74.2, bms.vpack!!, 0.01)
+        assertEquals(-12.5, bms.ibat!!, 0.01)
+        assertEquals(78.5, bms.socPct!!, 0.01)
+
+        // 0x92: temps (offset -40)
+        bms = TelemetryEngine.parseDaly13ByteFrame(makeDalyRx(0x92) {
+            it[4] = 74
+            it[6] = 69
+        }, bms, cellAcc)!!
+        assertEquals(34.0, bms.temp1C!!, 0.01)
+        assertEquals(29.0, bms.temp2C!!, 0.01)
+
+        // 0x93: MOS + remaining Ah
+        bms = TelemetryEngine.parseDaly13ByteFrame(makeDalyRx(0x93) {
+            it[5] = 1
+            it[6] = 1
+            it[8] = 0x00
+            it[9] = 0x00
+            it[10] = 0x5F
+            it[11] = 0xB4.toByte() // 24500 mAh = 24.5 Ah
+        }, bms, cellAcc)!!
+        assertTrue(bms.mosChargeOn == true)
+        assertTrue(bms.mosDischargeOn == true)
+        assertEquals(24.5, bms.remainAh!!, 0.01)
+
+        // 0x94: 6 cells, 42 cycles
+        bms = TelemetryEngine.parseDaly13ByteFrame(makeDalyRx(0x94) {
+            it[4] = 6
+            u16Be(it, 10, 42)
+        }, bms, cellAcc)!!
+        assertEquals(6, bms.cellCount)
+        assertEquals(42, bms.cycles)
+
+        // 0x95: cell voltages across 2 frames
+        bms = TelemetryEngine.parseDaly13ByteFrame(makeDalyRx(0x95) {
+            it[4] = 1
+            u16Be(it, 5, 3890)
+            u16Be(it, 7, 3900)
+            u16Be(it, 9, 3910)
+        }, bms, cellAcc)!!
+        bms = TelemetryEngine.parseDaly13ByteFrame(makeDalyRx(0x95) {
+            it[4] = 2
+            u16Be(it, 5, 3880)
+            u16Be(it, 7, 3895)
+            u16Be(it, 9, 3905)
+        }, bms, cellAcc)!!
+        assertEquals(6, bms.cellVoltages.size)
+        assertEquals(3.88, bms.minCellV!!, 0.001)
+        assertEquals(3.91, bms.maxCellV!!, 0.001)
+        assertEquals(0.03, bms.deltaCellV!!, 0.001)
+    }
+
+    @Test
+    fun parsesJbd03And04Frames() {
+        fun u16Be(buf: ByteArray, off: Int, v: Int) {
+            buf[off] = ((v ushr 8) and 0xFF).toByte()
+            buf[off + 1] = (v and 0xFF).toByte()
+        }
+        fun buildJbdRx(cmd: Int, payload: ByteArray): ByteArray {
+            val out = ByteArray(4 + payload.size + 3)
+            out[0] = 0xDD.toByte()
+            out[1] = (cmd and 0xFF).toByte()
+            out[2] = 0x00 // OK
+            out[3] = (payload.size and 0xFF).toByte()
+            System.arraycopy(payload, 0, out, 4, payload.size)
+            var sum = 0
+            for (i in 2 until 4 + payload.size) sum += out[i].toInt() and 0xFF
+            val crc = (0x10000 - (sum and 0xFFFF)) and 0xFFFF
+            u16Be(out, 4 + payload.size, crc)
+            out[out.size - 1] = 0x77
+            return out
+        }
+
+        val p03 = ByteArray(27)
+        u16Be(p03, 0, 7520) // 75.20 V
+        u16Be(p03, 2, (-1050) and 0xFFFF) // -10.50 A
+        u16Be(p03, 4, 2400) // 24.0 Ah
+        u16Be(p03, 6, 3000) // 30.0 Ah
+        u16Be(p03, 8, 38) // 38 cycles
+        u16Be(p03, 12, 1) // bal mask active
+        p03[19] = 80 // SOC 80%
+        p03[20] = 0x03 // CHG + DSG ON
+        p03[21] = 20 // 20S
+        p03[22] = 2 // 2 NTC sensors
+        u16Be(p03, 23, 3031) // 30.0 C
+        u16Be(p03, 25, 3061) // 33.0 C
+
+        val rx03 = buildJbdRx(0x03, p03)
+        var jbd = TelemetryEngine.parseJbdFrame(rx03, JkBmsData())
+        assertNotNull(jbd)
+        assertEquals(BmsProtocol.JBD.shortLabel, jbd!!.protocolLabel)
+        assertEquals(75.20, jbd.vpack!!, 0.01)
+        assertEquals(-10.50, jbd.ibat!!, 0.01)
+        assertEquals(24.0, jbd.remainAh!!, 0.01)
+        assertEquals(30.0, jbd.capacityAh!!, 0.01)
+        assertEquals(38, jbd.cycles)
+        assertEquals(80.0, jbd.socPct!!, 0.01)
+        assertTrue(jbd.mosChargeOn == true)
+        assertTrue(jbd.mosDischargeOn == true)
+        assertEquals(30.0, jbd.temp1C!!, 0.1)
+        assertEquals(33.0, jbd.temp2C!!, 0.1)
+
+        // Corrupt checksum must be rejected
+        val badRx = rx03.copyOf()
+        badRx[badRx.size - 2] = (badRx[badRx.size - 2].toInt() xor 0xFF).toByte()
+        assertNull(TelemetryEngine.parseJbdFrame(badRx, jbd))
+
+        // 0x04 cell voltages (20S)
+        val p04 = ByteArray(40)
+        for (i in 0 until 20) u16Be(p04, i * 2, 3760)
+        jbd = TelemetryEngine.parseJbdFrame(buildJbdRx(0x04, p04), jbd)!!
+        assertEquals(20, jbd.cellCount)
+        assertEquals(3.76, jbd.minCellV!!, 0.001)
+        assertEquals(0.0, jbd.deltaCellV!!, 0.001)
+    }
+
+    @Test
+    fun keepsFardriverAndSmartBmsSeparatedInComputeEffective() {
+        val now = 1_700_000_000_000L
+        val fd = FardriverData(
+            voltageV = 74.0,
+            lineCurrentA = 25.0, // Fardriver + = motoring/discharge
+            rpm = 3200,
+            speedKmh = 42.5,
+            mosTempC = 43.0,
+            gear = 2,
+            lastUpdatedMs = now
+        )
+        val antBms = JkBmsData(
+            protocolLabel = BmsProtocol.ANT.shortLabel,
+            vpack = 77.0,
+            ibat = -15.5,
+            socPct = 86.0,
+            temp1C = 31.0,
+            lastUpdatedMs = now
+        )
+        // Prefer Controller (Fardriver): must use Fardriver V/I (negated for discharge) and NEVER leak MID/BMS SOC
+        val effCtrl = TelemetryEngine.computeEffective(
+            motor = MotorData(socPct = 70.0, vbat = 71.0, lastUpdatedMs = now),
+            motorState = ConnectionStateX.CONNECTED,
+            jk = antBms,
+            jkState = ConnectionStateX.CONNECTED,
+            esp1 = Esp32Data(),
+            esp1State = ConnectionStateX.DISCONNECTED,
+            b2 = Battery2Data(),
+            esp2State = ConnectionStateX.DISCONNECTED,
+            gpsSpeedKmh = null,
+            trip = LiveTripMetrics(),
+            settings = AppSettings(
+                controllerProtocolId = ControllerProtocol.FARDRIVER_BLE.id,
+                bmsProtocolId = BmsProtocol.ANT.id,
+                batteryPriorityId = "motor"
+            ),
+            nowMs = now,
+            fardriver = fd
+        )
+        assertEquals("Fardriver", effCtrl.b1SourceLabel)
+        assertEquals(74.0, effCtrl.b1Vbat!!, 0.01)
+        assertEquals(-25.0, effCtrl.b1Ibat!!, 0.01)
+        assertEquals(42.5, effCtrl.speedKmh!!, 0.01)
+        assertEquals(3200, effCtrl.rpm)
+        assertEquals("SPORT", effCtrl.modeLabel)
+        assertNull(effCtrl.b1SocPct)
+
+        // Fardriver negative lineCurrentA -> regen
+        val effRegen = TelemetryEngine.computeEffective(
+            motor = MotorData(),
+            motorState = ConnectionStateX.CONNECTED,
+            jk = JkBmsData(),
+            jkState = ConnectionStateX.DISCONNECTED,
+            esp1 = Esp32Data(),
+            esp1State = ConnectionStateX.DISCONNECTED,
+            b2 = Battery2Data(),
+            esp2State = ConnectionStateX.DISCONNECTED,
+            gpsSpeedKmh = null,
+            trip = LiveTripMetrics(),
+            settings = AppSettings(controllerProtocolId = ControllerProtocol.FARDRIVER_BLE.id),
+            nowMs = now,
+            fardriver = fd.copy(lineCurrentA = -10.0)
+        )
+        assertEquals(10.0, effRegen.b1Ibat!!, 0.01)
+        assertTrue(effRegen.isRegen)
+
+        // Prefer Smart BMS (ANT) while using Fardriver speed/RPM
+        val effBms = TelemetryEngine.computeEffective(
+            motor = MotorData(),
+            motorState = ConnectionStateX.CONNECTED,
+            jk = antBms,
+            jkState = ConnectionStateX.CONNECTED,
+            esp1 = Esp32Data(),
+            esp1State = ConnectionStateX.DISCONNECTED,
+            b2 = Battery2Data(),
+            esp2State = ConnectionStateX.DISCONNECTED,
+            gpsSpeedKmh = null,
+            trip = LiveTripMetrics(),
+            settings = AppSettings(
+                controllerProtocolId = ControllerProtocol.FARDRIVER_BLE.id,
+                bmsProtocolId = BmsProtocol.ANT.id,
+                batteryPriorityId = "jikong"
+            ),
+            nowMs = now,
+            fardriver = fd
+        )
+        assertEquals("ANT BMS", effBms.b1SourceLabel)
+        assertEquals(86.0, effBms.b1SocPct!!, 0.01)
+        assertEquals(77.0, effBms.b1Vbat!!, 0.01)
+        assertEquals(42.5, effBms.speedKmh!!, 0.01)
+        assertEquals(3200, effBms.rpm)
     }
 }

@@ -82,6 +82,7 @@ import com.dashboard.app.dashboard_app.engine.TelemetryEngine
 import com.dashboard.app.dashboard_app.model.AlertSeverity
 import com.dashboard.app.dashboard_app.model.ChargingIndicatorState
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.ControllerProtocol
 import com.dashboard.app.dashboard_app.model.MaintHealthLevel
 import com.dashboard.app.dashboard_app.model.PlannedStop
 import com.dashboard.app.dashboard_app.ui.components.CockpitCard
@@ -247,8 +248,8 @@ fun HomeCockpitScreen(
             // 2. Connection Badges Row
             item {
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    item { ConnBadge("Motor MID", state.motorConnState, c.accent, c.warning, c.textMuted, onOpenDeviceSheet) }
-                    item { ConnBadge("JK-BMS", state.jkConnState, c.accent, c.warning, c.textMuted, onOpenDeviceSheet) }
+                    item { ConnBadge(state.settings.controllerProtocol.shortLabel, state.motorConnState, c.accent, c.warning, c.textMuted, onOpenDeviceSheet) }
+                    item { ConnBadge(state.settings.bmsProtocol.shortLabel, state.jkConnState, c.accent, c.warning, c.textMuted, onOpenDeviceSheet) }
                     item { ConnBadge("ESP32 #1", state.esp1ConnState, c.accent, c.warning, c.textMuted, onOpenDeviceSheet) }
                     item { ConnBadge("ESP32 #2", state.esp2ConnState, c.accent, c.warning, c.textMuted, onOpenDeviceSheet) }
                     if (state.devSimActive) {
@@ -429,20 +430,34 @@ fun HomeCockpitScreen(
                     Spacer(Modifier.height(12.dp))
 
                     val m = state.motorData
+                    val fd = state.fardriverData
                     val jk = state.jkData
+                    val useFardriver = state.settings.controllerProtocol != ControllerProtocol.MID_AT
+                    val bmsShort = state.settings.bmsProtocol.shortLabel
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        if (useFardriver) {
+                            MiniMetric(
+                                title = "Fardriver",
+                                value = "${fd.voltageV?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} V",
+                                sub = if (fd.framesCount > 0) {
+                                    "${fd.lineCurrentA?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}A • ${fd.rpm ?: "—"} RPM"
+                                } else "Belum terhubung",
+                                modifier = Modifier.weight(1f)
+                            )
+                        } else {
+                            MiniMetric(
+                                title = "Baterai ORI (MID)",
+                                value = "${m.socPct?.roundToInt()?.toString() ?: "—"}%",
+                                sub = "${m.vbat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}V • ${m.ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}A" +
+                                    (m.cbatCycles?.let { " • ${it}x" } ?: ""),
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
                         MiniMetric(
-                            title = "Baterai ORI (MID)",
-                            value = "${m.socPct?.roundToInt()?.toString() ?: "—"}%",
-                            sub = "${m.vbat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}V • ${m.ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}A" +
-                                (m.cbatCycles?.let { " • ${it}x" } ?: ""),
-                            modifier = Modifier.weight(1f)
-                        )
-                        MiniMetric(
-                            title = "JK-BMS",
+                            title = bmsShort,
                             value = "${jk.socPct?.roundToInt()?.toString() ?: "—"}%",
                             sub = if (jk.vpack != null || jk.ibat != null) {
                                 "${jk.vpack?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}V • ${jk.ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"}A" +

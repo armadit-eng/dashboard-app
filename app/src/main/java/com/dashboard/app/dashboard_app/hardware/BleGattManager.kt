@@ -17,9 +17,12 @@ import android.os.Handler
 import android.os.Looper
 import com.dashboard.app.dashboard_app.engine.TelemetryEngine
 import com.dashboard.app.dashboard_app.model.Battery2Data
+import com.dashboard.app.dashboard_app.model.BmsProtocol
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.ControllerProtocol
 import com.dashboard.app.dashboard_app.model.DiscoveredDeviceX
 import com.dashboard.app.dashboard_app.model.Esp32Data
+import com.dashboard.app.dashboard_app.model.FardriverData
 import com.dashboard.app.dashboard_app.model.JkBmsData
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -38,7 +41,16 @@ class BleGattManager(private val context: Context) {
         private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private val JK_SVC_UUID: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
         private val JK_NOTIFY_UUID: UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
+        private val JK_ALT_WRITE_UUID: UUID = UUID.fromString("0000ffe2-0000-1000-8000-00805f9b34fb")
         private val JK_WRITE_UUID: UUID = UUID.fromString("0000fff2-0000-1000-8000-00805f9b34fb")
+
+        private val DALY_SVC_UUID: UUID = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
+        private val DALY_NOTIFY_UUID: UUID = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
+        private val DALY_WRITE_UUID: UUID = UUID.fromString("0000fff2-0000-1000-8000-00805f9b34fb")
+
+        private val JBD_SVC_UUID: UUID = UUID.fromString("0000ff00-0000-1000-8000-00805f9b34fb")
+        private val JBD_NOTIFY_UUID: UUID = UUID.fromString("0000ff01-0000-1000-8000-00805f9b34fb")
+        private val JBD_WRITE_UUID: UUID = UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
 
         private val NUS_SVC_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
         private val NUS_WRITE_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
@@ -64,10 +76,26 @@ class BleGattManager(private val context: Context) {
 
     var onMotorBleStateChanged: ((ConnectionStateX, String) -> Unit)? = null
     var onMotorBleLine: ((String) -> Unit)? = null
+    var onFardriverData: ((FardriverData) -> Unit)? = null
     var onSlotRssi: ((String, Int) -> Unit)? = null
 
     @Volatile
     var invertB2Current: Boolean = false
+
+    @Volatile
+    var activeBmsProtocol: BmsProtocol = BmsProtocol.JIKONG
+
+    @Volatile
+    var activeControllerProtocol: ControllerProtocol = ControllerProtocol.MID_AT
+
+    @Volatile
+    var fardriverPolePairs: Int = 20
+
+    @Volatile
+    var fardriverWheelCircMm: Int = 1580
+
+    @Volatile
+    var fardriverCurrentScale: Double = 0.25
 
     @Volatile
     var isMotorBleMapsSending: Boolean = false
@@ -96,9 +124,19 @@ class BleGattManager(private val context: Context) {
 
     private var jkPollFuture: ScheduledFuture<*>? = null
     private val jkFrameBuf = mutableListOf<Byte>()
+    private var bmsCur = JkBmsData()
+    private val dalyCellAcc = mutableMapOf<Int, Double>()
+    private var antReplyV2 = false
+    private var antPollCount = 0
+    private var jbdToggle = false
+    private var dalyCmdIdx = 0
     @Volatile
     private var jkAwaitingResponse: Boolean = false
     private var jkAwaitTimeoutRunnable: Runnable? = null
+
+    private val fdFrameBuf = mutableListOf<Byte>()
+    private var fardriverCur = FardriverData()
+    private var fardriverPollFuture: ScheduledFuture<*>? = null
 
     private val esp1Rx = StringBuilder()
     private var esp1Cur = Esp32Data()
@@ -313,34 +351,113 @@ class BleGattManager(private val context: Context) {
                     var notifyCh: BluetoothGattCharacteristic? = null
                     var writeCh: BluetoothGattCharacteristic? = null
 
+                    fun isNotifyOrIndicate(ch: BluetoothGattCharacteristic): Boolean =
+                        (ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE)) != 0
+
+                    fun isWritable(ch: BluetoothGattCharacteristic): Boolean =
+                        (ch.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
+
                     if (isNus) {
                         val svc = g.getService(NUS_SVC_UUID)
                         notifyCh = svc?.getCharacteristic(NUS_NOTIFY_UUID)
                         writeCh = svc?.getCharacteristic(NUS_WRITE_UUID)
-                    } else {
-                        // Some JK-BMS devices declare FFE0 twice where FFE1/FFF2 live on the second instance.
+                    } else if (slot == "jk") {
+                        when (activeBmsProtocol) {
+                            BmsProtocol.JBD -> {
+                                val jbdSvc = g.getService(JBD_SVC_UUID)
+                                notifyCh = jbdSvc?.getCharacteristic(JBD_NOTIFY_UUID)
+                                writeCh = jbdSvc?.getCharacteristic(JBD_WRITE_UUID)
+                            }
+                            BmsProtocol.DALY -> {
+                                val dalySvc = g.getService(DALY_SVC_UUID)
+                                if (dalySvc != null) {
+                                    notifyCh = dalySvc.getCharacteristic(DALY_NOTIFY_UUID)
+                                        ?: dalySvc.characteristics.firstOrNull(::isNotifyOrIndicate)
+                                    writeCh = dalySvc.getCharacteristic(DALY_WRITE_UUID)
+                                        ?: dalySvc.characteristics.firstOrNull(::isWritable)
+                                }
+                                if (notifyCh == null) {
+                                    val ffeSvc = g.getService(JK_SVC_UUID)
+                                    notifyCh = ffeSvc?.getCharacteristic(JK_NOTIFY_UUID)
+                                        ?: ffeSvc?.characteristics?.firstOrNull(::isNotifyOrIndicate)
+                                    writeCh = ffeSvc?.getCharacteristic(JK_ALT_WRITE_UUID)
+                                        ?: ffeSvc?.getCharacteristic(JK_WRITE_UUID)
+                                        ?: ffeSvc?.characteristics?.firstOrNull(::isWritable)
+                                }
+                            }
+                            BmsProtocol.ANT -> {
+                                val ffeSvc = g.getService(JK_SVC_UUID)
+                                if (ffeSvc != null) {
+                                    notifyCh = ffeSvc.getCharacteristic(JK_NOTIFY_UUID)
+                                        ?: ffeSvc.characteristics.firstOrNull(::isNotifyOrIndicate)
+                                    writeCh = ffeSvc.getCharacteristic(JK_NOTIFY_UUID)
+                                        ?: ffeSvc.getCharacteristic(JK_ALT_WRITE_UUID)
+                                        ?: ffeSvc.characteristics.firstOrNull(::isWritable)
+                                }
+                                if (notifyCh == null) {
+                                    val fffSvc = g.getService(DALY_SVC_UUID)
+                                    notifyCh = fffSvc?.getCharacteristic(DALY_NOTIFY_UUID)
+                                        ?: fffSvc?.characteristics?.firstOrNull(::isNotifyOrIndicate)
+                                    writeCh = fffSvc?.getCharacteristic(DALY_WRITE_UUID)
+                                        ?: fffSvc?.characteristics?.firstOrNull(::isWritable)
+                                }
+                            }
+                            BmsProtocol.JIKONG -> {
+                                // Some JK-BMS devices declare FFE0 twice where FFE1/FFF2 live on the second instance.
+                                for (s in g.services) {
+                                    if (s.uuid == JK_SVC_UUID) {
+                                        if (notifyCh == null) notifyCh = s.getCharacteristic(JK_NOTIFY_UUID)
+                                        if (writeCh == null) writeCh = s.getCharacteristic(JK_WRITE_UUID)
+                                        if (notifyCh != null && writeCh != null) break
+                                    }
+                                }
+                            }
+                        }
+                    } else if (slot == "motor") {
                         for (s in g.services) {
                             if (s.uuid == JK_SVC_UUID) {
-                                if (notifyCh == null) notifyCh = s.getCharacteristic(JK_NOTIFY_UUID)
-                                if (writeCh == null) writeCh = s.getCharacteristic(JK_WRITE_UUID)
-                                if (notifyCh != null && writeCh != null) break
+                                notifyCh = notifyCh ?: s.getCharacteristic(JK_NOTIFY_UUID)
+                                writeCh = writeCh ?: s.getCharacteristic(JK_WRITE_UUID) ?: s.getCharacteristic(JK_ALT_WRITE_UUID) ?: notifyCh
                             }
                         }
                         if (notifyCh == null) {
-                            val fallbackSvc = g.services.firstOrNull { s ->
-                                s.characteristics.any { (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 }
+                            val jbdSvc = g.getService(JBD_SVC_UUID)
+                            if (jbdSvc != null) {
+                                notifyCh = jbdSvc.getCharacteristic(JBD_NOTIFY_UUID)
+                                writeCh = jbdSvc.getCharacteristic(JBD_WRITE_UUID) ?: jbdSvc.characteristics.firstOrNull(::isWritable)
                             }
-                            if (fallbackSvc != null) {
-                                notifyCh = fallbackSvc.getCharacteristic(JK_NOTIFY_UUID) ?: fallbackSvc.characteristics.firstOrNull {
-                                    (it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
-                                }
-                                writeCh = writeCh ?: fallbackSvc.getCharacteristic(JK_WRITE_UUID) ?: notifyCh ?: fallbackSvc.characteristics.firstOrNull {
-                                    (it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
-                                }
-                            }
-                        } else if (writeCh == null) {
-                            writeCh = notifyCh
                         }
+                        if (notifyCh == null) {
+                            val dalySvc = g.getService(DALY_SVC_UUID)
+                            if (dalySvc != null) {
+                                notifyCh = dalySvc.getCharacteristic(DALY_NOTIFY_UUID)
+                                writeCh = dalySvc.getCharacteristic(DALY_WRITE_UUID) ?: dalySvc.characteristics.firstOrNull(::isWritable)
+                            }
+                        }
+                        if (notifyCh == null) {
+                            val nusSvc = g.getService(NUS_SVC_UUID)
+                            if (nusSvc != null) {
+                                notifyCh = nusSvc.getCharacteristic(NUS_NOTIFY_UUID)
+                                writeCh = nusSvc.getCharacteristic(NUS_WRITE_UUID)
+                            }
+                        }
+                    }
+
+                    // Generic fallback across all discovered GATT services
+                    if (notifyCh == null) {
+                        val fallbackSvc = g.services.firstOrNull { s ->
+                            s.characteristics.any(::isNotifyOrIndicate)
+                        }
+                        if (fallbackSvc != null) {
+                            notifyCh = fallbackSvc.getCharacteristic(JK_NOTIFY_UUID)
+                                ?: fallbackSvc.characteristics.firstOrNull(::isNotifyOrIndicate)
+                            writeCh = writeCh
+                                ?: fallbackSvc.getCharacteristic(JK_WRITE_UUID)
+                                ?: fallbackSvc.characteristics.firstOrNull(::isWritable)
+                                ?: notifyCh
+                        }
+                    } else if (writeCh == null) {
+                        writeCh = notifyCh
                     }
 
                     if (notifyCh == null) {
@@ -355,19 +472,24 @@ class BleGattManager(private val context: Context) {
                     if (writeCh != null) writeChars[slot] = writeCh
 
                     var waitingCccd = false
-                    if (notifyCh != null) {
-                        g.setCharacteristicNotification(notifyCh, true)
-                        val cccd = notifyCh.getDescriptor(CCCD_UUID)
-                        if (cccd != null) {
-                            waitingCccd = true
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                            } else {
-                                @Suppress("DEPRECATION")
-                                cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                                @Suppress("DEPRECATION")
-                                g.writeDescriptor(cccd)
-                            }
+                    g.setCharacteristicNotification(notifyCh, true)
+                    val cccd = notifyCh.getDescriptor(CCCD_UUID)
+                    if (cccd != null) {
+                        val useIndicate = (notifyCh.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) == 0 &&
+                            (notifyCh.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+                        val cccdVal = if (useIndicate) {
+                            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                        } else {
+                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        }
+                        waitingCccd = true
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            g.writeDescriptor(cccd, cccdVal)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            cccd.value = cccdVal
+                            @Suppress("DEPRECATION")
+                            g.writeDescriptor(cccd)
                         }
                     }
 
@@ -490,22 +612,64 @@ class BleGattManager(private val context: Context) {
         jkPollFuture?.cancel(false)
         clearJkAwaitGuard()
         synchronized(jkFrameBuf) { jkFrameBuf.clear() }
+        synchronized(dalyCellAcc) { dalyCellAcc.clear() }
+        antReplyV2 = false
+        antPollCount = 0
+        jbdToggle = false
+        dalyCmdIdx = 0
 
-        // Mandatory JK-BMS handshake: 0x97 (Device Info) first, wait 1500ms so its
-        // 300-byte settings response finishes before requesting 0x96 (Cell Info).
-        scheduler.schedule({
-            if (gatts["jk"] != null) {
-                armJkAwaitGuard()
-                writeSlot("jk", TelemetryEngine.buildJkCommandFrame(0x97), noResponse = true)
+        when (activeBmsProtocol) {
+            BmsProtocol.JIKONG -> {
+                // Mandatory JK-BMS handshake: 0x97 (Device Info) first, wait 1500ms so its
+                // 300-byte settings response finishes before requesting 0x96 (Cell Info).
+                scheduler.schedule({
+                    if (gatts["jk"] != null) {
+                        armJkAwaitGuard()
+                        writeSlot("jk", TelemetryEngine.buildJkCommandFrame(0x97), noResponse = true)
+                    }
+                }, 200, TimeUnit.MILLISECONDS)
+
+                jkPollFuture = scheduler.scheduleAtFixedRate({
+                    if (gatts["jk"] == null) return@scheduleAtFixedRate
+                    if (jkAwaitingResponse) return@scheduleAtFixedRate
+                    armJkAwaitGuard()
+                    writeSlot("jk", TelemetryEngine.buildJkCommandFrame(0x96), noResponse = true)
+                }, 1700, 2500, TimeUnit.MILLISECONDS)
             }
-        }, 200, TimeUnit.MILLISECONDS)
-
-        jkPollFuture = scheduler.scheduleAtFixedRate({
-            if (gatts["jk"] == null) return@scheduleAtFixedRate
-            if (jkAwaitingResponse) return@scheduleAtFixedRate
-            armJkAwaitGuard()
-            writeSlot("jk", TelemetryEngine.buildJkCommandFrame(0x96), noResponse = true)
-        }, 1700, 2500, TimeUnit.MILLISECONDS)
+            BmsProtocol.ANT -> {
+                jkPollFuture = scheduler.scheduleAtFixedRate({
+                    if (gatts["jk"] == null) return@scheduleAtFixedRate
+                    val cmd = if (antReplyV2 || antPollCount % 4 == 3) {
+                        TelemetryEngine.ANT_V2_POLL_CMD
+                    } else {
+                        TelemetryEngine.ANT_LEGACY_POLL_CMD
+                    }
+                    antPollCount++
+                    writeSlot("jk", cmd, noResponse = true)
+                }, 300, 1500, TimeUnit.MILLISECONDS)
+            }
+            BmsProtocol.DALY -> {
+                val cmds = intArrayOf(0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96)
+                jkPollFuture = scheduler.scheduleAtFixedRate({
+                    if (gatts["jk"] == null) return@scheduleAtFixedRate
+                    val cmd = cmds[dalyCmdIdx % cmds.size]
+                    dalyCmdIdx++
+                    writeSlot("jk", TelemetryEngine.buildDalyCommandFrame(cmd), noResponse = true)
+                }, 300, 260, TimeUnit.MILLISECONDS)
+            }
+            BmsProtocol.JBD -> {
+                jkPollFuture = scheduler.scheduleAtFixedRate({
+                    if (gatts["jk"] == null) return@scheduleAtFixedRate
+                    val cmd = if (jbdToggle) {
+                        TelemetryEngine.JBD_READ_CELLS_CMD
+                    } else {
+                        TelemetryEngine.JBD_READ_BASIC_CMD
+                    }
+                    jbdToggle = !jbdToggle
+                    writeSlot("jk", cmd, noResponse = true)
+                }, 300, 750, TimeUnit.MILLISECONDS)
+            }
+        }
     }
 
     private fun startRssiPolling() {
@@ -531,8 +695,25 @@ class BleGattManager(private val context: Context) {
     private fun startMotorBlePolling() {
         motorBlePollFuture?.cancel(false)
         motorBleTimeFuture?.cancel(false)
+        fardriverPollFuture?.cancel(false)
         motorBleCbatReceived = false
         motorBleSchedule.forEach { it.lastSentMs = 0L }
+
+        if (activeControllerProtocol == ControllerProtocol.FARDRIVER_BLE) {
+            synchronized(fdFrameBuf) { fdFrameBuf.clear() }
+            fardriverCur = FardriverData()
+            scheduler.schedule({
+                if (gatts["motor"] != null) {
+                    writeSlot("motor", TelemetryEngine.FARDRIVER_WAKE_CMD, noResponse = true)
+                }
+            }, 250, TimeUnit.MILLISECONDS)
+            fardriverPollFuture = scheduler.scheduleAtFixedRate({
+                if (gatts["motor"] != null) {
+                    writeSlot("motor", TelemetryEngine.FARDRIVER_WAKE_CMD, noResponse = true)
+                }
+            }, 3000, 3000, TimeUnit.MILLISECONDS)
+            return
+        }
 
         val startupCmds = listOf(
             "AT+CBAT?\r\n",
@@ -578,14 +759,62 @@ class BleGattManager(private val context: Context) {
 
     private fun handleData(slot: String, bytes: ByteArray) {
         when (slot) {
-            "jk" -> onJkBytes(bytes)
+            "jk" -> onBmsBytes(bytes)
             "esp1" -> handleLineStream(esp1Rx, bytes) { parseEsp1Line(it) }
             "esp2" -> handleLineStream(esp2Rx, bytes) { parseEsp2Line(it) }
-            "motor" -> handleLineStream(motorBleRx, bytes) { line ->
-                if (!motorBleCbatReceived && line.contains("CBAT", ignoreCase = true) && line.any { it.isDigit() }) {
-                    motorBleCbatReceived = true
+            "motor" -> if (activeControllerProtocol == ControllerProtocol.FARDRIVER_BLE) {
+                onFardriverBytes(bytes)
+            } else {
+                handleLineStream(motorBleRx, bytes) { line ->
+                    if (!motorBleCbatReceived && line.contains("CBAT", ignoreCase = true) && line.any { it.isDigit() }) {
+                        motorBleCbatReceived = true
+                    }
+                    mainHandler.post { onMotorBleLine?.invoke(line) }
                 }
-                mainHandler.post { onMotorBleLine?.invoke(line) }
+            }
+        }
+    }
+
+    private fun onBmsBytes(chunk: ByteArray) {
+        when (activeBmsProtocol) {
+            BmsProtocol.JIKONG -> onJkBytes(chunk)
+            BmsProtocol.ANT -> onAntBytes(chunk)
+            BmsProtocol.DALY -> onDalyBytes(chunk)
+            BmsProtocol.JBD -> onJbdBytes(chunk)
+        }
+    }
+
+    private fun onFardriverBytes(chunk: ByteArray) {
+        synchronized(fdFrameBuf) {
+            chunk.forEach { fdFrameBuf.add(it) }
+            while (fdFrameBuf.size >= 16) {
+                val startIdx = fdFrameBuf.indexOfFirst { (it.toInt() and 0xFF) == 0xAA }
+                if (startIdx < 0) {
+                    fdFrameBuf.clear()
+                    return
+                }
+                if (startIdx > 0) {
+                    fdFrameBuf.subList(0, startIdx).clear()
+                }
+                if (fdFrameBuf.size < 16) return
+                val candidate = fdFrameBuf.subList(0, 16).toByteArray()
+                val pktId = candidate[1].toInt() and 0x3F
+                if (pktId !in 0..54) {
+                    fdFrameBuf.removeAt(0)
+                    continue
+                }
+                fdFrameBuf.subList(0, 16).clear()
+                val parsed = TelemetryEngine.parseFardriver16ByteFrame(
+                    buf = candidate,
+                    current = fardriverCur,
+                    polePairs = fardriverPolePairs,
+                    wheelCircMm = fardriverWheelCircMm,
+                    currentScale = fardriverCurrentScale
+                )
+                if (parsed != null) {
+                    fardriverCur = parsed
+                    mainHandler.post { onFardriverData?.invoke(parsed) }
+                }
             }
         }
     }
@@ -630,7 +859,133 @@ class BleGattManager(private val context: Context) {
                 onError = { err -> mainHandler.post { onLog?.invoke("JKBMS", err, true) } }
             )
             if (parsed != null) {
+                bmsCur = parsed
                 mainHandler.post { onJkData?.invoke(parsed) }
+            }
+        }
+    }
+
+    private fun onAntBytes(chunk: ByteArray) {
+        synchronized(jkFrameBuf) {
+            chunk.forEach { jkFrameBuf.add(it) }
+            while (jkFrameBuf.size >= 4) {
+                // Check for 140-byte legacy AA 55 AA FF / AA 55 AA 55
+                var legacyIdx = -1
+                for (i in 0..(jkFrameBuf.size - 4)) {
+                    val b0 = jkFrameBuf[i].toInt() and 0xFF
+                    val b1 = jkFrameBuf[i + 1].toInt() and 0xFF
+                    val b2 = jkFrameBuf[i + 2].toInt() and 0xFF
+                    val b3 = jkFrameBuf[i + 3].toInt() and 0xFF
+                    if (b0 == 0xAA && b1 == 0x55 && b2 == 0xAA && (b3 == 0xFF || b3 == 0x55)) {
+                        legacyIdx = i
+                        break
+                    }
+                }
+                if (legacyIdx >= 0) {
+                    if (legacyIdx > 0) jkFrameBuf.subList(0, legacyIdx).clear()
+                    if (jkFrameBuf.size < 140) return
+                    val frame = jkFrameBuf.subList(0, 140).toByteArray()
+                    jkFrameBuf.subList(0, 140).clear()
+                    val parsed = TelemetryEngine.parseAntBms140ByteFrame(frame)
+                    if (parsed != null) {
+                        bmsCur = parsed
+                        mainHandler.post { onJkData?.invoke(parsed) }
+                    }
+                    continue
+                }
+
+                // Check for newer 7E A1 ... AA 55 protocol
+                var v2Idx = -1
+                for (i in 0..(jkFrameBuf.size - 2)) {
+                    if ((jkFrameBuf[i].toInt() and 0xFF) == 0x7E &&
+                        (jkFrameBuf[i + 1].toInt() and 0xFF) == 0xA1
+                    ) {
+                        v2Idx = i
+                        break
+                    }
+                }
+                if (v2Idx >= 0) {
+                    if (v2Idx > 0) jkFrameBuf.subList(0, v2Idx).clear()
+                    if (jkFrameBuf.size < 10) return
+                    val dataLen = jkFrameBuf[5].toInt() and 0xFF
+                    val totalLen = 10 + dataLen
+                    if (totalLen < 12 || totalLen > 400) {
+                        jkFrameBuf.removeAt(0)
+                        continue
+                    }
+                    if (jkFrameBuf.size < totalLen) return
+                    val frame = jkFrameBuf.subList(0, totalLen).toByteArray()
+                    val parsed = TelemetryEngine.parseAntV2Frame(frame, bmsCur)
+                    if (parsed != null) {
+                        antReplyV2 = true
+                        bmsCur = parsed
+                        jkFrameBuf.subList(0, totalLen).clear()
+                        mainHandler.post { onJkData?.invoke(parsed) }
+                    } else {
+                        jkFrameBuf.removeAt(0)
+                    }
+                    continue
+                }
+
+                if (jkFrameBuf.size > 400) jkFrameBuf.clear()
+                return
+            }
+        }
+    }
+
+    private fun onDalyBytes(chunk: ByteArray) {
+        synchronized(jkFrameBuf) {
+            chunk.forEach { jkFrameBuf.add(it) }
+            while (jkFrameBuf.size >= 13) {
+                val hdrIdx = jkFrameBuf.indexOfFirst { (it.toInt() and 0xFF) == 0xA5 }
+                if (hdrIdx < 0) {
+                    jkFrameBuf.clear()
+                    return
+                }
+                if (hdrIdx > 0) jkFrameBuf.subList(0, hdrIdx).clear()
+                if (jkFrameBuf.size < 13) return
+                val frame = jkFrameBuf.subList(0, 13).toByteArray()
+                val parsed = synchronized(dalyCellAcc) {
+                    TelemetryEngine.parseDaly13ByteFrame(frame, bmsCur, dalyCellAcc)
+                }
+                if (parsed != null) {
+                    jkFrameBuf.subList(0, 13).clear()
+                    bmsCur = parsed
+                    mainHandler.post { onJkData?.invoke(parsed) }
+                } else {
+                    jkFrameBuf.removeAt(0)
+                }
+            }
+        }
+    }
+
+    private fun onJbdBytes(chunk: ByteArray) {
+        synchronized(jkFrameBuf) {
+            chunk.forEach { jkFrameBuf.add(it) }
+            while (jkFrameBuf.size >= 7) {
+                val hdrIdx = jkFrameBuf.indexOfFirst { (it.toInt() and 0xFF) == 0xDD }
+                if (hdrIdx < 0) {
+                    jkFrameBuf.clear()
+                    return
+                }
+                if (hdrIdx > 0) jkFrameBuf.subList(0, hdrIdx).clear()
+                if (jkFrameBuf.size < 7) return
+                val len = jkFrameBuf[3].toInt() and 0xFF
+                val totalLen = 4 + len + 3
+                if (totalLen > 280) {
+                    jkFrameBuf.removeAt(0)
+                    continue
+                }
+                if (jkFrameBuf.size < totalLen) return
+                val frame = jkFrameBuf.subList(0, totalLen).toByteArray()
+                val parsed = TelemetryEngine.parseJbdFrame(frame, bmsCur)
+                if (parsed != null) {
+                    jkFrameBuf.subList(0, totalLen).clear()
+                    bmsCur = parsed
+                    mainHandler.post { onJkData?.invoke(parsed) }
+                } else {
+                    jkFrameBuf.removeAt(0)
+                }
             }
         }
     }
@@ -850,13 +1205,21 @@ class BleGattManager(private val context: Context) {
             jkPollFuture = null
             clearJkAwaitGuard()
             synchronized(jkFrameBuf) { jkFrameBuf.clear() }
+            synchronized(dalyCellAcc) { dalyCellAcc.clear() }
+            bmsCur = JkBmsData(protocolLabel = activeBmsProtocol.shortLabel)
+            antReplyV2 = false
+            antPollCount = 0
         } else if (slot == "motor") {
             motorBlePollFuture?.cancel(false)
             motorBlePollFuture = null
             motorBleTimeFuture?.cancel(false)
             motorBleTimeFuture = null
+            fardriverPollFuture?.cancel(false)
+            fardriverPollFuture = null
             isMotorBleMapsSending = false
             synchronized(motorBleRx) { motorBleRx.clear() }
+            synchronized(fdFrameBuf) { fdFrameBuf.clear() }
+            fardriverCur = FardriverData()
         } else if (slot == "esp1") {
             synchronized(esp1Rx) { esp1Rx.clear() }
         } else if (slot == "esp2") {
@@ -876,10 +1239,10 @@ class BleGattManager(private val context: Context) {
     }
 
     private fun slotLabel(slot: String): String = when (slot) {
-        "jk" -> "JKBMS"
+        "jk" -> "BMS_${activeBmsProtocol.name}"
         "esp1" -> "ESP32#1"
         "esp2" -> "ESP32#2"
-        else -> "MOTOR_BLE"
+        else -> if (activeControllerProtocol == ControllerProtocol.FARDRIVER_BLE) "FARDRIVER_BLE" else "MOTOR_BLE"
     }
 
     private fun emitSlotState(slot: String, state: ConnectionStateX, name: String) {

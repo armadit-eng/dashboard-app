@@ -54,6 +54,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.dashboard.app.dashboard_app.model.AppSettings
+import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.ControllerProtocol
 import com.dashboard.app.dashboard_app.ui.components.ChartSeries
 import com.dashboard.app.dashboard_app.ui.components.CockpitCard
 import com.dashboard.app.dashboard_app.ui.components.MultiSeriesChart
@@ -73,11 +76,12 @@ fun DiagnosisScreen(
     onSetInvertB2Current: (Boolean) -> Unit,
     onSendEsp2Command: (String) -> Unit,
     onLogChargeSession: (startSoc: Double, endSoc: Double, energyWh: Double, durationMin: Int) -> Unit,
+    onUpdateSettings: (AppSettings) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val c = LocalCockpitColors.current
     var tabIndex by remember { mutableIntStateOf(0) }
-    var batTab by remember { mutableIntStateOf(0) } // 0=ORI/MID, 1=JK-BMS, 2=Baterai 2
+    var batTab by remember { mutableIntStateOf(0) } // 0=ORI/MID or Fardriver, 1=Smart BMS, 2=Baterai 2
     var sortLowFirst by remember { mutableStateOf(false) }
 
     Column(modifier = modifier.fillMaxSize()) {
@@ -107,7 +111,7 @@ fun DiagnosisScreen(
         }
 
         when (tabIndex) {
-            0 -> MotorDiagnosisTab(state, onRestoreOdo)
+            0 -> MotorDiagnosisTab(state, onRestoreOdo, onUpdateSettings)
             1 -> DualBatteryTab(
                 state = state,
                 batTab = batTab,
@@ -128,12 +132,15 @@ fun DiagnosisScreen(
 @Composable
 private fun MotorDiagnosisTab(
     state: DashboardUiState,
-    onRestoreOdo: (Double) -> Unit
+    onRestoreOdo: (Double) -> Unit,
+    onUpdateSettings: (AppSettings) -> Unit
 ) {
     val c = LocalCockpitColors.current
     val eff = state.effective
     val m = state.motorData
+    val fd = state.fardriverData
     val esp1 = state.esp1Data
+    val useFardriver = state.settings.controllerProtocol != ControllerProtocol.MID_AT
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -154,7 +161,7 @@ private fun MotorDiagnosisTab(
                         )
                     }
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("RPM Estimasi", color = c.textMuted, fontSize = 12.sp)
+                        Text(if (useFardriver) "RPM Fardriver" else "RPM Estimasi", color = c.textMuted, fontSize = 12.sp)
                         Text(
                             "${eff.rpm ?: "—"}",
                             style = MaterialTheme.typography.displayMedium
@@ -192,62 +199,153 @@ private fun MotorDiagnosisTab(
             }
         }
 
-        item {
-            CockpitCard {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+        if (useFardriver) {
+            item {
+                CockpitCard {
                     Text(
-                        "TEMPERATUR & ODOMETER",
+                        "FARDRIVER CONTROLLER (${state.settings.controllerProtocol.label.uppercase(Locale.US)})",
                         style = MaterialTheme.typography.labelMedium,
-                        color = c.textMuted,
-                        modifier = Modifier.weight(1f)
+                        color = c.textMuted
                     )
-                    Text(
-                        "Jam MID: ${m.timeStr ?: "Sinkron Otomatis"}",
-                        fontSize = 11.5.sp,
-                        color = if (m.timeStr != null) c.accent else c.textMuted
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        TempCard("MOSFET", fd.mosTempC, Modifier.weight(1f))
+                        TempCard("Motor", fd.motorTempC, Modifier.weight(1f))
+                        TempCard("Hall / Mod", fd.modRatio?.toDouble(), Modifier.weight(1f), suffix = "%")
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    BmsGrid(
+                        listOf(
+                            "Tegangan Bus" to "${fd.voltageV?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} V",
+                            "Arus Bus" to "${fd.lineCurrentA?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} A",
+                            "Kecepatan Est." to "${fd.speedKmh?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} km/h",
+                            "Arus Iq / Id" to "${fd.iqCurrentA?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} / ${fd.idCurrentA?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} A",
+                            "Gear / State" to "G${fd.gear ?: "—"} / W${fd.workState ?: "—"}",
+                            "Hall / Frame" to "${fd.hallPosition ?: "—"} (${fd.framesCount} pkt)"
+                        )
                     )
                 }
-                Spacer(Modifier.height(10.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    TempCard("Inverter", m.tempInverterC, Modifier.weight(1f))
-                    TempCard("Motor BLDC", m.tempMotorC, Modifier.weight(1f))
-                    TempCard("TBAT (MID)", m.tempBatteryC, Modifier.weight(1f))
+            }
+
+            item {
+                val s = state.settings
+                CockpitCard {
+                    Text("KALIBRASI FARDRIVER", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Pole Pairs Motor", fontWeight = FontWeight.SemiBold)
+                            Text("${s.fardriverPolePairs} pasang kutub", fontSize = 12.sp, color = c.textMuted)
+                        }
+                        OutlinedButton(
+                            onClick = { onUpdateSettings(s.copy(fardriverPolePairs = (s.fardriverPolePairs - 1).coerceIn(4, 48))) },
+                            modifier = Modifier.height(48.dp).testTag("fd_pole_minus")
+                        ) { Text("-1") }
+                        Spacer(Modifier.width(6.dp))
+                        OutlinedButton(
+                            onClick = { onUpdateSettings(s.copy(fardriverPolePairs = (s.fardriverPolePairs + 1).coerceIn(4, 48))) },
+                            modifier = Modifier.height(48.dp).testTag("fd_pole_plus")
+                        ) { Text("+1") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Keliling Roda", fontWeight = FontWeight.SemiBold)
+                            Text("${s.fardriverWheelCircMm} mm", fontSize = 12.sp, color = c.textMuted)
+                        }
+                        OutlinedButton(
+                            onClick = { onUpdateSettings(s.copy(fardriverWheelCircMm = (s.fardriverWheelCircMm - 25).coerceIn(700, 2600))) },
+                            modifier = Modifier.height(48.dp).testTag("fd_wheel_minus")
+                        ) { Text("-25") }
+                        Spacer(Modifier.width(6.dp))
+                        OutlinedButton(
+                            onClick = { onUpdateSettings(s.copy(fardriverWheelCircMm = (s.fardriverWheelCircMm + 25).coerceIn(700, 2600))) },
+                            modifier = Modifier.height(48.dp).testTag("fd_wheel_plus")
+                        ) { Text("+25") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text("Skala Arus Controller (A / LSB)", fontSize = 12.sp, color = c.textMuted)
+                    Spacer(Modifier.height(4.dp))
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(0.25, 0.50).forEach { scale ->
+                            FilterChip(
+                                selected = kotlin.math.abs(s.fardriverCurrentScale - scale) < 0.05,
+                                onClick = { onUpdateSettings(s.copy(fardriverCurrentScale = scale)) },
+                                label = { Text("$scale A/LSB") },
+                                modifier = Modifier.testTag("fd_scale_${(scale * 100).roundToInt()}")
+                            )
+                        }
+                    }
                 }
-                Spacer(Modifier.height(12.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
+            }
+        } else {
+            item {
+                CockpitCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Text(
-                            "Odometer Motor: ${eff.odoKm?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} km",
-                            fontWeight = FontWeight.SemiBold
+                            "TEMPERATUR & ODOMETER",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = c.textMuted,
+                            modifier = Modifier.weight(1f)
                         )
                         Text(
-                            "Backup lokal: ${String.format(Locale.US, "%.1f", state.settings.odoBackupKm)} km",
-                            fontSize = 12.sp,
-                            color = c.textMuted
+                            "Jam MID: ${m.timeStr ?: "Sinkron Otomatis"}",
+                            fontSize = 11.5.sp,
+                            color = if (m.timeStr != null) c.accent else c.textMuted
                         )
                     }
-                    OutlinedButton(
-                        onClick = { onRestoreOdo(state.settings.odoBackupKm) },
-                        modifier = Modifier
-                            .height(48.dp)
-                            .testTag("sync_odo_button")
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text("Sinkron AT+ODO")
+                        TempCard("Inverter", m.tempInverterC, Modifier.weight(1f))
+                        TempCard("Motor BLDC", m.tempMotorC, Modifier.weight(1f))
+                        TempCard("TBAT (MID)", m.tempBatteryC, Modifier.weight(1f))
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Odometer Motor: ${eff.odoKm?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} km",
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "Backup lokal: ${String.format(Locale.US, "%.1f", state.settings.odoBackupKm)} km",
+                                fontSize = 12.sp,
+                                color = c.textMuted
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { onRestoreOdo(state.settings.odoBackupKm) },
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("sync_odo_button")
+                        ) {
+                            Text("Sinkron AT+ODO")
+                        }
                     }
                 }
             }
         }
 
         item {
+            val activeMask = if (useFardriver) fd.errorFlags else m.errMask
             CockpitCard {
                 Text("DTC / FAULT ANALYZER", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
                 Spacer(Modifier.height(10.dp))
@@ -255,7 +353,7 @@ private fun MotorDiagnosisTab(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = c.accent)
                         Spacer(Modifier.width(10.dp))
-                        Text("Tidak ada kode fault motor (errMask = ${m.errMask}). Sistem normal.")
+                        Text("Tidak ada kode fault motor (errMask = $activeMask). Sistem normal.")
                     }
                 } else {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -344,6 +442,9 @@ private fun DualBatteryTab(
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 110.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        val useFardriver = state.settings.controllerProtocol != ControllerProtocol.MID_AT
+        val bmsProto = state.settings.bmsProtocol
+        val fd = state.fardriverData
         item {
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                 SegmentedButton(
@@ -352,7 +453,7 @@ private fun DualBatteryTab(
                     shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3),
                     modifier = Modifier.testTag("bat_segment_ori")
                 ) {
-                    Text("ORI / MID")
+                    Text(if (useFardriver) "Fardriver" else "ORI / MID")
                 }
                 SegmentedButton(
                     selected = batTab == 1,
@@ -360,7 +461,7 @@ private fun DualBatteryTab(
                     shape = SegmentedButtonDefaults.itemShape(index = 1, count = 3),
                     modifier = Modifier.testTag("bat_segment_jk")
                 ) {
-                    Text("JK-BMS")
+                    Text(bmsProto.shortLabel)
                 }
                 SegmentedButton(
                     selected = batTab == 2,
@@ -375,51 +476,78 @@ private fun DualBatteryTab(
 
         when (batTab) {
             0 -> {
-                item {
-                    val midPowerW = if (m.vbat != null && m.ibat != null) -(m.vbat * m.ibat) else null
-                    CockpitCard {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("BATERAI ORI (MOTOR MID)", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                if (useFardriver) {
+                    item {
+                        val fdPowerW = if (fd.voltageV != null && fd.lineCurrentA != null) fd.voltageV * fd.lineCurrentA else null
+                        CockpitCard {
+                            Text("KONTROLER FARDRIVER (BUS DC)", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                            Text(
+                                "Sumber terpisah dari Smart BMS • Prioritas Range: ${eff.b1SourceLabel}",
+                                fontSize = 11.5.sp,
+                                color = c.textMuted
+                            )
+                            Spacer(Modifier.height(10.dp))
+                            BmsGrid(
+                                listOf(
+                                    "Tegangan Bus" to "${fd.voltageV?.let { String.format(Locale.US, "%.2f", it) } ?: "—"} V",
+                                    "Arus Bus" to "${fd.lineCurrentA?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} A",
+                                    "Daya Bus" to "${fdPowerW?.roundToInt()?.toString() ?: "—"} W",
+                                    "Arus Iq / Id" to "${fd.iqCurrentA?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} / ${fd.idCurrentA?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} A",
+                                    "Suhu MOSFET" to "${fd.mosTempC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
+                                    "Suhu Motor" to "${fd.motorTempC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
+                                    "RPM" to "${fd.rpm?.toString() ?: "—"}",
+                                    "Packet RX" to "${fd.framesCount}"
+                                )
+                            )
+                        }
+                    }
+                } else {
+                    item {
+                        val midPowerW = if (m.vbat != null && m.ibat != null) -(m.vbat * m.ibat) else null
+                        CockpitCard {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("BATERAI ORI (MOTOR MID)", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
+                                    Text(
+                                        "Sumber terpisah langsung dari AT+ MID • Prioritas Range: ${eff.b1SourceLabel}",
+                                        fontSize = 11.5.sp,
+                                        color = c.textMuted
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            BmsGrid(
+                                listOf(
+                                    "SOC (MID)" to "${m.socPct?.roundToInt()?.toString() ?: "—"}%",
+                                    "SOH (MID)" to "${m.sohPct?.roundToInt()?.toString() ?: "—"}%",
+                                    "Tegangan (VBAT)" to "${m.vbat?.let { String.format(Locale.US, "%.2f", it) } ?: "—"} V",
+                                    "Arus (IBAT)" to "${m.ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} A",
+                                    "Daya (MID)" to "${midPowerW?.roundToInt()?.toString() ?: "—"} W",
+                                    "Suhu (TBAT)" to "${m.tempBatteryC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
+                                    "Siklus (AT+CBAT)" to "${m.cbatCycles?.toString() ?: "—"}",
+                                    "Odometer (MID)" to "${m.odoKm?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} km"
+                                )
+                            )
+                            Spacer(Modifier.height(10.dp))
+                            OutlinedButton(
+                                onClick = onRefreshMidBattery,
+                                enabled = state.motorConnState == ConnectionStateX.CONNECTED,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp)
+                                    .testTag("refresh_mid_cbat_button")
+                            ) {
                                 Text(
-                                    "Sumber terpisah langsung dari AT+ MID • Prioritas Range: ${eff.b1SourceLabel}",
-                                    fontSize = 11.5.sp,
-                                    color = c.textMuted
+                                    if (state.motorConnState == ConnectionStateX.CONNECTED) {
+                                        "Ambil Ulang Data MID (AT+CBAT, SOC, SOH)"
+                                    } else {
+                                        "Hubungkan Motor MID untuk Query AT+CBAT"
+                                    }
                                 )
                             }
-                        }
-                        Spacer(Modifier.height(10.dp))
-                        BmsGrid(
-                            listOf(
-                                "SOC (MID)" to "${m.socPct?.roundToInt()?.toString() ?: "—"}%",
-                                "SOH (MID)" to "${m.sohPct?.roundToInt()?.toString() ?: "—"}%",
-                                "Tegangan (VBAT)" to "${m.vbat?.let { String.format(Locale.US, "%.2f", it) } ?: "—"} V",
-                                "Arus (IBAT)" to "${m.ibat?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} A",
-                                "Daya (MID)" to "${midPowerW?.roundToInt()?.toString() ?: "—"} W",
-                                "Suhu (TBAT)" to "${m.tempBatteryC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
-                                "Siklus (AT+CBAT)" to "${m.cbatCycles?.toString() ?: "—"}",
-                                "Odometer (MID)" to "${m.odoKm?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} km"
-                            )
-                        )
-                        Spacer(Modifier.height(10.dp))
-                        OutlinedButton(
-                            onClick = onRefreshMidBattery,
-                            enabled = state.motorConnState == com.dashboard.app.dashboard_app.model.ConnectionStateX.CONNECTED,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(48.dp)
-                                .testTag("refresh_mid_cbat_button")
-                        ) {
-                            Text(
-                                if (state.motorConnState == com.dashboard.app.dashboard_app.model.ConnectionStateX.CONNECTED) {
-                                    "Ambil Ulang Data MID (AT+CBAT, SOC, SOH)"
-                                } else {
-                                    "Hubungkan Motor MID untuk Query AT+CBAT"
-                                }
-                            )
                         }
                     }
                 }
@@ -439,29 +567,38 @@ private fun DualBatteryTab(
                     } else if (jk.remainAh != null) {
                         "${String.format(Locale.US, "%.1f", jk.remainAh)} Ah"
                     } else "—"
+                    val mosText = if (jk.mosChargeOn != null || jk.mosDischargeOn != null) {
+                        "CHG ${if (jk.mosChargeOn == true) "ON" else "OFF"} • DSG ${if (jk.mosDischargeOn == true) "ON" else "OFF"}"
+                    } else "—"
 
                     CockpitCard {
-                        Text("JK-BMS (SMART BMS BLE)", style = MaterialTheme.typography.labelMedium, color = c.textMuted)
                         Text(
-                            "Sumber terpisah dari MID • ${if (jk.cellCount > 0) "${jk.cellCount}S terdeteksi" else "Menunggu frame 300B"}",
+                            bmsProto.label.uppercase(Locale.US),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = c.textMuted
+                        )
+                        Text(
+                            "Sumber terpisah dari kontroler • ${if (jk.cellCount > 0) "${jk.cellCount}S terdeteksi" else "Menunggu data ${bmsProto.shortLabel}"}",
                             fontSize = 11.5.sp,
                             color = c.textMuted
                         )
                         Spacer(Modifier.height(10.dp))
                         BmsGrid(
                             listOf(
-                                "SOC (JK)" to "${jk.socPct?.roundToInt()?.toString() ?: "—"}%",
-                                "SOH (JK)" to "${jk.sohPct?.roundToInt()?.toString() ?: "—"}%",
+                                "SOC (${bmsProto.shortLabel})" to "${jk.socPct?.roundToInt()?.toString() ?: "—"}%",
+                                "SOH (${bmsProto.shortLabel})" to "${jk.sohPct?.roundToInt()?.toString() ?: "—"}%",
                                 "Voltase Pack" to "${jk.vpack?.let { String.format(Locale.US, "%.2f", it) } ?: "—"} V",
                                 "Arus Pack" to "${jk.ibat?.let { String.format(Locale.US, "%.2f", it) } ?: "—"} A",
-                                "Daya (JK)" to "${jkPowerW?.roundToInt()?.toString() ?: "—"} W",
-                                "Siklus (JK)" to "${jk.cycles?.toString() ?: "—"}",
+                                "Daya BMS" to "${jkPowerW?.roundToInt()?.toString() ?: "—"} W",
+                                "Siklus" to "${jk.cycles?.toString() ?: "—"}",
                                 "Sisa / Kapasitas" to ahText,
                                 "Balancing" to balText,
                                 "Delta Sel" to "${jk.deltaCellV?.let { String.format(Locale.US, "%.3f", it) } ?: "—"} V",
                                 "Jumlah Sel" to "${if (jk.cellCount > 0) "${jk.cellCount}S" else "—"}",
                                 "T1 / T2" to "${jk.temp1C?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} / ${jk.temp2C?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
-                                "MOSFET" to "${jk.tempMosC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C"
+                                "Suhu MOSFET" to "${jk.tempMosC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
+                                "Status FET" to mosText,
+                                "Proteksi BMS" to (jk.faultText ?: "Normal")
                             )
                         )
                     }
@@ -470,7 +607,7 @@ private fun DualBatteryTab(
                 if (jk.cellVoltages.isNotEmpty()) {
                     item {
                         CellVoltagesCard(
-                            title = "TEGANGAN SEL JK-BMS (${jk.cellCount}S)",
+                            title = "TEGANGAN SEL ${bmsProto.shortLabel.uppercase(Locale.US)} (${jk.cellCount}S)",
                             cells = jk.cellVoltages,
                             sortLowFirst = sortLowFirst,
                             onToggleSort = onToggleSort
@@ -754,9 +891,14 @@ private fun StatusChip(label: String, active: Boolean, color: Color) {
 }
 
 @Composable
-private fun TempCard(label: String, tempC: Double?, modifier: Modifier = Modifier) {
+private fun TempCard(
+    label: String,
+    tempC: Double?,
+    modifier: Modifier = Modifier,
+    suffix: String = " °C"
+) {
     val c = LocalCockpitColors.current
-    val hot = (tempC ?: 0.0) > 60.0
+    val hot = suffix.contains("C") && (tempC ?: 0.0) > 60.0
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(14.dp),
@@ -765,7 +907,7 @@ private fun TempCard(label: String, tempC: Double?, modifier: Modifier = Modifie
         Column(modifier = Modifier.padding(10.dp)) {
             Text(label, fontSize = 11.sp, color = c.textMuted)
             Text(
-                text = "${tempC?.let { String.format(Locale.US, "%.1f", it) } ?: "—"} °C",
+                text = "${tempC?.let { String.format(Locale.US, if (suffix == "%") "%.0f" else "%.1f", it) } ?: "—"}$suffix",
                 fontWeight = FontWeight.Bold,
                 fontSize = 16.sp,
                 color = if (hot) c.danger else Color.Unspecified

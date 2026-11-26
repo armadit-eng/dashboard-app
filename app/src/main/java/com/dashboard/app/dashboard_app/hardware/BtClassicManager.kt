@@ -8,8 +8,11 @@ import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import com.dashboard.app.dashboard_app.engine.TelemetryEngine
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.ControllerProtocol
 import com.dashboard.app.dashboard_app.model.DiscoveredDeviceX
+import com.dashboard.app.dashboard_app.model.FardriverData
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
@@ -36,9 +39,22 @@ class BtClassicManager(private val context: Context) {
     }
 
     var onLineReceived: ((String) -> Unit)? = null
+    var onFardriverData: ((FardriverData) -> Unit)? = null
     var onStateChanged: ((ConnectionStateX, String, String?) -> Unit)? = null
     var onLog: ((String, String, Boolean) -> Unit)? = null
     var isNavOrMapsBusy: (() -> Boolean)? = null
+
+    @Volatile
+    var activeControllerProtocol: ControllerProtocol = ControllerProtocol.MID_AT
+
+    @Volatile
+    var fardriverPolePairs: Int = 20
+
+    @Volatile
+    var fardriverWheelCircMm: Int = 1580
+
+    @Volatile
+    var fardriverCurrentScale: Double = 0.25
 
     @Volatile
     var isMapsSending: Boolean = false
@@ -55,10 +71,18 @@ class BtClassicManager(private val context: Context) {
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
 
-    private val writeQueue = LinkedBlockingQueue<String>()
+    private sealed class QueuedWrite {
+        data class Text(val cmd: String) : QueuedWrite()
+        data class Raw(val bytes: ByteArray) : QueuedWrite()
+    }
+
+    private val writeQueue = LinkedBlockingQueue<QueuedWrite>()
     private var writerThread: Thread? = null
     @Volatile
     private var writerRunning = false
+
+    private val fdFrameBuf = mutableListOf<Byte>()
+    private var fardriverCur = FardriverData()
 
     private data class PollEntry(val cmd: String, val intervalMs: Long, var lastSentMs: Long = 0L)
 
@@ -209,15 +233,27 @@ class BtClassicManager(private val context: Context) {
 
     private fun readLoop(sock: BluetoothSocket) {
         try {
-            val reader = BufferedReader(InputStreamReader(sock.inputStream, Charsets.UTF_8))
-            while (reading) {
-                val line = reader.readLine() ?: break
-                val trimmed = line.trim()
-                if (trimmed.isNotEmpty()) {
-                    if (!cbatReceived && trimmed.contains("CBAT", ignoreCase = true) && trimmed.any { it.isDigit() }) {
-                        cbatReceived = true
+            if (activeControllerProtocol == ControllerProtocol.FARDRIVER_SPP) {
+                val input = sock.inputStream
+                val buf = ByteArray(512)
+                while (reading) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    if (n > 0) {
+                        onFardriverBytes(buf, n)
                     }
-                    mainHandler.post { onLineReceived?.invoke(trimmed) }
+                }
+            } else {
+                val reader = BufferedReader(InputStreamReader(sock.inputStream, Charsets.UTF_8))
+                while (reading) {
+                    val line = reader.readLine() ?: break
+                    val trimmed = line.trim()
+                    if (trimmed.isNotEmpty()) {
+                        if (!cbatReceived && trimmed.contains("CBAT", ignoreCase = true) && trimmed.any { it.isDigit() }) {
+                            cbatReceived = true
+                        }
+                        mainHandler.post { onLineReceived?.invoke(trimmed) }
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -234,6 +270,41 @@ class BtClassicManager(private val context: Context) {
             }
             if (dropWasUnexpected) {
                 startReconnectLoop()
+            }
+        }
+    }
+
+    private fun onFardriverBytes(chunk: ByteArray, length: Int) {
+        synchronized(fdFrameBuf) {
+            for (i in 0 until length) fdFrameBuf.add(chunk[i])
+            while (fdFrameBuf.size >= 16) {
+                val startIdx = fdFrameBuf.indexOfFirst { (it.toInt() and 0xFF) == 0xAA }
+                if (startIdx < 0) {
+                    fdFrameBuf.clear()
+                    return
+                }
+                if (startIdx > 0) {
+                    fdFrameBuf.subList(0, startIdx).clear()
+                }
+                if (fdFrameBuf.size < 16) return
+                val candidate = fdFrameBuf.subList(0, 16).toByteArray()
+                val pktId = candidate[1].toInt() and 0x3F
+                if (pktId !in 0..54) {
+                    fdFrameBuf.removeAt(0)
+                    continue
+                }
+                fdFrameBuf.subList(0, 16).clear()
+                val parsed = TelemetryEngine.parseFardriver16ByteFrame(
+                    buf = candidate,
+                    current = fardriverCur,
+                    polePairs = fardriverPolePairs,
+                    wheelCircMm = fardriverWheelCircMm,
+                    currentScale = fardriverCurrentScale
+                )
+                if (parsed != null) {
+                    fardriverCur = parsed
+                    mainHandler.post { onFardriverData?.invoke(parsed) }
+                }
             }
         }
     }
@@ -291,6 +362,13 @@ class BtClassicManager(private val context: Context) {
         enqueueCoalesced(norm)
     }
 
+    fun sendRawBytes(bytes: ByteArray) {
+        if (!connected) return
+        if (writeQueue.size < 48) {
+            writeQueue.offer(QueuedWrite.Raw(bytes))
+        }
+    }
+
     private fun enqueueCoalesced(fullCmd: String) {
         val eqPrefix = when {
             fullCmd.startsWith("AT+MAPS=") -> "AT+MAPS="
@@ -300,10 +378,10 @@ class BtClassicManager(private val context: Context) {
             else -> null
         }
         if (eqPrefix != null) {
-            writeQueue.removeIf { it.startsWith(eqPrefix) }
+            writeQueue.removeIf { item -> item is QueuedWrite.Text && item.cmd.startsWith(eqPrefix) }
         }
         if (writeQueue.size < 48) {
-            writeQueue.offer(fullCmd)
+            writeQueue.offer(QueuedWrite.Text(fullCmd))
         }
     }
 
@@ -314,7 +392,7 @@ class BtClassicManager(private val context: Context) {
         }
         var count = if (isMapsSending) 1 else 0
         for (item in writeQueue) {
-            if (item.startsWith("AT+MAPS=")) count++
+            if (item is QueuedWrite.Text && item.cmd.startsWith("AT+MAPS=")) count++
         }
         return count
     }
@@ -361,7 +439,7 @@ class BtClassicManager(private val context: Context) {
         writerThread = Thread {
             var lastWriteAt = 0L
             while (writerRunning) {
-                val cmd = try {
+                val item = try {
                     writeQueue.take()
                 } catch (_: InterruptedException) {
                     break
@@ -375,14 +453,18 @@ class BtClassicManager(private val context: Context) {
                         break
                     }
                 }
-                val isMaps = cmd.startsWith("AT+MAPS=")
+                val isMaps = item is QueuedWrite.Text && item.cmd.startsWith("AT+MAPS=")
                 val t0 = System.currentTimeMillis()
                 if (isMaps) {
                     isMapsSending = true
                     mapsSendStartedMs = t0
                 }
                 try {
-                    out.write(cmd.toByteArray(Charsets.UTF_8))
+                    val bytes = when (item) {
+                        is QueuedWrite.Text -> item.cmd.toByteArray(Charsets.UTF_8)
+                        is QueuedWrite.Raw -> item.bytes
+                    }
+                    out.write(bytes)
                     out.flush()
                 } catch (e: IOException) {
                     if (isMaps) {
@@ -427,6 +509,18 @@ class BtClassicManager(private val context: Context) {
         stopPolling()
         cbatReceived = false
         pollSchedule.forEach { it.lastSentMs = 0L }
+
+        if (activeControllerProtocol == ControllerProtocol.FARDRIVER_SPP) {
+            synchronized(fdFrameBuf) { fdFrameBuf.clear() }
+            fardriverCur = FardriverData()
+            scheduler.schedule({
+                if (connected) sendRawBytes(TelemetryEngine.FARDRIVER_WAKE_CMD)
+            }, 250, TimeUnit.MILLISECONDS)
+            pollFuture = scheduler.scheduleAtFixedRate({
+                if (connected) sendRawBytes(TelemetryEngine.FARDRIVER_WAKE_CMD)
+            }, 3000, 3000, TimeUnit.MILLISECONDS)
+            return
+        }
 
         // Query battery & odometer snapshot immediately after socket settles, before AT+MAPS floods link
         scheduler.schedule({
@@ -487,6 +581,7 @@ class BtClassicManager(private val context: Context) {
         connected = false
         stopPolling()
         stopWriter()
+        synchronized(fdFrameBuf) { fdFrameBuf.clear() }
         try {
             socket?.close()
         } catch (_: Exception) {

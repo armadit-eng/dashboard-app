@@ -18,15 +18,18 @@ import com.dashboard.app.dashboard_app.hardware.NativeGpsFix
 import com.dashboard.app.dashboard_app.model.AppAlert
 import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.Battery2Data
+import com.dashboard.app.dashboard_app.model.BmsProtocol
 import com.dashboard.app.dashboard_app.model.CalibrationEntry
 import com.dashboard.app.dashboard_app.model.ChargingLogEntry
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.ControllerProtocol
 import com.dashboard.app.dashboard_app.model.DEFAULT_MOLIS_MAPS_LIST_URL
 import com.dashboard.app.dashboard_app.model.DailyChallenge
 import com.dashboard.app.dashboard_app.model.DiscoveredDeviceX
 import com.dashboard.app.dashboard_app.model.EffectiveTelemetry
 import com.dashboard.app.dashboard_app.model.EfficiencyTrend
 import com.dashboard.app.dashboard_app.model.Esp32Data
+import com.dashboard.app.dashboard_app.model.FardriverData
 import com.dashboard.app.dashboard_app.model.FieldNotePin
 import com.dashboard.app.dashboard_app.model.GeoPointX
 import com.dashboard.app.dashboard_app.model.GpsState
@@ -74,6 +77,7 @@ import kotlin.math.sin
 data class DashboardUiState(
     val settings: AppSettings = AppSettings(),
     val motorData: MotorData = MotorData(),
+    val fardriverData: FardriverData = FardriverData(),
     val jkData: JkBmsData = JkBmsData(),
     val battery2Data: Battery2Data = Battery2Data(),
     val esp1Data: Esp32Data = Esp32Data(),
@@ -216,7 +220,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             cachedCommunitySpklu = communitySpklu
 
             TileCacheService.offlineOnly = settings.offlineModeOnly
-            ble.invertB2Current = settings.invertB2Current
+            syncProtocolConfigToHardware(settings)
             ScreenMirrorService.overlayStripEnabled = settings.mirrorOverlayStrip
             ScreenMirrorService.mirrorOffsetX = settings.mirrorOffsetX.coerceIn(0f, 1f)
             ScreenMirrorService.mirrorOffsetY = settings.mirrorOffsetY.coerceIn(0f, 1f)
@@ -242,6 +246,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
                 cur.copy(
                     settings = settings,
+                    jkData = cur.jkData.copy(protocolLabel = settings.bmsProtocol.shortLabel),
                     parkedLocation = parked,
                     tripHistory = trips,
                     savedPlaces = places,
@@ -280,7 +285,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             esp2State = esp2ConnState,
             gpsSpeedKmh = gpsState.speedKmh,
             trip = liveTrip,
-            settings = settings
+            settings = settings,
+            fardriver = fardriverData
         )
         val totalKm = tripHistory.sumOf { it.distanceKm } + liveTrip.distanceKm
         val totalRegen = tripHistory.sumOf { it.regenWh } + liveTrip.regenWh
@@ -340,7 +346,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 st.isRerouting -> "Menghitung Ulang Rute…"
                 st.isNavigating -> if (st.offlineRouteActive) "Navigasi Offline & MID Aktif" else "Navigasi & MID Aktif"
                 st.midStreaming -> "Stream Peta MID Aktif"
-                else -> "Terhubung ke Motor MID"
+                else -> "Terhubung ke ${st.settings.controllerProtocol.shortLabel}"
             }
             val sub = when {
                 st.isRerouting ->
@@ -352,7 +358,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 st.midStreaming ->
                     "AT+MAPS & AT+NAV terus memperbarui layar MID motor"
                 else ->
-                    "Telemetri & AT+NAV motor tetap aktif di latar"
+                    "Telemetri ${st.settings.controllerProtocol.shortLabel} tetap aktif di latar"
             }
             MidForegroundService.startOrUpdate(getApplication(), title, sub)
         } else {
@@ -364,12 +370,17 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         idleDrainCheckedOnConnect = false
         syncBackgroundServiceState()
         val st = _uiState.value
-        if (st.settings.mapsAutoStream && !st.screenMirrorActive && !st.midStreaming) {
+        if (st.settings.controllerProtocol == ControllerProtocol.MID_AT &&
+            st.settings.mapsAutoStream &&
+            !st.screenMirrorActive &&
+            !st.midStreaming
+        ) {
             viewModelScope.launch {
                 // Give startup AT+CBAT?/AT+SOH?/AT+ODO? queries time to settle before AT+MAPS frames
                 delay(2200L)
                 val cur = _uiState.value
                 if (cur.motorConnState == ConnectionStateX.CONNECTED &&
+                    cur.settings.controllerProtocol == ControllerProtocol.MID_AT &&
                     cur.settings.mapsAutoStream &&
                     !cur.screenMirrorActive &&
                     !cur.midStreaming
@@ -381,9 +392,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun wireHardwareCallbacks() {
+        val handleFardriver: (FardriverData) -> Unit = { fd ->
+            _uiState.update { it.copy(fardriverData = fd).recomputeDerived() }
+        }
         btClassic.onLog = ::addLog
         btClassic.isNavOrMapsBusy = { _uiState.value.isNavigating || _uiState.value.midStreaming }
         btClassic.onLineReceived = ::handleMotorLine
+        btClassic.onFardriverData = handleFardriver
         btClassic.onStateChanged = { st, name, _ ->
             if (!_uiState.value.motorViaBle) {
                 val wasConnected = _uiState.value.motorConnState == ConnectionStateX.CONNECTED
@@ -423,7 +438,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         }
         ScreenMirrorService.onExternalNavLine = { line ->
             val st = _uiState.value
-            if (st.motorConnState == ConnectionStateX.CONNECTED) {
+            if (st.motorConnState == ConnectionStateX.CONNECTED &&
+                st.settings.controllerProtocol == ControllerProtocol.MID_AT
+            ) {
                 if (st.motorViaBle) {
                     val ascii = TelemetryEngine.formatAtNavText(line).padEnd(20, ' ')
                     ble.writeMotorBle("AT+NAV=\"$ascii\"\r\n")
@@ -435,7 +452,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         ScreenMirrorService.onFrameReady = { b64 ->
             viewModelScope.launch {
                 val st = _uiState.value
-                if (st.motorConnState != ConnectionStateX.CONNECTED) return@launch
+                if (st.motorConnState != ConnectionStateX.CONNECTED ||
+                    st.settings.controllerProtocol != ControllerProtocol.MID_AT
+                ) return@launch
                 if (!st.motorViaBle && btClassic.isMapsSending) return@launch
                 if (st.motorViaBle) {
                     val sent = ble.sendMotorBleMapsFrame(
@@ -547,6 +566,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
         ble.onMotorBleLine = ::handleMotorLine
+        ble.onFardriverData = handleFardriver
         locationTts.onGpsFix = ::onGpsFix
     }
 
@@ -628,7 +648,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     gpsSpeedKmh = cur.gpsState.speedKmh,
                     trip = cur.liveTrip,
                     settings = cur.settings,
-                    nowMs = now
+                    nowMs = now,
+                    fardriver = cur.fardriverData
                 )
 
                 var nextTrip = cur.liveTrip
@@ -753,7 +774,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                             timestampMs = now,
                             sohPct = curSoh,
                             odoKm = eff.odoKm,
-                            cycles = if (eff.b1SourceLabel == "JK-BMS") cur.jkData.cycles else cur.motorData.cbatCycles
+                            cycles = if (eff.b1SourceLabel == cur.jkData.protocolLabel ||
+                                eff.b1SourceLabel == cur.settings.bmsProtocol.shortLabel
+                            ) cur.jkData.cycles else cur.motorData.cbatCycles
                         )
                         val nextSohList = (cur.sohHistory + sample).takeLast(30)
                         _uiState.update { it.copy(sohHistory = nextSohList) }
@@ -775,7 +798,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     settings = cur.settings
                 )
 
-                if (cur.motorConnState == ConnectionStateX.CONNECTED) {
+                if (cur.motorConnState == ConnectionStateX.CONNECTED &&
+                    cur.settings.controllerProtocol == ControllerProtocol.MID_AT
+                ) {
                     val nowSec = now / 1000L
                     if (nowSec % 2L == 0L) {
                         // Jangan kirim jarak 0.0 palsu ke MID saat data baterai belum ada
@@ -951,16 +976,16 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun attemptAutoReconnect() {
-        val savedAddr = _uiState.value.settings.savedMotorAddress
+        val st = _uiState.value
+        val savedAddr = st.settings.savedMotorAddress
         if (savedAddr.isNullOrBlank()) {
             loadBondedAndScanBle()
             return
         }
-        // Pemindaian BLE saat RFCOMM sedang connect sering membuat SPP gagal: tunda dulu.
         _uiState.update { it.copy(pairedBtDevices = btClassic.getBondedDevices()) }
-        connectMotor(savedAddr)
+        connectMotor(savedAddr, preferBle = st.settings.controllerProtocol.usesBle)
         viewModelScope.launch {
-            delay(15_000L)
+            delay(if (st.settings.controllerProtocol.usesBle) 4_000L else 15_000L)
             ble.startScan(timeoutMs = 7000L)
         }
     }
@@ -971,19 +996,31 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         ble.startScan(timeoutMs = 7000L)
     }
 
-    /** MID selalu dihubungkan lewat Classic SPP (BLE terlalu lambat untuk frame AT+MAPS). */
-    @Suppress("UNUSED_PARAMETER")
     fun connectMotor(address: String, preferBle: Boolean = false) {
         val addr = address.trim()
         if (addr.isEmpty()) return
+        val proto = _uiState.value.settings.controllerProtocol
+        val useBle = proto.usesBle || (preferBle && proto != ControllerProtocol.MID_AT)
+        syncProtocolConfigToHardware(_uiState.value.settings)
         viewModelScope.launch {
             disconnectMotor()
             _uiState.update {
                 it.copy(
-                    motorViaBle = false,
+                    motorViaBle = useBle,
                     motorConnState = ConnectionStateX.CONNECTING,
                     motorConnName = addr
                 ).recomputeDerived()
+            }
+            if (useBle) {
+                val cur = _uiState.value
+                updateSettings(
+                    cur.settings.copy(
+                        savedMotorAddress = addr,
+                        savedMotorName = addr
+                    )
+                )
+                ble.connectMotorBle(addr)
+                return@launch
             }
             var ok = btClassic.connect(addr)
             if (!ok) {
@@ -1003,14 +1040,48 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             }
             addLog(
                 "MOTOR",
-                "SPP gagal. Pastikan MID sudah dipasangkan (pair) di Pengaturan Bluetooth Android, " +
+                "SPP gagal. Pastikan ${proto.shortLabel} sudah dipasangkan (pair) di Pengaturan Bluetooth Android, " +
                     "dan tidak sedang terhubung ke perangkat lain, lalu coba lagi.",
                 true
             )
             _uiState.update {
-                it.copy(mapsStatus = "SPP gagal: pair MID di Pengaturan Bluetooth lalu hubungkan ulang")
+                it.copy(mapsStatus = "SPP gagal: pair ${proto.shortLabel} di Pengaturan Bluetooth lalu hubungkan ulang")
             }
         }
+    }
+
+    fun selectControllerProtocol(proto: ControllerProtocol) {
+        val cur = _uiState.value
+        if (cur.settings.controllerProtocol == proto) return
+        disconnectMotor()
+        val updated = cur.settings.copy(controllerProtocolId = proto.id)
+        syncProtocolConfigToHardware(updated)
+        _uiState.update {
+            it.copy(
+                settings = updated,
+                motorViaBle = proto.usesBle,
+                motorData = MotorData(),
+                fardriverData = FardriverData()
+            ).recomputeDerived()
+        }
+        viewModelScope.launch { storage.saveSettings(updated) }
+        addLog("MOTOR", "Protokol kontroler diubah ke ${proto.label}", false)
+    }
+
+    fun selectBmsProtocol(proto: BmsProtocol) {
+        val cur = _uiState.value
+        if (cur.settings.bmsProtocol == proto) return
+        disconnectJkBms()
+        val updated = cur.settings.copy(bmsProtocolId = proto.id)
+        syncProtocolConfigToHardware(updated)
+        _uiState.update {
+            it.copy(
+                settings = updated,
+                jkData = JkBmsData(protocolLabel = proto.shortLabel)
+            ).recomputeDerived()
+        }
+        viewModelScope.launch { storage.saveSettings(updated) }
+        addLog("BMS", "Protokol Smart BMS diubah ke ${proto.label}", false)
     }
 
     fun disconnectMotor() {
@@ -1036,6 +1107,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun sendMotorTripRange(rangeKm: Double) {
+        if (_uiState.value.settings.controllerProtocol != ControllerProtocol.MID_AT) return
         if (_uiState.value.motorViaBle) {
             sendMotorCommand("AT+TRIP=\"${String.format(Locale.US, "%.1f", rangeKm)}\"")
         } else {
@@ -1044,6 +1116,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun sendMotorNavText(txt: String) {
+        if (_uiState.value.settings.controllerProtocol != ControllerProtocol.MID_AT) return
         if (_uiState.value.motorViaBle) {
             val clipped = TelemetryEngine.formatAtNavText(txt)
             sendMotorCommand("AT+NAV=\"${clipped.padEnd(20, ' ')}\"")
@@ -1053,12 +1126,15 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun restoreMotorOdo(odoKm: Double) {
-        sendMotorCommand("AT+ODO=\"${Math.round(odoKm)}\"")
+        if (_uiState.value.settings.controllerProtocol == ControllerProtocol.MID_AT) {
+            sendMotorCommand("AT+ODO=\"${Math.round(odoKm)}\"")
+        }
         updateSettings(_uiState.value.settings.copy(odoBackupKm = odoKm))
     }
 
     fun refreshMidBatteryTelemetry() {
         if (_uiState.value.motorConnState != ConnectionStateX.CONNECTED) return
+        if (_uiState.value.settings.controllerProtocol != ControllerProtocol.MID_AT) return
         viewModelScope.launch {
             val cmds = listOf("AT+CBAT?", "AT+SOH?", "AT+SOC?", "AT+VBAT?", "AT+IBAT?", "AT+TBAT?")
             cmds.forEach { cmd ->
@@ -1069,6 +1145,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun connectJkBms(address: String) {
+        syncProtocolConfigToHardware(_uiState.value.settings)
         updateSettings(_uiState.value.settings.copy(savedJkAddress = address))
         ble.connectJkBms(address)
     }
@@ -1767,6 +1844,10 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     // MID Streaming (AT+MAPS)
     fun startMidStreaming() {
+        if (_uiState.value.settings.controllerProtocol != ControllerProtocol.MID_AT) {
+            _uiState.update { it.copy(mapsStatus = "Mode Fardriver aktif — AT+MAPS MID dinonaktifkan") }
+            return
+        }
         if (_uiState.value.midStreaming) return
         if (_uiState.value.screenMirrorActive) stopScreenMirror()
         _uiState.update { it.copy(midStreaming = true) }
@@ -1790,6 +1871,10 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     suspend fun sendSingleMidFrame() {
         val st = _uiState.value
+        if (st.settings.controllerProtocol != ControllerProtocol.MID_AT) {
+            _uiState.update { it.copy(mapsStatus = "Mode Fardriver aktif — AT+MAPS MID dinonaktifkan") }
+            return
+        }
         if (st.motorConnState != ConnectionStateX.CONNECTED) {
             _uiState.update {
                 it.copy(mapsStatus = "Motor belum terhubung (hubungkan dulu via tombol Hubung)")
@@ -1996,8 +2081,21 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    private fun syncProtocolConfigToHardware(settings: AppSettings) {
+        ble.invertB2Current = settings.invertB2Current
+        ble.activeBmsProtocol = settings.bmsProtocol
+        ble.activeControllerProtocol = settings.controllerProtocol
+        ble.fardriverPolePairs = settings.fardriverPolePairs
+        ble.fardriverWheelCircMm = settings.fardriverWheelCircMm
+        ble.fardriverCurrentScale = settings.fardriverCurrentScale
+        btClassic.activeControllerProtocol = settings.controllerProtocol
+        btClassic.fardriverPolePairs = settings.fardriverPolePairs
+        btClassic.fardriverWheelCircMm = settings.fardriverWheelCircMm
+        btClassic.fardriverCurrentScale = settings.fardriverCurrentScale
+    }
+
     fun updateSettings(updated: AppSettings) {
-        ble.invertB2Current = updated.invertB2Current
+        syncProtocolConfigToHardware(updated)
         ScreenMirrorService.overlayStripEnabled = updated.mirrorOverlayStrip
         ScreenMirrorService.mirrorOffsetX = updated.mirrorOffsetX.coerceIn(0f, 1f)
         ScreenMirrorService.mirrorOffsetY = updated.mirrorOffsetY.coerceIn(0f, 1f)

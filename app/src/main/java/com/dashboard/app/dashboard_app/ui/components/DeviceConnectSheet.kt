@@ -62,7 +62,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dashboard.app.dashboard_app.model.BatterySourcePriority
+import com.dashboard.app.dashboard_app.model.BmsProtocol
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.ControllerProtocol
 import com.dashboard.app.dashboard_app.ui.theme.LocalCockpitColors
 import com.dashboard.app.dashboard_app.viewmodel.DashboardUiState
 
@@ -78,11 +80,13 @@ fun DeviceConnectSheet(
     onDisconnectJkBms: () -> Unit,
     onConnectEspSlot: (slot: Int, address: String) -> Unit,
     onDisconnectEspSlot: (slot: Int) -> Unit,
-    onChangeBatteryPriority: (BatterySourcePriority) -> Unit
+    onChangeBatteryPriority: (BatterySourcePriority) -> Unit,
+    onSelectControllerProtocol: (ControllerProtocol) -> Unit,
+    onSelectBmsProtocol: (BmsProtocol) -> Unit
 ) {
     val c = LocalCockpitColors.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var selectedSlot by remember { mutableIntStateOf(0) } // 0=Motor, 1=JK-BMS, 2=ESP1, 3=ESP2
+    var selectedSlot by remember { mutableIntStateOf(0) } // 0=Controller, 1=Smart BMS, 2=ESP1, 3=ESP2
     var showSerialLog by remember { mutableStateOf(false) }
     var priorityMenuExpanded by remember { mutableStateOf(false) }
 
@@ -90,9 +94,10 @@ fun DeviceConnectSheet(
         onScanDevices()
     }
 
-    val devices = remember(selectedSlot, state.pairedBtDevices, state.scannedBleDevices) {
-        if (selectedSlot == 0) {
-            // MID dihubungkan lewat Classic SPP: hanya perangkat yang sudah ter-pair yang relevan.
+    val ctrlProto = state.settings.controllerProtocol
+    val bmsProto = state.settings.bmsProtocol
+    val devices = remember(selectedSlot, ctrlProto, state.pairedBtDevices, state.scannedBleDevices) {
+        if (selectedSlot == 0 && !ctrlProto.usesBle) {
             state.pairedBtDevices
         } else {
             state.scannedBleDevices
@@ -160,14 +165,14 @@ fun DeviceConnectSheet(
             ) {
                 item {
                     val mSub = buildString {
-                        append(state.motorConnName.ifEmpty { "SPP / BLE" })
+                        append(state.motorConnName.ifEmpty { if (ctrlProto.usesBle) "BLE Dongle" else "Classic SPP" })
                         if (state.motorConnState == ConnectionStateX.CONNECTED && state.motorRssiDbm != null) {
                             append(" (${state.motorRssiDbm} dBm)")
                         }
                     }
                     SlotPill(
                         selected = selectedSlot == 0,
-                        label = "Motor MID",
+                        label = ctrlProto.shortLabel,
                         state = state.motorConnState,
                         sub = mSub,
                         onSelect = { selectedSlot = 0 },
@@ -176,14 +181,14 @@ fun DeviceConnectSheet(
                 }
                 item {
                     val jkSub = buildString {
-                        append(state.jkConnName.ifEmpty { "Smart BMS BLE" })
+                        append(state.jkConnName.ifEmpty { bmsProto.gattHint })
                         if (state.jkConnState == ConnectionStateX.CONNECTED && state.jkRssiDbm != null) {
                             append(" (${state.jkRssiDbm} dBm)")
                         }
                     }
                     SlotPill(
                         selected = selectedSlot == 1,
-                        label = "JK-BMS",
+                        label = bmsProto.shortLabel,
                         state = state.jkConnState,
                         sub = jkSub,
                         onSelect = { selectedSlot = 1 },
@@ -225,41 +230,77 @@ fun DeviceConnectSheet(
             }
 
             if (selectedSlot == 0) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    FilterChip(
-                        selected = true,
-                        onClick = { },
-                        label = { Text("Classic SPP") },
-                        modifier = Modifier.testTag("motor_spp_chip")
-                    )
-                    Spacer(Modifier.weight(1f))
-                    Box {
-                        TextButton(
-                            onClick = { priorityMenuExpanded = true },
-                            modifier = Modifier.testTag("battery_priority_button")
-                        ) {
-                            Text("Utama: ${state.settings.batteryPriority.label}")
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(ControllerProtocol.entries) { proto ->
+                            FilterChip(
+                                selected = ctrlProto == proto,
+                                onClick = { onSelectControllerProtocol(proto) },
+                                label = { Text(proto.label, fontSize = 12.sp) },
+                                modifier = Modifier.testTag("ctrl_proto_${proto.id}")
+                            )
                         }
-                        DropdownMenu(
-                            expanded = priorityMenuExpanded,
-                            onDismissRequest = { priorityMenuExpanded = false }
-                        ) {
-                            BatterySourcePriority.entries.forEach { prio ->
-                                DropdownMenuItem(
-                                    text = { Text("Sumber Range: ${prio.label}") },
-                                    onClick = {
-                                        priorityMenuExpanded = false
-                                        onChangeBatteryPriority(prio)
-                                    }
-                                )
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (ctrlProto.usesBle) "Mode: BLE Scan" else "Mode: Classic SPP Paired",
+                            fontSize = 12.sp,
+                            color = c.textMuted
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Box {
+                            TextButton(
+                                onClick = { priorityMenuExpanded = true },
+                                modifier = Modifier.testTag("battery_priority_button")
+                            ) {
+                                Text("Utama: ${state.settings.batteryPriority.label}")
+                            }
+                            DropdownMenu(
+                                expanded = priorityMenuExpanded,
+                                onDismissRequest = { priorityMenuExpanded = false }
+                            ) {
+                                BatterySourcePriority.entries.forEach { prio ->
+                                    DropdownMenuItem(
+                                        text = { Text("Sumber Range: ${prio.label}") },
+                                        onClick = {
+                                            priorityMenuExpanded = false
+                                            onChangeBatteryPriority(prio)
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
+                }
+            } else if (selectedSlot == 1) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(BmsProtocol.entries) { proto ->
+                            FilterChip(
+                                selected = bmsProto == proto,
+                                onClick = { onSelectBmsProtocol(proto) },
+                                label = { Text(proto.shortLabel, fontSize = 12.sp) },
+                                modifier = Modifier.testTag("bms_proto_${proto.id}")
+                            )
+                        }
+                    }
+                    Text(
+                        text = "${bmsProto.label} • GATT ${bmsProto.gattHint}",
+                        fontSize = 11.5.sp,
+                        color = c.textMuted,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp)
+                    )
                 }
             }
 
@@ -296,10 +337,10 @@ fun DeviceConnectSheet(
                         )
                         Spacer(Modifier.height(10.dp))
                         Text(
-                            text = if (selectedSlot == 0) {
-                                "Belum ada MID yang ter-pair.\nPair dulu di Pengaturan Bluetooth Android, lalu buka lagi."
+                            text = if (selectedSlot == 0 && !ctrlProto.usesBle) {
+                                "Belum ada ${ctrlProto.shortLabel} yang ter-pair.\nPair dulu di Pengaturan Bluetooth Android, lalu buka lagi."
                             } else if (state.isScanningBle) {
-                                "Memindai perangkat di sekitar…"
+                                "Memindai perangkat BLE di sekitar…"
                             } else {
                                 "Belum ada perangkat ditemukan.\nPastikan Bluetooth & Lokasi aktif."
                             },
@@ -357,7 +398,7 @@ fun DeviceConnectSheet(
                                 Button(
                                     onClick = {
                                         when (selectedSlot) {
-                                            0 -> onConnectMotor(d.address, false)
+                                            0 -> onConnectMotor(d.address, ctrlProto.usesBle)
                                             1 -> onConnectJkBms(d.address)
                                             2 -> onConnectEspSlot(1, d.address)
                                             3 -> onConnectEspSlot(2, d.address)

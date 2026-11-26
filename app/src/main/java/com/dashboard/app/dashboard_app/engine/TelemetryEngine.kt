@@ -6,12 +6,15 @@ import com.dashboard.app.dashboard_app.model.AppSettings
 import com.dashboard.app.dashboard_app.model.AtNavSlotConfig
 import com.dashboard.app.dashboard_app.model.Battery2Data
 import com.dashboard.app.dashboard_app.model.BatterySourcePriority
+import com.dashboard.app.dashboard_app.model.BmsProtocol
 import com.dashboard.app.dashboard_app.model.ChargingIndicatorState
 import com.dashboard.app.dashboard_app.model.ConnectionStateX
+import com.dashboard.app.dashboard_app.model.ControllerProtocol
 import com.dashboard.app.dashboard_app.model.DailyChallenge
 import com.dashboard.app.dashboard_app.model.EffectiveTelemetry
 import com.dashboard.app.dashboard_app.model.EfficiencyTrend
 import com.dashboard.app.dashboard_app.model.Esp32Data
+import com.dashboard.app.dashboard_app.model.FardriverData
 import com.dashboard.app.dashboard_app.model.FuelSavingsSummary
 import com.dashboard.app.dashboard_app.model.JkBmsData
 import com.dashboard.app.dashboard_app.model.LiveTripMetrics
@@ -246,6 +249,7 @@ object TelemetryEngine {
         val delta = if (minCell != null && maxCell != null) maxCell!! - minCell!! else null
 
         return JkBmsData(
+            protocolLabel = BmsProtocol.JIKONG.shortLabel,
             vpack = vpack,
             ibat = ibat,
             socPct = soc,
@@ -269,6 +273,496 @@ object TelemetryEngine {
         )
     }
 
+    // ==================== FARDRIVER CONTROLLER PROTOCOL (16B 0xAA) ====================
+
+    val FARDRIVER_WAKE_CMD: ByteArray = byteArrayOf(
+        0xAA.toByte(), 0x13, 0xEC.toByte(), 0x07, 0x01, 0xF1.toByte(), 0xA2.toByte(), 0x5D
+    )
+
+    private val FARDRIVER_FLASH_READ_ADDR = intArrayOf(
+        0xE2, 0xE8, 0xEE, 0x00, 0x06, 0x0C, 0x12,
+        0xE2, 0xE8, 0xEE, 0x18, 0x1E, 0x24, 0x2A,
+        0xE2, 0xE8, 0xEE, 0x30, 0x5D, 0x63, 0x69,
+        0xE2, 0xE8, 0xEE, 0x7C, 0x82, 0x88, 0x8E,
+        0xE2, 0xE8, 0xEE, 0x94, 0x9A, 0xA0, 0xA6,
+        0xE2, 0xE8, 0xEE, 0xAC, 0xB2, 0xB8, 0xBE,
+        0xE2, 0xE8, 0xEE, 0xC4, 0xCA, 0xD0,
+        0xE2, 0xE8, 0xEE, 0xD6, 0xDC, 0xF4, 0xFA
+    )
+
+    fun parseFardriver16ByteFrame(
+        buf: ByteArray,
+        current: FardriverData,
+        polePairs: Int = 20,
+        wheelCircMm: Int = 1580,
+        currentScale: Double = 0.25,
+        nowMs: Long = System.currentTimeMillis()
+    ): FardriverData? {
+        if (buf.size < 16) return null
+        if ((buf[0].toInt() and 0xFF) != 0xAA) return null
+        val pktId = buf[1].toInt() and 0x3F
+        if (pktId !in FARDRIVER_FLASH_READ_ADDR.indices) return null
+
+        fun u16le(off: Int): Int =
+            (buf[off].toInt() and 0xFF) or ((buf[off + 1].toInt() and 0xFF) shl 8)
+
+        fun i16le(off: Int): Int {
+            val v = u16le(off)
+            return if (v >= 0x8000) v - 0x10000 else v
+        }
+
+        val flashAddr = FARDRIVER_FLASH_READ_ADDR[pktId]
+        val nextCount = current.framesCount + 1
+        return when (flashAddr) {
+            0xE2 -> {
+                val hall = buf[3].toInt() and 0xFF
+                val gear = buf[4].toInt() and 0x03
+                val rawRpm = u16le(5)
+                val errFlags = buf[7].toInt() and 0xFF
+                val iq = i16le(8) * currentScale
+                val id = i16le(10) * currentScale
+                val mechRpm = if (polePairs > 1) rawRpm.toDouble() / polePairs.toDouble() else rawRpm.toDouble()
+                val speedKmh = mechRpm * (wheelCircMm.coerceIn(500, 3000) / 1_000_000.0) * 60.0
+                current.copy(
+                    hallPosition = hall,
+                    gear = gear,
+                    rpm = rawRpm,
+                    speedKmh = max(0.0, speedKmh),
+                    errorFlags = errFlags,
+                    iqCurrentA = iq,
+                    idCurrentA = id,
+                    framesCount = nextCount,
+                    lastUpdatedMs = nowMs
+                )
+            }
+            0xE8 -> {
+                val volt = u16le(2) * 0.1
+                val lineI = i16le(4) * currentScale
+                val modRatio = buf[6].toInt() and 0xFF
+                val workState = buf[8].toInt() and 0xFF
+                val thrRaw = buf[13].toInt() and 0xFF
+                val thrPct = ((thrRaw / 255.0) * 100.0).coerceIn(0.0, 100.0)
+                current.copy(
+                    voltageV = if (volt in 5.0..200.0) volt else current.voltageV,
+                    lineCurrentA = lineI,
+                    modRatio = modRatio,
+                    workState = workState,
+                    throttlePct = thrPct,
+                    framesCount = nextCount,
+                    lastUpdatedMs = nowMs
+                )
+            }
+            0x06 -> {
+                val rawMos = buf[3].toInt() and 0xFF
+                val mosC = if (rawMos in 0..145) rawMos.toDouble() else (rawMos - 40).toDouble()
+                current.copy(
+                    mosTempC = mosC.coerceIn(-40.0, 160.0),
+                    framesCount = nextCount,
+                    lastUpdatedMs = nowMs
+                )
+            }
+            0xDC -> {
+                val rawMot = buf[2].toInt() and 0xFF
+                val motC = if (rawMot in 0..165) rawMot.toDouble() else (rawMot - 40).toDouble()
+                val thrAdc = u16le(3)
+                val thrAdcPct = (((thrAdc - 800) / 3000.0) * 100.0).coerceIn(0.0, 100.0)
+                current.copy(
+                    motorTempC = motC.coerceIn(-40.0, 180.0),
+                    throttlePct = current.throttlePct ?: thrAdcPct,
+                    framesCount = nextCount,
+                    lastUpdatedMs = nowMs
+                )
+            }
+            else -> current.copy(framesCount = nextCount, lastUpdatedMs = nowMs)
+        }
+    }
+
+    // ==================== ANT BMS PROTOCOL (140B AA55 & 7EA1) ====================
+
+    val ANT_LEGACY_POLL_CMD: ByteArray = byteArrayOf(0xDB.toByte(), 0xDB.toByte(), 0x00, 0x00, 0x00, 0x00)
+    val ANT_V2_POLL_CMD: ByteArray = byteArrayOf(
+        0x7E.toByte(), 0xA1.toByte(), 0x01, 0x00, 0x00, 0xBE.toByte(), 0x18, 0x55, 0xAA.toByte(), 0x55
+    )
+
+    private fun u16be(buf: ByteArray, off: Int): Int =
+        ((buf[off].toInt() and 0xFF) shl 8) or (buf[off + 1].toInt() and 0xFF)
+
+    private fun i16be(buf: ByteArray, off: Int): Int {
+        val v = u16be(buf, off)
+        return if (v >= 0x8000) v - 0x10000 else v
+    }
+
+    private fun u32be(buf: ByteArray, off: Int): Long =
+        ((buf[off].toLong() and 0xFF) shl 24) or
+            ((buf[off + 1].toLong() and 0xFF) shl 16) or
+            ((buf[off + 2].toLong() and 0xFF) shl 8) or
+            (buf[off + 3].toLong() and 0xFF)
+
+    private fun i32be(buf: ByteArray, off: Int): Long {
+        val v = u32be(buf, off)
+        return if (v >= 0x80000000L) v - 0x100000000L else v
+    }
+
+    fun crc16Modbus(buf: ByteArray, start: Int, endExclusive: Int): Int {
+        var crc = 0xFFFF
+        for (idx in start until endExclusive) {
+            crc = crc xor (buf[idx].toInt() and 0xFF)
+            repeat(8) {
+                crc = if ((crc and 0x0001) != 0) (crc ushr 1) xor 0xA001 else crc ushr 1
+            }
+        }
+        return crc and 0xFFFF
+    }
+
+    fun parseAntBms140ByteFrame(
+        buf: ByteArray,
+        nowMs: Long = System.currentTimeMillis()
+    ): JkBmsData? {
+        if (buf.size < 140) return null
+        val b0 = buf[0].toInt() and 0xFF
+        val b1 = buf[1].toInt() and 0xFF
+        val b2 = buf[2].toInt() and 0xFF
+        val b3 = buf[3].toInt() and 0xFF
+        if (b0 != 0xAA || b1 != 0x55 || b2 != 0xAA || (b3 != 0xFF && b3 != 0x55)) return null
+
+        val vpack = u16be(buf, 4) * 0.1
+        val cells = mutableListOf<Double>()
+        for (i in 0 until 32) {
+            val cv = u16be(buf, 6 + i * 2) * 0.001
+            if (cv > 0.5 && cv < 5.5) cells.add(cv)
+        }
+        val ibat = i32be(buf, 70) * 0.1
+        val soc = (buf[74].toInt() and 0xFF).toDouble().coerceIn(0.0, 100.0)
+
+        fun scaleAntAh(raw: Long): Double = when {
+            raw <= 0L -> 0.0
+            raw > 500_000L -> raw * 0.000001
+            else -> raw * 0.001
+        }
+        val capAh = scaleAntAh(u32be(buf, 75))
+        val remainAh = scaleAntAh(u32be(buf, 79))
+        val cycleAh = scaleAntAh(u32be(buf, 83))
+        val cycles = if (capAh > 1.0 && cycleAh > 0.0) (cycleAh / capAh).roundToInt() else null
+
+        val mosTempRaw = i16be(buf, 91).toDouble()
+        val temp1Raw = i16be(buf, 95).toDouble()
+        val temp2Raw = i16be(buf, 97).toDouble()
+        val tempMos = if (mosTempRaw in -40.0..150.0) mosTempRaw else null
+        val temp1 = if (temp1Raw in -40.0..150.0 && temp1Raw != 0.0) temp1Raw else i16be(buf, 93).toDouble().takeIf { it in -40.0..150.0 }
+        val temp2 = if (temp2Raw in -40.0..150.0 && temp2Raw != 0.0) temp2Raw else null
+
+        val chgMos = (buf[103].toInt() and 0xFF) == 1
+        val dsgMos = (buf[104].toInt() and 0xFF) == 1
+        val balActive = (buf[105].toInt() and 0xFF) != 0
+
+        val minCell = cells.minOrNull()
+        val maxCell = cells.maxOrNull()
+        val minIdx = minCell?.let { m -> cells.indexOfFirst { it == m } } ?: -1
+        val maxIdx = maxCell?.let { m -> cells.indexOfFirst { it == m } } ?: -1
+        val delta = if (minCell != null && maxCell != null) maxCell - minCell else null
+
+        return JkBmsData(
+            protocolLabel = BmsProtocol.ANT.shortLabel,
+            vpack = vpack,
+            ibat = ibat,
+            socPct = soc,
+            temp1C = temp1,
+            temp2C = temp2,
+            tempMosC = tempMos,
+            deltaCellV = delta,
+            minCellV = minCell,
+            maxCellV = maxCell,
+            minCellIndex = minIdx,
+            maxCellIndex = maxIdx,
+            cellCount = cells.size,
+            cellVoltages = cells,
+            cycles = cycles,
+            remainAh = if (remainAh > 0.0) remainAh else null,
+            capacityAh = if (capAh > 0.0) capAh else null,
+            balancingActive = balActive,
+            balanceStatus = if (balActive) 1 else 0,
+            mosChargeOn = chgMos,
+            mosDischargeOn = dsgMos,
+            lastUpdatedMs = nowMs
+        )
+    }
+
+    fun parseAntV2Frame(
+        buf: ByteArray,
+        current: JkBmsData,
+        nowMs: Long = System.currentTimeMillis()
+    ): JkBmsData? {
+        if (buf.size < 20) return null
+        if ((buf[0].toInt() and 0xFF) != 0x7E || (buf[1].toInt() and 0xFF) != 0xA1) return null
+        if ((buf[buf.size - 2].toInt() and 0xFF) != 0xAA || (buf[buf.size - 1].toInt() and 0xFF) != 0x55) return null
+        val crcOffset = buf.size - 4
+        val rxCrc = (buf[crcOffset].toInt() and 0xFF) or ((buf[crcOffset + 1].toInt() and 0xFF) shl 8)
+        val calcCrc = crc16Modbus(buf, 1, crcOffset)
+        if (rxCrc != calcCrc) return null
+
+        val cmd = buf[2].toInt() and 0xFF
+        if (cmd != 0x11 && cmd != 0x01) return null
+        // Status packet 0x11 carries temp sensor count at byte 8, cell count at byte 9, followed by cell voltages (2B LE each)
+        val dataLen = buf[5].toInt() and 0xFF
+        if (buf.size < 10 + dataLen) return null
+        val ntcCount = (buf[8].toInt() and 0xFF).coerceIn(0, 10)
+        val cellCount = (buf[9].toInt() and 0xFF).coerceIn(0, 32)
+        val cells = mutableListOf<Double>()
+        var cursor = 10 + ntcCount * 2
+        // Extract cell voltages (2 bytes LE each, 1 mV) when payload holds them
+        if (cursor + cellCount * 2 <= crcOffset) {
+            for (i in 0 until cellCount) {
+                val mv = (buf[cursor].toInt() and 0xFF) or ((buf[cursor + 1].toInt() and 0xFF) shl 8)
+                val v = mv * 0.001
+                if (v in 0.5..5.5) cells.add(v)
+                cursor += 2
+            }
+        }
+        val t1 = if (ntcCount >= 1 && 10 + 1 < crcOffset) {
+            val raw = ((buf[10].toInt() and 0xFF) or ((buf[11].toInt() and 0xFF) shl 8))
+            val signed = if (raw >= 0x8000) raw - 0x10000 else raw
+            signed.toDouble().takeIf { it in -40.0..150.0 }
+        } else current.temp1C
+        val t2 = if (ntcCount >= 2 && 12 + 1 < crcOffset) {
+            val raw = ((buf[12].toInt() and 0xFF) or ((buf[13].toInt() and 0xFF) shl 8))
+            val signed = if (raw >= 0x8000) raw - 0x10000 else raw
+            signed.toDouble().takeIf { it in -40.0..150.0 }
+        } else current.temp2C
+
+        val minC = cells.minOrNull()
+        val maxC = cells.maxOrNull()
+        val delta = if (minC != null && maxC != null) maxC - minC else current.deltaCellV
+        val vSum = if (cells.isNotEmpty()) cells.sum() else current.vpack
+        return current.copy(
+            protocolLabel = BmsProtocol.ANT.shortLabel,
+            vpack = vSum,
+            temp1C = t1,
+            temp2C = t2,
+            cellCount = if (cells.isNotEmpty()) cells.size else current.cellCount,
+            cellVoltages = if (cells.isNotEmpty()) cells else current.cellVoltages,
+            minCellV = minC ?: current.minCellV,
+            maxCellV = maxC ?: current.maxCellV,
+            deltaCellV = delta,
+            lastUpdatedMs = nowMs
+        )
+    }
+
+    // ==================== DALY BMS PROTOCOL (13B 0xA5) ====================
+
+    fun buildDalyCommandFrame(cmdId: Int): ByteArray {
+        val frame = ByteArray(13)
+        frame[0] = 0xA5.toByte()
+        frame[1] = 0x40.toByte()
+        frame[2] = (cmdId and 0xFF).toByte()
+        frame[3] = 0x08.toByte()
+        var sum = 0
+        for (i in 0 until 12) sum += frame[i].toInt() and 0xFF
+        frame[12] = (sum and 0xFF).toByte()
+        return frame
+    }
+
+    fun parseDaly13ByteFrame(
+        buf: ByteArray,
+        current: JkBmsData,
+        cellAccumulator: MutableMap<Int, Double> = mutableMapOf(),
+        nowMs: Long = System.currentTimeMillis()
+    ): JkBmsData? {
+        if (buf.size < 13) return null
+        if ((buf[0].toInt() and 0xFF) != 0xA5) return null
+        var sum = 0
+        for (i in 0 until 12) sum += buf[i].toInt() and 0xFF
+        if ((sum and 0xFF) != (buf[12].toInt() and 0xFF)) return null
+
+        val cmd = buf[2].toInt() and 0xFF
+        val withProto = current.copy(protocolLabel = BmsProtocol.DALY.shortLabel)
+        return when (cmd) {
+            0x90 -> {
+                val vpack = u16be(buf, 4) * 0.1
+                val rawI = u16be(buf, 8)
+                val ibat = (rawI - 30_000) * 0.1
+                val soc = (u16be(buf, 10) * 0.1).coerceIn(0.0, 100.0)
+                withProto.copy(vpack = vpack, ibat = ibat, socPct = soc, lastUpdatedMs = nowMs)
+            }
+            0x91 -> {
+                val maxV = u16be(buf, 4) * 0.001
+                val maxIdx = (buf[6].toInt() and 0xFF) - 1
+                val minV = u16be(buf, 7) * 0.001
+                val minIdx = (buf[9].toInt() and 0xFF) - 1
+                withProto.copy(
+                    maxCellV = maxV,
+                    maxCellIndex = maxIdx,
+                    minCellV = minV,
+                    minCellIndex = minIdx,
+                    deltaCellV = max(0.0, maxV - minV),
+                    lastUpdatedMs = nowMs
+                )
+            }
+            0x92 -> {
+                val maxT = (buf[4].toInt() and 0xFF) - 40.0
+                val minT = (buf[6].toInt() and 0xFF) - 40.0
+                withProto.copy(temp1C = maxT, temp2C = minT, lastUpdatedMs = nowMs)
+            }
+            0x93 -> {
+                val chgMos = (buf[5].toInt() and 0xFF) == 1
+                val dsgMos = (buf[6].toInt() and 0xFF) == 1
+                val remainAh = u32be(buf, 8) * 0.001
+                withProto.copy(
+                    mosChargeOn = chgMos,
+                    mosDischargeOn = dsgMos,
+                    remainAh = remainAh,
+                    lastUpdatedMs = nowMs
+                )
+            }
+            0x94 -> {
+                val cellCount = (buf[4].toInt() and 0xFF).coerceIn(0, 48)
+                val cycles = u16be(buf, 10)
+                withProto.copy(
+                    cellCount = if (cellCount > 0) cellCount else withProto.cellCount,
+                    cycles = cycles,
+                    lastUpdatedMs = nowMs
+                )
+            }
+            0x95 -> {
+                val frameNum = buf[4].toInt() and 0xFF
+                if (frameNum == 0xFF || frameNum > 16) return withProto
+                val baseCell = if (frameNum >= 1) (frameNum - 1) * 3 else 0
+                for (i in 0 until 3) {
+                    val mv = u16be(buf, 5 + i * 2) * 0.001
+                    val cIdx = baseCell + i
+                    val limit = if (withProto.cellCount > 0) withProto.cellCount else 32
+                    if (cIdx < limit && mv in 0.5..5.5) {
+                        cellAccumulator[cIdx] = mv
+                    }
+                }
+                val ordered = cellAccumulator.entries.sortedBy { it.key }.map { it.value }
+                if (ordered.isEmpty()) return withProto
+                val minV = ordered.min()
+                val maxV = ordered.max()
+                withProto.copy(
+                    cellVoltages = ordered,
+                    cellCount = if (withProto.cellCount > 0) withProto.cellCount else ordered.size,
+                    minCellV = minV,
+                    maxCellV = maxV,
+                    minCellIndex = ordered.indexOf(minV),
+                    maxCellIndex = ordered.indexOf(maxV),
+                    deltaCellV = maxV - minV,
+                    lastUpdatedMs = nowMs
+                )
+            }
+            0x96 -> {
+                val anyFault = (4..11).any { (buf[it].toInt() and 0xFF) != 0 }
+                val faultSummary = if (anyFault) {
+                    (4..11).joinToString(" ") { String.format(Locale.US, "%02X", buf[it].toInt() and 0xFF) }
+                } else null
+                withProto.copy(faultText = faultSummary, lastUpdatedMs = nowMs)
+            }
+            else -> null
+        }
+    }
+
+    // ==================== JBD / XIAOXIANG BMS PROTOCOL (0xDD ... 0x77) ====================
+
+    val JBD_READ_BASIC_CMD: ByteArray = byteArrayOf(
+        0xDD.toByte(), 0xA5.toByte(), 0x03, 0x00, 0xFF.toByte(), 0xFD.toByte(), 0x77
+    )
+    val JBD_READ_CELLS_CMD: ByteArray = byteArrayOf(
+        0xDD.toByte(), 0xA5.toByte(), 0x04, 0x00, 0xFF.toByte(), 0xFC.toByte(), 0x77
+    )
+
+    fun parseJbdFrame(
+        buf: ByteArray,
+        current: JkBmsData,
+        nowMs: Long = System.currentTimeMillis()
+    ): JkBmsData? {
+        if (buf.size < 7) return null
+        if ((buf[0].toInt() and 0xFF) != 0xDD || (buf.last().toInt() and 0xFF) != 0x77) return null
+        val cmd = buf[1].toInt() and 0xFF
+        val status = buf[2].toInt() and 0xFF
+        val len = buf[3].toInt() and 0xFF
+        if (status != 0x00 || buf.size < 4 + len + 3) return null
+
+        var sum = 0
+        for (i in 2 until (4 + len)) sum += buf[i].toInt() and 0xFF
+        val expectedCrc = (0x10000 - (sum and 0xFFFF)) and 0xFFFF
+        val actualCrc = u16be(buf, 4 + len)
+        if (expectedCrc != actualCrc) return null
+
+        val p = 4 // payload start
+        val withProto = current.copy(protocolLabel = BmsProtocol.JBD.shortLabel)
+        return when (cmd) {
+            0x03 -> {
+                if (len < 23) return null
+                val vpack = u16be(buf, p) * 0.01
+                val ibat = i16be(buf, p + 2) * 0.01
+                val remainAh = u16be(buf, p + 4) * 0.01
+                val capAh = u16be(buf, p + 6) * 0.01
+                val cycles = u16be(buf, p + 8)
+                val balLow = u16be(buf, p + 12)
+                val balHigh = u16be(buf, p + 14)
+                val balMask = balLow or (balHigh shl 16)
+                val protFlags = u16be(buf, p + 16)
+                val soc = (buf[p + 19].toInt() and 0xFF).toDouble().coerceIn(0.0, 100.0)
+                val fetStatus = buf[p + 20].toInt() and 0xFF
+                val cells = buf[p + 21].toInt() and 0xFF
+                val ntcCount = buf[p + 22].toInt() and 0xFF
+
+                val temps = mutableListOf<Double>()
+                if (ntcCount > 0 && len >= 23 + ntcCount * 2) {
+                    for (i in 0 until ntcCount) {
+                        val tC = (u16be(buf, p + 23 + i * 2) - 2731) * 0.1
+                        if (tC in -40.0..150.0) temps.add(tC)
+                    }
+                } else if (ntcCount > 0 && len >= 23 + ntcCount) {
+                    for (i in 0 until ntcCount) {
+                        val tC = (buf[p + 23 + i].toInt() and 0xFF) - 40.0
+                        if (tC in -40.0..150.0) temps.add(tC)
+                    }
+                }
+
+                withProto.copy(
+                    vpack = vpack,
+                    ibat = ibat,
+                    remainAh = remainAh,
+                    capacityAh = capAh,
+                    cycles = cycles,
+                    balancingActive = balMask != 0,
+                    balanceStatus = if (balMask != 0) 1 else 0,
+                    socPct = soc,
+                    mosChargeOn = (fetStatus and 0x01) != 0,
+                    mosDischargeOn = (fetStatus and 0x02) != 0,
+                    cellCount = if (cells > 0) cells else withProto.cellCount,
+                    temp1C = temps.getOrNull(0) ?: withProto.temp1C,
+                    temp2C = temps.getOrNull(1) ?: withProto.temp2C,
+                    tempMosC = temps.getOrNull(2) ?: withProto.tempMosC,
+                    faultText = if (protFlags != 0) "Proteksi 0x${protFlags.toString(16).uppercase(Locale.US)}" else null,
+                    lastUpdatedMs = nowMs
+                )
+            }
+            0x04 -> {
+                val count = len / 2
+                val cellList = mutableListOf<Double>()
+                for (i in 0 until count) {
+                    val v = u16be(buf, p + i * 2) * 0.001
+                    if (v in 0.5..5.5) cellList.add(v)
+                }
+                if (cellList.isEmpty()) return withProto
+                val minV = cellList.min()
+                val maxV = cellList.max()
+                withProto.copy(
+                    cellCount = cellList.size,
+                    cellVoltages = cellList,
+                    minCellV = minV,
+                    maxCellV = maxV,
+                    minCellIndex = cellList.indexOf(minV),
+                    maxCellIndex = cellList.indexOf(maxV),
+                    deltaCellV = maxV - minV,
+                    lastUpdatedMs = nowMs
+                )
+            }
+            else -> null
+        }
+    }
+
     fun computeEffective(
         motor: MotorData,
         motorState: ConnectionStateX,
@@ -281,26 +775,33 @@ object TelemetryEngine {
         gpsSpeedKmh: Double?,
         trip: LiveTripMetrics,
         settings: AppSettings,
-        nowMs: Long = System.currentTimeMillis()
+        nowMs: Long = System.currentTimeMillis(),
+        fardriver: FardriverData = FardriverData()
     ): EffectiveTelemetry {
-        val motorAlive = motorState == ConnectionStateX.CONNECTED && (nowMs - motor.lastUpdatedMs) < STALE_MS
+        val useFardriver = settings.controllerProtocol != ControllerProtocol.MID_AT
+        val midAlive = !useFardriver && motorState == ConnectionStateX.CONNECTED && (nowMs - motor.lastUpdatedMs) < STALE_MS
+        val fdAlive = useFardriver && motorState == ConnectionStateX.CONNECTED && (nowMs - fardriver.lastUpdatedMs) < STALE_MS
+        val ctrlAlive = midAlive || fdAlive
         val jkAlive = jkState == ConnectionStateX.CONNECTED && (nowMs - jk.lastUpdatedMs) < STALE_MS
         val esp1Alive = esp1State == ConnectionStateX.CONNECTED && (nowMs - esp1.lastUpdatedMs) < STALE_MS
         val esp2Alive = esp2State == ConnectionStateX.CONNECTED && (nowMs - b2.lastUpdatedMs) < STALE_MS
 
         val speedKmh: Double? = when {
-            motorAlive && motor.speedKmh != null -> motor.speedKmh
+            midAlive && motor.speedKmh != null -> motor.speedKmh
+            fdAlive && fardriver.speedKmh != null -> fardriver.speedKmh
             esp1Alive && esp1.speedKmh != null -> esp1.speedKmh
             else -> gpsSpeedKmh
         }
 
         val throttlePct: Double? = when {
-            motorAlive && motor.throttlePct != null -> motor.throttlePct
+            midAlive && motor.throttlePct != null -> motor.throttlePct
+            fdAlive && fardriver.throttlePct != null -> fardriver.throttlePct
             esp1Alive && esp1.throttlePct != null -> esp1.throttlePct
             else -> null
         }
 
-        val preferJk = settings.batteryPriority == BatterySourcePriority.JIKONG
+        val bmsLabel = jk.protocolLabel.ifBlank { settings.bmsProtocol.shortLabel }
+        val preferBms = settings.batteryPriority == BatterySourcePriority.JIKONG
         val b1Source: String
         var b1Soc: Double? = null
         var b1Vbat: Double? = null
@@ -308,16 +809,23 @@ object TelemetryEngine {
         var b1Temp: Double? = null
         var b1Soh: Double? = null
 
-        // Keep Baterai ORI (Motor MID) and JK-BMS strictly separated — never mix
+        // Keep Controller (MID or Fardriver) and Smart BMS strictly separated — never mix
         // fields across devices when computing the active Battery 1 physics source.
-        if ((preferJk && jkAlive) || (!motorAlive && jkAlive)) {
-            b1Source = "JK-BMS"
+        if ((preferBms && jkAlive) || (!ctrlAlive && jkAlive)) {
+            b1Source = bmsLabel
             b1Soc = jk.socPct
             b1Vbat = jk.vpack
             b1Ibat = jk.ibat
             b1Temp = jk.temp1C
             b1Soh = jk.sohPct
-        } else if (motorAlive) {
+        } else if (fdAlive) {
+            b1Source = "Fardriver"
+            b1Vbat = fardriver.voltageV
+            // Fardriver bus current: positive when motoring, negative when regen.
+            // TelemetryEngine convention: negative = discharging/motoring, positive = charging/regen.
+            b1Ibat = fardriver.lineCurrentA?.let { -it }
+            b1Temp = fardriver.mosTempC ?: fardriver.motorTempC
+        } else if (midAlive) {
             b1Source = "Motor MID"
             b1Soc = motor.socPct
             b1Vbat = motor.vbat
@@ -405,9 +913,10 @@ object TelemetryEngine {
             chargeEtaHours = remainingWhToFull / abs(combinedPowerW)
         }
 
-        val activeErrors = kMotorErrorDefs.filter { ((motor.errMask ushr it.bit) and 1) == 1 }
+        val errMaskActive = if (fdAlive) fardriver.errorFlags else motor.errMask
+        val activeErrors = kMotorErrorDefs.filter { ((errMaskActive ushr it.bit) and 1) == 1 }
         val odoKm = motor.odoKm ?: settings.odoBackupKm
-        val modeIdx = esp1.modeIndex ?: motor.modeIndex
+        val modeIdx = esp1.modeIndex ?: if (fdAlive) fardriver.gear else motor.modeIndex
         val modeLabel = when (modeIdx) {
             0 -> "ECO"
             1 -> "URBAN"
@@ -415,9 +924,15 @@ object TelemetryEngine {
             else -> "—"
         }
 
+        val activeRpm = when {
+            midAlive && motor.rpm != null -> motor.rpm
+            fdAlive && fardriver.rpm != null -> fardriver.rpm
+            else -> speedKmh?.let { (it * 51.45).roundToInt() }
+        }
+
         return EffectiveTelemetry(
             speedKmh = speedKmh,
-            rpm = motor.rpm?.takeIf { motorAlive } ?: speedKmh?.let { (it * 51.45).roundToInt() },
+            rpm = activeRpm,
             throttlePct = throttlePct,
             b1SocPct = b1Soc,
             b1Vbat = b1Vbat,

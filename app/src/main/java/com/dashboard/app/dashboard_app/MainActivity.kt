@@ -485,6 +485,12 @@ private fun DashboardRootApp(
                     onDisconnectEspSlot = { slot -> viewModel.disconnectEspSlot(slot) },
                     onChangeBatteryPriority = { prio ->
                         viewModel.updateSettings(state.settings.copy(batteryPriorityId = prio.id))
+                    },
+                    onSelectControllerProtocol = { proto ->
+                        viewModel.selectControllerProtocol(proto)
+                    },
+                    onSelectBmsProtocol = { proto ->
+                        viewModel.selectBmsProtocol(proto)
                     }
                 )
             }
@@ -597,6 +603,7 @@ private fun MainTabContent(
                     viewModel.logManualChargeSession(sSoc, eSoc, wh, dur)
                     onShowSnackbar("Sesi pengisian dicatat.")
                 },
+                onUpdateSettings = { updated -> viewModel.updateSettings(updated) },
                 modifier = boundedMod
             )
             2 -> NavigationScreen(

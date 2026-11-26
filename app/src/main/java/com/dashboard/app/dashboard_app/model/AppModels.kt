@@ -37,6 +37,11 @@ data class AppSettings(
     val garageStyleId: String = "stealth_obsidian",
     val cockpitLayout: String = "complete",
     val batteryPriorityId: String = BatterySourcePriority.MOTOR.id,
+    val controllerProtocolId: String = ControllerProtocol.MID_AT.id,
+    val bmsProtocolId: String = BmsProtocol.JIKONG.id,
+    val fardriverPolePairs: Int = 20,
+    val fardriverWheelCircMm: Int = 1580,
+    val fardriverCurrentScale: Double = 0.25,
     val b1NominalV: Double = 72.0,
     val b1CapacityAh: Double = 20.0,
     val b2NominalV: Double = 72.0,
@@ -103,6 +108,12 @@ data class AppSettings(
 ) {
     val batteryPriority: BatterySourcePriority
         get() = BatterySourcePriority.fromId(batteryPriorityId)
+
+    val controllerProtocol: ControllerProtocol
+        get() = ControllerProtocol.fromId(controllerProtocolId)
+
+    val bmsProtocol: BmsProtocol
+        get() = BmsProtocol.fromId(bmsProtocolId)
 }
 
 @Serializable

@@ -9,9 +9,42 @@ enum class ConnectionStateX {
     CONNECTED
 }
 
+enum class ControllerProtocol(
+    val id: String,
+    val label: String,
+    val shortLabel: String,
+    val usesBle: Boolean
+) {
+    MID_AT("mid_at", "MID Gesits (AT+ SPP)", "Motor MID", false),
+    FARDRIVER_BLE("fardriver_ble", "Fardriver (BLE)", "Fardriver", true),
+    FARDRIVER_SPP("fardriver_spp", "Fardriver (Serial SPP)", "Fardriver", false);
+
+    companion object {
+        fun fromId(id: String?): ControllerProtocol =
+            entries.firstOrNull { it.id == id } ?: MID_AT
+    }
+}
+
+enum class BmsProtocol(
+    val id: String,
+    val label: String,
+    val shortLabel: String,
+    val gattHint: String
+) {
+    JIKONG("jikong", "JK-BMS (Smart BMS BLE)", "JK-BMS", "FFE0 / 300B"),
+    ANT("ant", "ANT BMS (BLE)", "ANT BMS", "FFE0 / AA55 & 7EA1"),
+    DALY("daly", "Daly BMS (Smart BLE)", "Daly BMS", "FFF0 / FFE0 (A5)"),
+    JBD("jbd", "JBD / Xiaoxiang BMS (BLE)", "JBD BMS", "FF00 (DD A5)");
+
+    companion object {
+        fun fromId(id: String?): BmsProtocol =
+            entries.firstOrNull { it.id == id } ?: JIKONG
+    }
+}
+
 enum class BatterySourcePriority(val id: String, val label: String) {
-    MOTOR("motor", "Motor MID"),
-    JIKONG("jikong", "JK-BMS");
+    MOTOR("motor", "Kontroler / MID"),
+    JIKONG("jikong", "Smart BMS BLE");
 
     companion object {
         fun fromId(id: String?): BatterySourcePriority =
@@ -108,7 +141,27 @@ data class MotorData(
     val lastUpdatedMs: Long = 0L
 )
 
+data class FardriverData(
+    val voltageV: Double? = null,
+    val lineCurrentA: Double? = null,
+    val iqCurrentA: Double? = null,
+    val idCurrentA: Double? = null,
+    val rpm: Int? = null,
+    val speedKmh: Double? = null,
+    val throttlePct: Double? = null,
+    val modRatio: Int? = null,
+    val gear: Int? = null,
+    val workState: Int? = null,
+    val errorFlags: Int = 0,
+    val mosTempC: Double? = null,
+    val motorTempC: Double? = null,
+    val hallPosition: Int? = null,
+    val framesCount: Int = 0,
+    val lastUpdatedMs: Long = 0L
+)
+
 data class JkBmsData(
+    val protocolLabel: String = "JK-BMS",
     val vpack: Double? = null,
     val ibat: Double? = null,
     val socPct: Double? = null,
@@ -128,6 +181,9 @@ data class JkBmsData(
     val capacityAh: Double? = null,
     val balancingActive: Boolean? = null,
     val balanceStatus: Int? = null,
+    val mosChargeOn: Boolean? = null,
+    val mosDischargeOn: Boolean? = null,
+    val faultText: String? = null,
     val lastUpdatedMs: Long = 0L
 )
 
